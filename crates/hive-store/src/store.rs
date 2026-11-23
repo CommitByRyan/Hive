@@ -525,6 +525,54 @@ impl Store {
         Ok((node, approval, envelope))
     }
 
+    /// Lease-guarded variant of [`Self::transition_node_and_request_approval`].
+    ///
+    /// A stale executor cannot move a newer attempt into `waiting_approval` or
+    /// create an approval bound to an obsolete lease.
+    pub fn transition_node_cas_and_request_approval(
+        &mut self,
+        node_id: NodeId,
+        guard: &LeaseGuard,
+        input: &ApprovalInput,
+        event: &EventInput,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, ApprovalRecord, EventEnvelope)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.attempt_no != guard.attempt_no
+            || current.lease_token.as_ref() != Some(&guard.lease_token)
+        {
+            return Err(StoreError::StaleExecution);
+        }
+        if let Some(event_node) = event.node_id {
+            if event_node != node_id {
+                return Err(StoreError::Conflict(format!(
+                    "event node {event_node} does not match {node_id}"
+                )));
+            }
+        }
+        if let Some(event_attempt) = event.attempt_no {
+            if event_attempt != guard.attempt_no {
+                return Err(StoreError::Conflict(
+                    "event attempt_no does not match lease guard".to_owned(),
+                ));
+            }
+        }
+        let next_state = current.state.transition(NodeState::WaitingApproval)?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, updated_at_ms = ?2 WHERE node_id = ?3",
+            params![next_state.as_str(), now_ms, node_id.to_string()],
+        )?;
+        let approval = create_approval_on(&tx, input, now_ms)?;
+        let envelope = insert_event(&tx, event)?;
+        tx.commit()?;
+        let node = query_node(&self.conn, node_id)?.expect("node was just updated");
+        Ok((node, approval, envelope))
+    }
+
     pub fn get_approval(&self, approval_id: ApprovalId) -> StoreResult<Option<ApprovalRecord>> {
         query_approval(&self.conn, approval_id)
     }

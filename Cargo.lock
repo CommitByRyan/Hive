@@ -215,6 +215,7 @@ name = "hive-agent"
 version = "0.1.0"
 dependencies = [
  "hive-llm",
+ "hive-policy",
  "hive-store",
  "hive-tools",
  "hive-types",

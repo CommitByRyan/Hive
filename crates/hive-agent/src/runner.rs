@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 use hive_llm::{ChatRequest, ChatResponse, ChatTransport, Gateway, Message, Role, Tool, Usage};
+use hive_policy::RiskLevel;
 use hive_store::{AgentSessionState, LeaseGuard, NewTurnUsage, Store, TurnState, UsageSource};
 use hive_tools::{
-    AuditSink, DenyApprovals, ToolCall, ToolContext, ToolDispatcher, ToolError, ToolResult,
+    AllowAllApprovals, ApprovalGate, AuditSink, DenyApprovals, ToolCall, ToolContext,
+    ToolDispatcher, ToolError, ToolResult,
 };
 use hive_types::{
     AgentSessionId, ApprovalId, EventId, EventInput, EventKind, LeaseToken, MissionId, NodeId,
@@ -11,7 +13,9 @@ use hive_types::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::{AgentError, AgentSpec, CancellationToken};
+use crate::{
+    AgentError, AgentSpec, ApprovalPolicy, ApprovalRequest, CancellationToken, StoreApprovalGate,
+};
 
 const PREVIEW_CHARS: usize = 512;
 const DEFAULT_LEASE_SECONDS: u64 = 60;
@@ -50,6 +54,7 @@ pub struct AgentRunner<'a, T: ChatTransport> {
     gateway: &'a Gateway<T>,
     lease_owner: String,
     lease_ttl: Duration,
+    approval_policy: ApprovalPolicy,
 }
 
 impl<'a, T: ChatTransport> AgentRunner<'a, T> {
@@ -60,12 +65,18 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
             gateway,
             lease_owner: format!("h04-{}", std::process::id()),
             lease_ttl: Duration::from_secs(DEFAULT_LEASE_SECONDS),
+            approval_policy: ApprovalPolicy::Deny,
         }
     }
 
     pub fn with_lease(mut self, owner: impl Into<String>, ttl: Duration) -> Self {
         self.lease_owner = owner.into();
         self.lease_ttl = ttl;
+        self
+    }
+
+    pub fn with_approval_policy(mut self, policy: ApprovalPolicy) -> Self {
+        self.approval_policy = policy;
         self
     }
 
@@ -309,6 +320,52 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                         continue;
                     }
 
+                    let (risk, tool_version) = self
+                        .tools
+                        .registry()
+                        .get(&tool_name)
+                        .map(|tool| (tool.risk, tool.version))
+                        .unwrap_or((RiskLevel::ReadOnly, 1));
+                    if self.approval_policy.requires_approval(risk) {
+                        let approval = {
+                            let mut gate = StoreApprovalGate::new(
+                                &mut *self.store,
+                                StoreApprovalGate::DEFAULT_TIMEOUT,
+                            );
+                            gate.request(
+                                &ApprovalRequest {
+                                    mission_id,
+                                    run_id: Some(run_id),
+                                    node_id: node,
+                                    session_id: session,
+                                    attempt_no: guard.attempt_no,
+                                    lease_token: guard.lease_token.clone(),
+                                    policy_version: "v1",
+                                    tool_name: &tool_name,
+                                    tool_version,
+                                    arguments: &arguments,
+                                },
+                                &guard,
+                                now_ms(),
+                            )?
+                            .1
+                        };
+                        self.store.finish_turn(
+                            turn.turn_id,
+                            TurnState::Completed,
+                            finish_reason.as_deref(),
+                            &preview,
+                            tool_calls.len() as u32,
+                            now_ms(),
+                        )?;
+                        return Ok(AgentOutcome::WaitingApproval {
+                            session_id: session,
+                            turns: turn_index,
+                            approval_id: approval.approval_id,
+                            tool_name,
+                        });
+                    }
+
                     let context = ToolContext {
                         mission_id,
                         run_id: Some(run_id),
@@ -324,12 +381,15 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                             node_id: node,
                             guard: guard.clone(),
                         };
-                        let mut approvals = DenyApprovals;
+                        let mut approvals: Box<dyn ApprovalGate> = match self.approval_policy {
+                            ApprovalPolicy::Request => Box::new(AllowAllApprovals),
+                            ApprovalPolicy::Deny => Box::new(DenyApprovals),
+                        };
                         self.tools.dispatch(
                             &context,
                             ToolCall::new(tool_name, arguments),
                             &mut audit,
-                            &mut approvals,
+                            &mut *approvals,
                         )
                     };
                     match outcome {
@@ -647,7 +707,7 @@ mod tests {
         ChatTransport, HttpResponse, LlmError, MockResponse, MockTransport, RetryPolicy,
     };
     use hive_store::{AgentSessionRecord, MissionRecord, NewAgentSession, NodeRecord, RunRecord};
-    use hive_types::{AttemptNo, MissionId};
+    use hive_types::{ApprovalState, AttemptNo, MissionId};
     use serde_json::json;
 
     use super::*;
@@ -1188,6 +1248,192 @@ mod tests {
                 .expect("present")
                 .state,
             NodeState::Failed
+        );
+    }
+
+    #[test]
+    fn write_tool_requests_approval_and_parks_node() {
+        let mut f = fixture("approval-request");
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &tool_completion("fs.write", json!({"path": "out.txt", "content": "payload"})),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+        let write_spec = spec().with_tools(["fs.write".to_owned()]);
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway)
+                .with_approval_policy(ApprovalPolicy::Request);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &write_spec, &token)
+                .expect("run")
+        };
+        let AgentOutcome::WaitingApproval {
+            approval_id,
+            tool_name,
+            turns,
+            ..
+        } = outcome
+        else {
+            panic!("expected waiting approval, got {outcome:?}");
+        };
+        assert_eq!(tool_name, "fs.write");
+        assert_eq!(turns, 1);
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::WaitingApproval
+        );
+        let approval = f
+            .store
+            .get_approval(approval_id)
+            .expect("approval")
+            .expect("present");
+        assert_eq!(approval.state, ApprovalState::Pending);
+        assert_eq!(approval.tool_name, "fs.write");
+        assert!(!f.dir.path().join("out.txt").exists());
+        assert_eq!(
+            kinds(&f.store, f.mission.mission_id),
+            vec![
+                EventKind::NodeStarted,
+                EventKind::NodeTurn,
+                EventKind::NodeApprovalRequested
+            ]
+        );
+        let requests = gateway.transport().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tools.as_ref().map(|tools| tools.len()), Some(1));
+    }
+
+    #[test]
+    fn approved_tool_is_consumed_once_then_executes() {
+        use hive_store::ApprovalDecision;
+
+        let mut f = fixture("approval-consume");
+        let lease = LeaseToken::generate();
+        f.store
+            .lease_node(f.node.node_id, &lease, "exec", 60_000, 0)
+            .expect("lease");
+        let guard = LeaseGuard {
+            attempt_no: AttemptNo::FIRST,
+            lease_token: lease.clone(),
+        };
+        let started = node_event(
+            f.mission.mission_id,
+            Some(f.run.run_id),
+            f.node.node_id,
+            f.session.session_id,
+            AttemptNo::FIRST,
+            EventKind::NodeStarted,
+            json!({}),
+        );
+        f.store
+            .transition_node_cas(f.node.node_id, &guard, NodeState::Running, &started, 1)
+            .expect("running");
+
+        let arguments = json!({"path": "approved.txt", "content": "approved"});
+        let (parked, approval) = {
+            let mut gate = StoreApprovalGate::new(&mut f.store, StoreApprovalGate::DEFAULT_TIMEOUT);
+            gate.request(
+                &ApprovalRequest {
+                    mission_id: f.mission.mission_id,
+                    run_id: Some(f.run.run_id),
+                    node_id: f.node.node_id,
+                    session_id: f.session.session_id,
+                    attempt_no: AttemptNo::FIRST,
+                    lease_token: lease.clone(),
+                    policy_version: "v1",
+                    tool_name: "fs.write",
+                    tool_version: 1,
+                    arguments: &arguments,
+                },
+                &guard,
+                2,
+            )
+            .expect("request")
+        };
+        assert_eq!(parked.state, NodeState::WaitingApproval);
+        f.store
+            .decide_approval(approval.approval_id, ApprovalDecision::Approved, "user", 3)
+            .expect("approve");
+
+        {
+            let mut gate = StoreApprovalGate::new(&mut f.store, StoreApprovalGate::DEFAULT_TIMEOUT);
+            let consumed = gate
+                .consume(
+                    approval.approval_id,
+                    approval.tool_call_id,
+                    &approval.request_hash,
+                    approval.attempt_no,
+                    &approval.lease_token,
+                    4,
+                )
+                .expect("consume");
+            assert_eq!(consumed.consumed_at_ms, Some(4));
+            let replay = gate
+                .consume(
+                    approval.approval_id,
+                    approval.tool_call_id,
+                    &approval.request_hash,
+                    approval.attempt_no,
+                    &approval.lease_token,
+                    5,
+                )
+                .expect_err("replay");
+            assert!(matches!(
+                replay,
+                AgentError::Store(hive_store::StoreError::ApprovalReplayed(_))
+            ));
+        }
+
+        let resumed = node_event(
+            f.mission.mission_id,
+            Some(f.run.run_id),
+            f.node.node_id,
+            f.session.session_id,
+            AttemptNo::FIRST,
+            EventKind::NodeApprovalDecided,
+            json!({"approval_id": approval.approval_id, "decision": "approved"}),
+        );
+        f.store
+            .transition_node_cas(f.node.node_id, &guard, NodeState::Running, &resumed, 6)
+            .expect("resume");
+
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let context = ToolContext {
+            mission_id: f.mission.mission_id,
+            run_id: Some(f.run.run_id),
+            node_id: f.node.node_id,
+            session_id: Some(f.session.session_id),
+            attempt_no: AttemptNo::FIRST,
+            lease_token: lease,
+            policy_version: "v1".to_owned(),
+        };
+        let outcome = {
+            let mut audit = GuardedAuditSink {
+                store: &mut f.store,
+                node_id: f.node.node_id,
+                guard: guard.clone(),
+            };
+            let mut approvals = AllowAllApprovals;
+            dispatcher
+                .dispatch(
+                    &context,
+                    ToolCall::new("fs.write", arguments),
+                    &mut audit,
+                    &mut approvals,
+                )
+                .expect("execute")
+        };
+        assert_eq!(outcome.output.bytes, 8);
+        assert_eq!(
+            std::fs::read_to_string(f.dir.path().join("approved.txt")).expect("file"),
+            "approved"
         );
     }
 }

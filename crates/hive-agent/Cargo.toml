@@ -10,5 +10,6 @@ hive-types = { path = "../hive-types" }
 hive-store = { path = "../hive-store" }
 hive-tools = { path = "../hive-tools" }
 hive-llm = { path = "../hive-llm" }
+hive-policy = { path = "../hive-policy" }
 serde_json.workspace = true
 thiserror.workspace = true
