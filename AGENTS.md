@@ -23,6 +23,7 @@
   - 构建：`pwsh -File scripts/cargo.ps1 build --workspace`
   - 运行：`pwsh -File scripts/cargo.ps1 run -p hive-cli -- doctor`
 - `cargo` 是 rustup 代理，禁止在未设置 `RUSTUP_HOME` 与 `CARGO_HOME` 时调用，否则会尝试使用用户全局工具链。
+- 在 Git worktree 中工作时，先设 `HIVE_TOOLCHAIN_ROOT=<主仓绝对路径>`，再调用 `scripts/cargo.ps1`；否则脚本找不到被忽略的 `work/` 工具链。
 - 不以其他项目的命令替代本项目命令。
 
 ## 协作边界
