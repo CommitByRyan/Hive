@@ -832,6 +832,16 @@ fn build_handoff(
     objective: &str,
     final_text: &str,
 ) -> Handoff {
+    let (base_revision, risks) = match &spec.workspace_root {
+        Some(root) => match hive_workspace::head_revision_at(root) {
+            Ok(sha) => (sha, Vec::new()),
+            Err(error) => (
+                "unknown".to_owned(),
+                vec![format!("base_revision unavailable: {error}")],
+            ),
+        },
+        None => ("unknown".to_owned(), Vec::new()),
+    };
     Handoff {
         schema_version: HANDOFF_SCHEMA_VERSION,
         mission_id,
@@ -844,13 +854,13 @@ fn build_handoff(
         artifacts: Vec::new(),
         decisions: Vec::new(),
         assumptions: Vec::new(),
-        risks: Vec::new(),
+        risks,
         open_questions: Vec::new(),
         acceptance: Vec::new(),
         recommended_next: Vec::new(),
         provenance: HandoffProvenance {
             attempt_no,
-            base_revision: "unknown".to_owned(),
+            base_revision,
             created_at: now_rfc3339(),
         },
     }
@@ -1017,6 +1027,36 @@ mod tests {
             .filter(|event| event.mission_id == mission_id)
             .map(|event| event.kind)
             .collect()
+    }
+
+    fn init_git_repo(dir: &Path) -> String {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), b"base\n").expect("write");
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     #[test]
@@ -1683,6 +1723,108 @@ mod tests {
             succeeded.payload["handoff_id"],
             handoffs[0].handoff_id.to_string()
         );
+    }
+
+    #[test]
+    fn handoff_with_workspace_records_head_revision() {
+        let mut f = fixture("handoff-workspace");
+        let sha = init_git_repo(f.dir.path());
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion("delivered", None),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+        let with_root = spec().with_workspace_root(f.dir.path().to_path_buf());
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &with_root, &token)
+                .expect("run")
+        };
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+
+        let handoffs = f
+            .store
+            .list_handoffs(f.mission.mission_id)
+            .expect("handoffs");
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].base_revision, sha);
+        assert!(handoffs[0]
+            .base_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(matches!(handoffs[0].base_revision.len(), 40 | 64));
+        assert!(handoffs[0].risks.is_empty());
+    }
+
+    #[test]
+    fn handoff_without_workspace_keeps_unknown_base_revision() {
+        let mut f = fixture("handoff-no-workspace");
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion("delivered", None),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect("run")
+        };
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+
+        let handoffs = f
+            .store
+            .list_handoffs(f.mission.mission_id)
+            .expect("handoffs");
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].base_revision, "unknown");
+        assert!(handoffs[0].risks.is_empty());
+    }
+
+    #[test]
+    fn handoff_with_bad_workspace_path_fails_open_and_node_succeeds() {
+        let mut f = fixture("handoff-bad-workspace");
+        let bad = f.dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&bad).expect("bad dir");
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion("delivered", None),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+        let bad_spec = spec().with_workspace_root(bad);
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &bad_spec, &token)
+                .expect("run")
+        };
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+
+        let node = f
+            .store
+            .get_node(f.node.node_id)
+            .expect("node")
+            .expect("present");
+        assert_eq!(node.state, NodeState::Succeeded);
+
+        let handoffs = f
+            .store
+            .list_handoffs(f.mission.mission_id)
+            .expect("handoffs");
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].base_revision, "unknown");
+        assert_eq!(handoffs[0].risks.len(), 1);
+        assert!(handoffs[0].risks[0].contains("base_revision unavailable"));
     }
 
     #[test]

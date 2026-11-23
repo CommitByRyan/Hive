@@ -1,17 +1,20 @@
 use std::collections::{HashMap, VecDeque};
 
 use hive_types::{MissionId, NodeId, RunId};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Static description of a single DAG node.
 ///
 /// The deterministic scheduler does not interpret `spec`; it is handed to the
 /// [`crate::NodeExecutor`] when the node is started.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeSpec {
     pub role: String,
     pub model: String,
     pub objective: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
 }
 
 impl NodeSpec {
@@ -20,11 +23,17 @@ impl NodeSpec {
             role: role.into(),
             model: model.into(),
             objective: String::new(),
+            workspace_root: None,
         }
     }
 
     pub fn with_objective(mut self, objective: impl Into<String>) -> Self {
         self.objective = objective.into();
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: impl Into<String>) -> Self {
+        self.workspace_root = Some(root.into());
         self
     }
 }
@@ -262,5 +271,21 @@ mod tests {
         assert!(index(c) < index(d));
         assert_eq!(topology.deps_of(d).len(), 2);
         assert_eq!(topology.dependents_of(a).len(), 2);
+    }
+
+    #[test]
+    fn node_spec_deserializes_without_workspace_root() {
+        let spec: NodeSpec =
+            serde_json::from_str(r#"{"role":"worker","model":"auto/auto","objective":"do it"}"#)
+                .expect("old node spec json");
+        assert_eq!(spec.workspace_root, None);
+    }
+
+    #[test]
+    fn node_spec_round_trips_workspace_root() {
+        let spec = NodeSpec::new("worker", "auto/auto").with_workspace_root("/tmp/hive/repo");
+        let json = serde_json::to_string(&spec).expect("serialize");
+        let decoded: NodeSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.workspace_root.as_deref(), Some("/tmp/hive/repo"));
     }
 }
