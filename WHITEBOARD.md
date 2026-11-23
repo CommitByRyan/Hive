@@ -112,6 +112,7 @@
 | R03 | `docs/design/H03-tool-security.md` | design ready（181 行，18 条验收） |
 | R07 | `docs/design/H07-model-gateway.md` | recon done（5 次真实探测） |
 | R02 | `docs/audits/R02-contract-consistency.md` | fail → 12 项已裁决，见下 |
+| H08 | `docs/design/H08-http-console.md` | design ready（186 行，16 条测试断言） |
 
 ## R02 裁决（已写入 PROTOCOL）
 
