@@ -329,6 +329,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-eval"
+version = "0.1.0"
+dependencies = [
+ "hive-agent",
+ "hive-llm",
+ "hive-runtime",
+ "hive-store",
+ "hive-tools",
+ "hive-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hive-events"
 version = "0.1.0"
 dependencies = [

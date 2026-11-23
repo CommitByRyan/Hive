@@ -1,0 +1,25 @@
+[package]
+name = "hive-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-types = { path = "../hive-types" }
+hive-store = { path = "../hive-store" }
+hive-runtime = { path = "../hive-runtime" }
+hive-agent = { path = "../hive-agent" }
+hive-llm = { path = "../hive-llm" }
+hive-tools = { path = "../hive-tools" }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+hive-agent = { path = "../hive-agent" }
+hive-llm = { path = "../hive-llm" }
+hive-runtime = { path = "../hive-runtime" }
+hive-store = { path = "../hive-store" }
+hive-tools = { path = "../hive-tools" }
+hive-types = { path = "../hive-types" }
