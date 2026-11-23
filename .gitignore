@@ -1,0 +1,11 @@
+/target/
+/.hive/
+/.env
+/.env.*
+!/.env.example
+/data/
+/sandbox/
+/tmp/
+/work/
+*.log
+

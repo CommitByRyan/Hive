@@ -1,0 +1,10 @@
+[package]
+name = "hive-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-store = { path = "../hive-store" }
+hive-types = { path = "../hive-types" }
