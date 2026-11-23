@@ -36,6 +36,7 @@
 | H09a | 预算账本 + 启动恢复 | done, merged, verified（217/3 + 主仓全绿） | H02、H08、H06c |
 | H09b | Routine 定时与 API | in_progress | H09a |
 | H09c | 可观测与保留 | blocked | H09b |
+| H09d | 恢复入口、租约事件与生命周期 tick | pending | H09b、R08 |
 | H06d-1 | worktree 集成器与回收 | done, merged, verified（232/3） | H06 |
 | H06d-2 | Handoff 真实基线 | done, merged, verified（264/1） | H09a、H06d-1 |
 | R08 | 安全与并发独立审计 | done, merged（no P0 / 4 P1） | H09a、H03b-2 |
