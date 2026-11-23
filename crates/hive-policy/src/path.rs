@@ -145,7 +145,7 @@ impl PathPolicy {
         input: &str,
         access: PathAccess,
     ) -> Result<AuthorizedPath, PolicyError> {
-        let relative = validate_relative(input)?;
+        let relative = validate_relative_path(input)?;
         let root = self.root(root_index)?;
         let joined = root.join(&relative);
         let final_path = match access {
@@ -197,7 +197,7 @@ impl PathPolicy {
         input: &str,
         access: PathAccess,
     ) -> Result<HandleAuthorizedPath, PolicyError> {
-        let relative = validate_relative(input)?;
+        let relative = validate_relative_path(input)?;
         let root = self.root(root_index)?;
         let platform = hive_platform::default_path_platform();
         let root_handle = platform.open_root(root).map_err(map_platform_error)?;
@@ -224,9 +224,52 @@ impl PathPolicy {
             handle,
         })
     }
+
+    /// Open a directory (or the registered root itself) and keep that exact
+    /// handle available for enumeration after authorization.
+    pub fn authorize_handle_listing(
+        &self,
+        root_index: usize,
+        input: &str,
+    ) -> Result<HandleAuthorizedPath, PolicyError> {
+        let root = self.root(root_index)?;
+        let platform = hive_platform::default_path_platform();
+        let root_handle = platform.open_root(root).map_err(map_platform_error)?;
+        let (relative, handle) = if input.is_empty() || input == "." {
+            #[cfg(windows)]
+            {
+                (PathBuf::new(), root_handle.into_path_handle())
+            }
+            #[cfg(not(windows))]
+            {
+                (
+                    PathBuf::new(),
+                    platform
+                        .open_checked(&root_handle, Path::new("."), hive_platform::OpenMode::Read)
+                        .map_err(map_platform_error)?,
+                )
+            }
+        } else {
+            let relative = validate_relative_path(input)?;
+            let handle = platform
+                .open_checked(&root_handle, &relative, hive_platform::OpenMode::Read)
+                .map_err(map_platform_error)?;
+            (relative, handle)
+        };
+        if !handle.is_dir() {
+            return Err(PolicyError::PathUnsupportedForm(format!(
+                "path is not a directory: {input}"
+            )));
+        }
+        Ok(HandleAuthorizedPath {
+            root: root.to_path_buf(),
+            relative,
+            handle,
+        })
+    }
 }
 
-fn validate_relative(input: &str) -> Result<PathBuf, PolicyError> {
+pub fn validate_relative_path(input: &str) -> Result<PathBuf, PolicyError> {
     if input.is_empty() {
         return Err(PolicyError::PathUnsupportedForm(
             "empty path is not a relative file path".to_owned(),

@@ -13,6 +13,6 @@ pub use net::{
     connect_pinned, net_capabilities, resolve_all, verify_peer, NetCapabilities, PinnedSocket,
 };
 pub use path::{
-    default_path_platform, path_capabilities, DefaultPathPlatform, OpenMode, PathCapabilities,
-    PathHandle, PathPlatform, RootHandle,
+    default_path_platform, path_capabilities, DefaultPathPlatform, DirectoryEntry,
+    DirectoryEntryKind, OpenMode, PathCapabilities, PathHandle, PathPlatform, RootHandle,
 };

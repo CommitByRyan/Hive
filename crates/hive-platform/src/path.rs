@@ -23,6 +23,8 @@ pub struct PathCapabilities {
     pub handle_level: bool,
     pub reparse_detection: bool,
     pub final_path_verification: bool,
+    pub listing_handle_relative: bool,
+    pub atomic_replace_handle_relative: bool,
     pub note: &'static str,
 }
 
@@ -33,7 +35,9 @@ pub fn path_capabilities() -> PathCapabilities {
             handle_level: true,
             reparse_detection: true,
             final_path_verification: true,
-            note: "Win32 handle traversal: FILE_FLAG_OPEN_REPARSE_POINT per component + GetFinalPathNameByHandleW",
+            listing_handle_relative: true,
+            atomic_replace_handle_relative: false,
+            note: "Win32 handle traversal and directory enumeration; atomic replace is path-based with parent identity checks before and after, leaving a residual rename window",
         }
     }
     #[cfg(not(windows))]
@@ -42,10 +46,25 @@ pub fn path_capabilities() -> PathCapabilities {
             handle_level: false,
             reparse_detection: false,
             final_path_verification: false,
+            listing_handle_relative: false,
+            atomic_replace_handle_relative: false,
             note:
-                "canonicalize + prefix check only; TOCTOU window remains (application-layer limit)",
+                "canonicalize + prefix check only; path-based listing and replacement retain TOCTOU windows (application-layer limit)",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryEntryKind {
+    File,
+    Directory,
+    Link,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub kind: DirectoryEntryKind,
 }
 
 /// An opened workspace-root directory. On Windows this owns a directory handle
@@ -61,6 +80,16 @@ pub struct RootHandle {
 impl RootHandle {
     pub fn final_path(&self) -> &Path {
         &self.final_path
+    }
+
+    #[cfg(windows)]
+    pub fn into_path_handle(self) -> PathHandle {
+        let this = std::mem::ManuallyDrop::new(self);
+        PathHandle {
+            handle: this.handle,
+            final_path: this.final_path.clone(),
+            is_dir: true,
+        }
     }
 }
 
@@ -110,6 +139,32 @@ impl PathHandle {
     pub fn path(&self) -> &Path {
         &self.final_path
     }
+
+    /// Transfer the owned operating-system handle to a `File` exactly once.
+    /// The non-Windows fallback has no owned handle and therefore reopens the
+    /// already canonicalized path; its reduced capability is reported above.
+    pub fn into_file(self) -> Result<std::fs::File, PlatformError> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::FromRawHandle;
+
+            if self.is_dir {
+                return Err(PlatformError::Unsupported(format!(
+                    "cannot read directory {} as a file",
+                    self.final_path.display()
+                )));
+            }
+            let this = std::mem::ManuallyDrop::new(self);
+            Ok(unsafe { std::fs::File::from_raw_handle(this.handle) })
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::File::open(&self.final_path).map_err(|source| PlatformError::Io {
+                context: format!("open {}", self.final_path.display()),
+                source,
+            })
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -133,6 +188,14 @@ pub trait PathPlatform: Send + Sync {
     /// Create a missing leaf file (and any missing parent directories) without
     /// following reparse points, re-verifying every created segment.
     fn create_file(&self, root: &RootHandle, relative: &Path) -> Result<PathHandle, PlatformError>;
+    fn list_directory(&self, directory: &PathHandle) -> Result<Vec<DirectoryEntry>, PlatformError>;
+    fn list_root(&self, root: &RootHandle) -> Result<Vec<DirectoryEntry>, PlatformError>;
+    fn atomic_write(
+        &self,
+        root: &RootHandle,
+        relative: &Path,
+        content: &[u8],
+    ) -> Result<(), PlatformError>;
 }
 
 #[cfg(windows)]
@@ -181,6 +244,29 @@ impl PathPlatform for WindowsPathPlatform {
 
     fn create_file(&self, root: &RootHandle, relative: &Path) -> Result<PathHandle, PlatformError> {
         create_missing(root, relative)
+    }
+
+    fn list_directory(&self, directory: &PathHandle) -> Result<Vec<DirectoryEntry>, PlatformError> {
+        if !directory.is_dir {
+            return Err(PlatformError::Unsupported(format!(
+                "{} is not a directory",
+                directory.final_path.display()
+            )));
+        }
+        list_directory_handle(directory.handle)
+    }
+
+    fn list_root(&self, root: &RootHandle) -> Result<Vec<DirectoryEntry>, PlatformError> {
+        list_directory_handle(root.handle)
+    }
+
+    fn atomic_write(
+        &self,
+        root: &RootHandle,
+        relative: &Path,
+        content: &[u8],
+    ) -> Result<(), PlatformError> {
+        atomic_write_windows(root, relative, content)
     }
 }
 
@@ -266,6 +352,126 @@ impl PathPlatform for FallbackPathPlatform {
             is_dir: false,
         })
     }
+
+    fn list_directory(&self, directory: &PathHandle) -> Result<Vec<DirectoryEntry>, PlatformError> {
+        list_directory_fallback(&directory.final_path)
+    }
+
+    fn list_root(&self, root: &RootHandle) -> Result<Vec<DirectoryEntry>, PlatformError> {
+        list_directory_fallback(&root.final_path)
+    }
+
+    fn atomic_write(
+        &self,
+        root: &RootHandle,
+        relative: &Path,
+        content: &[u8],
+    ) -> Result<(), PlatformError> {
+        atomic_write_fallback(root, relative, content)
+    }
+}
+
+#[cfg(not(windows))]
+fn list_directory_fallback(path: &Path) -> Result<Vec<DirectoryEntry>, PlatformError> {
+    let entries = std::fs::read_dir(path).map_err(|source| PlatformError::Io {
+        context: format!("list {}", path.display()),
+        source,
+    })?;
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PlatformError::Io {
+            context: format!("list {}", path.display()),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| PlatformError::Io {
+            context: format!("inspect {}", entry.path().display()),
+            source,
+        })?;
+        let kind = if file_type.is_symlink() {
+            DirectoryEntryKind::Link
+        } else if file_type.is_dir() {
+            DirectoryEntryKind::Directory
+        } else {
+            DirectoryEntryKind::File
+        };
+        result.push(DirectoryEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            kind,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn atomic_write_fallback(
+    root: &RootHandle,
+    relative: &Path,
+    content: &[u8],
+) -> Result<(), PlatformError> {
+    use std::io::Write;
+
+    let target = root.final_path.join(relative);
+    let parent = target.parent().ok_or_else(|| {
+        PlatformError::Unsupported(format!("{} has no parent directory", target.display()))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|source| PlatformError::Io {
+        context: format!("create parent {}", parent.display()),
+        source,
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|source| PlatformError::Io {
+        context: format!("resolve parent {}", parent.display()),
+        source,
+    })?;
+    if !within(&root.final_path, &canonical_parent) {
+        return Err(PlatformError::OutsideRoot(format!(
+            "{} resolves outside the workspace root",
+            parent.display()
+        )));
+    }
+    let file_name = target.file_name().ok_or_else(|| {
+        PlatformError::Unsupported(format!("{} has no file name", target.display()))
+    })?;
+    let temp = unique_temp_path(&canonical_parent, file_name);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|source| PlatformError::Io {
+                context: format!("create temporary file {}", temp.display()),
+                source,
+            })?;
+        file.write_all(content)
+            .map_err(|source| PlatformError::Io {
+                context: format!("write temporary file {}", temp.display()),
+                source,
+            })?;
+        file.sync_all().map_err(|source| PlatformError::Io {
+            context: format!("sync temporary file {}", temp.display()),
+            source,
+        })?;
+        drop(file);
+        std::fs::rename(&temp, &target).map_err(|source| PlatformError::Io {
+            context: format!("replace {}", target.display()),
+            source,
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn unique_temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{}.hive-tmp-{}-{counter}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ))
 }
 
 #[cfg(not(windows))]
@@ -295,11 +501,14 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_
 
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    CreateDirectoryW, CreateFileW, FileIdBothDirectoryInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, MoveFileExW, ReplaceFileW,
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_BOTH_DIR_INFO,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
+    REPLACEFILE_WRITE_THROUGH,
 };
 
 #[cfg(windows)]
@@ -664,6 +873,340 @@ fn create_missing(root: &RootHandle, relative: &Path) -> Result<PathHandle, Plat
     unreachable!("leaf component is always created and returned")
 }
 
+#[cfg(windows)]
+fn list_directory_handle(handle: HANDLE) -> Result<Vec<DirectoryEntry>, PlatformError> {
+    const ERROR_NO_MORE_FILES: i32 = 18;
+
+    let mut storage = vec![0u64; 8192];
+    let buffer = unsafe {
+        std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), storage.len() * 8)
+    };
+    let mut entries = Vec::new();
+    loop {
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdBothDirectoryInfo,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+            )
+        };
+        if ok == 0 {
+            let error = last_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                break;
+            }
+            if entries.is_empty() && error.kind() == std::io::ErrorKind::InvalidInput {
+                return list_directory_path(final_path_of(handle)?);
+            }
+            return Err(PlatformError::Io {
+                context: "GetFileInformationByHandleEx(FileIdBothDirectoryInfo)".to_owned(),
+                source: error,
+            });
+        }
+
+        let mut offset = 0usize;
+        loop {
+            if offset + std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() > buffer.len() {
+                return Err(PlatformError::Unsupported(
+                    "directory enumeration returned a truncated entry".to_owned(),
+                ));
+            }
+            let entry = unsafe { &*buffer.as_ptr().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>() };
+            let name_offset =
+                std::ptr::addr_of!(entry.FileName) as usize - entry as *const _ as usize;
+            let name_bytes = entry.FileNameLength as usize;
+            if name_bytes % 2 != 0
+                || name_offset
+                    .checked_add(name_bytes)
+                    .map_or(true, |end| end > buffer.len())
+            {
+                return Err(PlatformError::Unsupported(
+                    "directory enumeration returned an invalid file name".to_owned(),
+                ));
+            }
+            let name = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.as_ptr().add(offset + name_offset).cast::<u16>(),
+                    name_bytes / 2,
+                )
+            };
+            let name = std::ffi::OsString::from_wide(name)
+                .to_string_lossy()
+                .into_owned();
+            if name != "." && name != ".." {
+                let kind = if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    DirectoryEntryKind::Link
+                } else if entry.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                    DirectoryEntryKind::Directory
+                } else {
+                    DirectoryEntryKind::File
+                };
+                entries.push(DirectoryEntry { name, kind });
+            }
+            if entry.NextEntryOffset == 0 {
+                break;
+            }
+            offset = offset
+                .checked_add(entry.NextEntryOffset as usize)
+                .ok_or_else(|| {
+                    PlatformError::Unsupported("directory enumeration offset overflow".to_owned())
+                })?;
+        }
+    }
+    Ok(entries)
+}
+
+#[cfg(windows)]
+fn list_directory_path(path: PathBuf) -> Result<Vec<DirectoryEntry>, PlatformError> {
+    let entries = std::fs::read_dir(&path).map_err(|source| PlatformError::Io {
+        context: format!("list {}", path.display()),
+        source,
+    })?;
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PlatformError::Io {
+            context: format!("list {}", path.display()),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| PlatformError::Io {
+            context: format!("inspect {}", entry.path().display()),
+            source,
+        })?;
+        let kind = if file_type.is_symlink() {
+            DirectoryEntryKind::Link
+        } else if file_type.is_dir() {
+            DirectoryEntryKind::Directory
+        } else {
+            DirectoryEntryKind::File
+        };
+        result.push(DirectoryEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            kind,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn same_file_identity(
+    left: &BY_HANDLE_FILE_INFORMATION,
+    right: &BY_HANDLE_FILE_INFORMATION,
+) -> bool {
+    left.dwVolumeSerialNumber == right.dwVolumeSerialNumber
+        && left.nFileIndexHigh == right.nFileIndexHigh
+        && left.nFileIndexLow == right.nFileIndexLow
+}
+
+#[cfg(windows)]
+fn verify_parent_identity(
+    root: &RootHandle,
+    root_norm: &[String],
+    parent_path: &Path,
+    expected: &BY_HANDLE_FILE_INFORMATION,
+) -> Result<(), PlatformError> {
+    let handle = open_directory(parent_path)?;
+    let inspected = inspect_handle(handle, parent_path, root, root_norm);
+    unsafe {
+        CloseHandle(handle);
+    }
+    let (actual, _) = inspected?;
+    if !same_file_identity(expected, &actual) {
+        return Err(PlatformError::OutsideRoot(format!(
+            "parent directory identity changed while writing {}",
+            parent_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_or_create_parent(
+    root: &RootHandle,
+    root_norm: &[String],
+    relative_parent: &Path,
+    parent_path: &Path,
+) -> Result<(HANDLE, BY_HANDLE_FILE_INFORMATION, PathBuf), PlatformError> {
+    match open_directory(parent_path) {
+        Ok(handle) => {
+            let (info, final_path) = inspect_handle(handle, parent_path, root, root_norm)?;
+            Ok((handle, info, final_path))
+        }
+        Err(PlatformError::NotFound(_)) => {
+            if relative_parent.as_os_str().is_empty() {
+                return Err(PlatformError::NotFound(format!(
+                    "workspace root {} does not exist",
+                    parent_path.display()
+                )));
+            }
+            let grandparent = relative_parent.parent().unwrap_or_else(|| Path::new(""));
+            let grandparent_path = root.final_path.join(grandparent);
+            let (grandparent_handle, _, _) =
+                open_or_create_parent(root, root_norm, grandparent, &grandparent_path)?;
+            unsafe {
+                CloseHandle(grandparent_handle);
+            }
+            let created = unsafe {
+                CreateDirectoryW(wide(parent_path.as_os_str()).as_ptr(), std::ptr::null())
+            };
+            if created == 0 {
+                let error = last_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(PlatformError::Io {
+                        context: format!("CreateDirectoryW {}", parent_path.display()),
+                        source: error,
+                    });
+                }
+            }
+            let handle = open_directory(parent_path)?;
+            let (info, final_path) = inspect_handle(handle, parent_path, root, root_norm)?;
+            Ok((handle, info, final_path))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn atomic_write_windows(
+    root: &RootHandle,
+    relative: &Path,
+    content: &[u8],
+) -> Result<(), PlatformError> {
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+
+    let file_name = relative.file_name().ok_or_else(|| {
+        PlatformError::Unsupported("empty relative path cannot be written".to_owned())
+    })?;
+    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent_path = root.final_path.join(relative_parent);
+    let root_norm = normalized_final(&root.final_path);
+
+    let (parent_handle, parent_info, parent_final) =
+        open_or_create_parent(root, &root_norm, relative_parent, &parent_path)?;
+    let parent = PathHandle {
+        handle: parent_handle,
+        final_path: parent_final,
+        is_dir: true,
+    };
+
+    let target = parent.final_path.join(file_name);
+    let target_handle = match open_leaf(&target, OpenMode::Write) {
+        Ok(handle) => {
+            let (info, final_path) = inspect_handle(handle, &target, root, &root_norm)?;
+            if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                unsafe {
+                    CloseHandle(handle);
+                }
+                return Err(PlatformError::Unsupported(format!(
+                    "cannot replace directory {}",
+                    target.display()
+                )));
+            }
+            Some(PathHandle {
+                handle,
+                final_path,
+                is_dir: false,
+            })
+        }
+        Err(PlatformError::NotFound(_)) => None,
+        Err(error) => return Err(error),
+    };
+
+    let temp = unique_temp_path(&parent.final_path, file_name);
+    let result = (|| {
+        let handle = create_leaf(&temp)?;
+        let inspected = inspect_handle(handle, &temp, root, &root_norm);
+        if let Err(error) = inspected {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(error);
+        }
+        let mut file = unsafe { std::fs::File::from_raw_handle(handle) };
+        file.write_all(content)
+            .map_err(|source| PlatformError::Io {
+                context: format!("write temporary file {}", temp.display()),
+                source,
+            })?;
+        file.sync_all().map_err(|source| PlatformError::Io {
+            context: format!("sync temporary file {}", temp.display()),
+            source,
+        })?;
+        drop(file);
+
+        verify_parent_identity(root, &root_norm, &parent_path, &parent_info)?;
+        let target_wide = wide(target.as_os_str());
+        let temp_wide = wide(temp.as_os_str());
+        let backup = target_handle
+            .as_ref()
+            .map(|_| unique_temp_path(&parent.final_path, file_name));
+        let backup_wide = backup.as_ref().map(|path| wide(path.as_os_str()));
+        let replaced = if target_handle.is_some() {
+            unsafe {
+                ReplaceFileW(
+                    target_wide.as_ptr(),
+                    temp_wide.as_ptr(),
+                    backup_wide
+                        .as_ref()
+                        .map_or(std::ptr::null(), |path| path.as_ptr()),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            }
+        } else {
+            unsafe {
+                MoveFileExW(
+                    temp_wide.as_ptr(),
+                    target_wide.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if replaced == 0 {
+            return Err(PlatformError::Io {
+                context: format!("atomically replace {}", target.display()),
+                source: last_error(),
+            });
+        }
+        let verification = (|| {
+            verify_parent_identity(root, &root_norm, &parent_path, &parent_info)?;
+            let final_handle = open_leaf(&target, OpenMode::Read)?;
+            let inspected = inspect_handle(final_handle, &target, root, &root_norm);
+            unsafe {
+                CloseHandle(final_handle);
+            }
+            inspected.map(|_| ())
+        })();
+        if verification.is_err() {
+            if let Some(backup) = &backup {
+                let backup_wide = wide(backup.as_os_str());
+                unsafe {
+                    ReplaceFileW(
+                        target_wide.as_ptr(),
+                        backup_wide.as_ptr(),
+                        std::ptr::null(),
+                        REPLACEFILE_WRITE_THROUGH,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                };
+            } else {
+                let _ = std::fs::remove_file(&target);
+            }
+        }
+        if let Some(backup) = &backup {
+            let _ = std::fs::remove_file(backup);
+        }
+        verification
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::path::PathBuf;
@@ -725,5 +1268,24 @@ mod tests {
             .expect("create");
         assert!(!handle.is_dir());
         assert!(temp.path().join("nested").join("out.txt").exists());
+    }
+
+    #[test]
+    fn path_handle_into_file_keeps_single_owner() {
+        use std::io::Read;
+
+        let temp = TempDir::new("into-file");
+        std::fs::write(temp.path().join("file.txt"), b"owned").expect("write");
+        let platform = default_path_platform();
+        let root = platform.open_root(temp.path()).expect("root");
+        let handle = platform
+            .open_checked(&root, Path::new("file.txt"), OpenMode::Read)
+            .expect("open");
+        let mut file = handle.into_file().expect("into file");
+        let mut content = String::new();
+        file.read_to_string(&mut content).expect("read");
+        drop(file);
+        assert_eq!(content, "owned");
+        std::fs::remove_file(temp.path().join("file.txt")).expect("single close");
     }
 }

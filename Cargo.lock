@@ -429,6 +429,7 @@ dependencies = [
 name = "hive-tools"
 version = "0.1.0"
 dependencies = [
+ "hive-platform",
  "hive-policy",
  "hive-store",
  "hive-types",
