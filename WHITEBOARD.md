@@ -55,8 +55,8 @@
 | H09a | 可见对话 `01a20877-15e5-7ad0-a650-eb3df9f9e3b3`（pro high） | V5 budgets、原子扣减、budget_exceeded、启动恢复扫描 | `.codex/worktrees/b2fb/Hive`，基线 `46d381d` | done, merged `5f3769c`, verified 217/3 |
 | H09b | 可见对话 `01a2089f-87cc-7281-8cfb-1a9c348b865b`（flash high） | V6 routines、表达式、幂等触发、tick、`/api/routines` | `.codex/worktrees/2b99/Hive`，基线 `5f3769c` | done, merged `5bcee31`, verified 286/1 |
 | H09d | 可见对话 `01a208fb-add5-7ce1-8792-dc2079d9bc55`（`auto/deepseek-v4-pro` high） | 启动恢复接线、reclaim 同事务事件、可停止生命周期 tick | `.codex/worktrees/dec6/Hive`，基线 `5bcee31` | done, merged `da60c17`, verified 291/1 |
-| H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（`auto/deepseek-v4-pro` high） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | in_progress |
-| H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（`auto/deepseek-v4-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | in_progress |
+| H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（pro high → 429，切 `auto/glm-5.3` max） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | in_progress |
+| H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | in_progress |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
 | H10 | 可见对话 `01a20878-248d-73f3-8924-0dc64342445a`（flash high） | `crates/hive-eval`、s5 预算场景、故障注入 | `.codex/worktrees/ca7e/Hive` | done, merged `f9708e3`, 249/3 + s5 |
@@ -140,6 +140,7 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | H01 实施对话出现工具调用异常 | 已归档，由 H00 收敛并验证 | 已完成 |
 | 误建全局 `C:\Users\24096\.rustup`（约 104 MB，未完成） | 不阻塞，但与项目工具链无关 | 等用户确认是否删除 |
 | H02 首轮 26 分钟后遇 magpie 429 | 已换模型续做，不丢已落盘代码 | 已完成切换 |
+| H09c/H03b-4 首轮同时遇 magpie 429 | 两对话均未落代码，worktree 干净 | 已分别切 `auto/glm-5.3` max 与 `auto/kimi-k3.1-pro` high 续跑 |
 
 ## 交接收件箱
 
