@@ -162,6 +162,7 @@ Run 是 Mission 的一次规划/执行生命周期；追加要求或恢复可以
 - 工具完整输出可以单独存储，事件只放摘要和引用。
 - 持久化封套**不含** `agent` 字段；`agent` 是读取/SSE 层按 `session_id` 投影出的展示字段（见 §6），不得写进 events 表，避免同一事件出现两个身份来源。
 - `run_id`、`node_id`、`session_id` 在 Mission 级事件上允许为 `null`；读取方必须按可空处理。
+- `mission_id` 表示事件作用域；除保留的系统作用域 `m_00000000-0000-4000-8000-000000000000` 外，持久化事件必须引用真实 Mission。系统作用域用于没有单一 Mission 所有者的进程级事件（当前为 `routine.updated`/`routine.deleted`/`routine.error`），不是 `missions` 行，不得被调度或当作普通 Mission 查询；`routine.triggered` 必须使用本次创建的真实 Mission。详见 ADR 0006。
 
 ## 4. 首版事件族
 
