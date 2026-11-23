@@ -277,8 +277,8 @@ ID 已存在不代表表已存在。需要当前状态、原子 CAS、重启查�
 | `missions`、`runs`、`nodes`、`events`、`snapshots`、`approvals` | H02 | 表（V1） |
 | `tool_calls`、`artifacts`、`tool_audit` | H03 | 表（V2） |
 | `agent_sessions`、`turns`、`turn_usage` | H04 | 表（V3） |
-| `budgets` | H05 | 表（V4） |
-| `handoffs` | H06 | 表（V5） |
+| `handoffs` | H06 | 表（V4） |
+| `budgets` | H09 | 表（V5） |
 | `routines` | H09 | 表（V6） |
 
 | 迁移 | 阶段 | 内容 |
@@ -286,8 +286,8 @@ ID 已存在不代表表已存在。需要当前状态、原子 CAS、重启查�
 | V1 | H02 | Mission/Run/Node/Event/Snapshot/Approval |
 | V2 | H03 | ToolCall、Artifact、ToolAudit（哈希链） |
 | V3 | H04 | AgentSession、Turn、TurnUsage |
-| V4 | H05 | 预算分配与账本 |
-| V5 | H06 | Handoff |
+| V4 | H06 | Handoff |
+| V5 | H09 | 预算分配与账本 |
 | V6 | H09 | Routine 与保留策略 |
 
 ### V3 列契约（H04 冻结）
@@ -305,7 +305,7 @@ ID 已存在不代表表已存在。需要当前状态、原子 CAS、重启查�
 - `turn_usage` 与 `turns` 一一对应；usage 缺失时写 `estimated`，不得写 0 冒充权威值。
 - 行是当前状态，`node.turn` / `node.thought` 等事件是通知；两者在同一事务提交。
 
-### V5 列契约（H06 冻结）
+### V4 列契约（H06 冻结）
 
 `handoffs`：`handoff_id` 主键（`hd_<uuid>`），`mission_id`/`run_id`/`node_id` 外键，`attempt_no`、`agent`、`schema_version`、`objective`、`summary`、`base_revision`、`created_at_ms`；结构化字段以 JSON 文本存储：`inputs_json`、`artifacts_json`、`decisions_json`、`assumptions_json`、`risks_json`、`open_questions_json`、`acceptance_json`、`recommended_next_json`；`UNIQUE(node_id, attempt_no)`。
 
