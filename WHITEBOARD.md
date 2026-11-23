@@ -42,7 +42,7 @@
 | H03b | 待派发 | 真实 Shell（argv/超时/进程树）、Win32 句柄级路径、连接级 IP 固定 | 新 worktree | pending |
 | H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
 | H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | done, merged |
-| H05b | 待派发（可见对话） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、租约/事务/attempt 语义收紧 | 新 worktree | ready |
+| H05b | 可见对话 `01a207e0-8bd5-7ff1-8247-78c2156c82f3`（`auto/deepseek-v4-pro`） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、租约/事务/attempt 语义收紧 | `.codex/worktrees/36e0/Hive` | implementing |
 
 合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
 
