@@ -14,7 +14,8 @@ pub struct NetCapabilities {
     /// The TCP primitive can connect to a validated IP and verify the peer.
     pub connection_pinning: bool,
     /// End-to-end DNS-rebinding resistance: every HTTP/TLS request goes through
-    /// the pinned socket. This is false while `hive-llm` uses its own resolver.
+    /// the pinned socket. True now that `hive-llm`'s `UreqTransport` resolves
+    /// once through `NetworkPolicy` and connects only to validated addresses.
     pub dns_rebinding_resistant: bool,
     pub note: &'static str,
 }
@@ -22,8 +23,8 @@ pub struct NetCapabilities {
 pub fn net_capabilities() -> NetCapabilities {
     NetCapabilities {
         connection_pinning: true,
-        dns_rebinding_resistant: false,
-        note: "TCP connect-to-validated-IP + peer verify available; hive-llm ureq is not rewired (application-layer SSRF limit, no DNS-rebinding defense)",
+        dns_rebinding_resistant: true,
+        note: "hive-llm ureq transport resolves once through NetworkPolicy and connects to validated addresses only; generic network tools remain closed",
     }
 }
 

@@ -126,7 +126,7 @@ fn run_with<G: ProcessTree>(
     let bytes = stdout.len() + stderr.len();
     let content = combine_output(stdout, stderr);
     let exit_code = status.and_then(|code| code.code());
-    Ok(ToolOutput {
+    let output = ToolOutput {
         content,
         bytes,
         truncated,
@@ -136,7 +136,22 @@ fn run_with<G: ProcessTree>(
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "signal".to_owned())
         ),
-    })
+    };
+
+    match exit_code {
+        Some(0) => Ok(output),
+        Some(code) => Err(ToolError::new(
+            ErrorCode::ToolExecutionFailed,
+            format!("{} exited with non-zero code {code}", program.display()),
+        )
+        .with_exit_code(code)
+        .with_output(output)),
+        None => Err(ToolError::new(
+            ErrorCode::ToolExecutionFailed,
+            format!("{} terminated by a signal", program.display()),
+        )
+        .with_output(output)),
+    }
 }
 
 /// Fail-closed cleanup for a child that spawned but was never assigned to a

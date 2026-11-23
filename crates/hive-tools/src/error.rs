@@ -2,10 +2,14 @@ use std::fmt::{self, Display, Formatter};
 
 use hive_policy::{ErrorCode, PolicyError};
 
+use crate::types::ToolOutput;
+
 #[derive(Debug)]
 pub struct ToolError {
     code: ErrorCode,
     message: String,
+    exit_code: Option<i32>,
+    output: Option<ToolOutput>,
 }
 
 impl ToolError {
@@ -13,7 +17,19 @@ impl ToolError {
         Self {
             code,
             message: message.into(),
+            exit_code: None,
+            output: None,
         }
+    }
+
+    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = Some(exit_code);
+        self
+    }
+
+    pub fn with_output(mut self, output: ToolOutput) -> Self {
+        self.output = Some(output);
+        self
     }
 
     pub const fn error_code(&self) -> ErrorCode {
@@ -27,6 +43,14 @@ impl ToolError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    pub const fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    pub fn output(&self) -> Option<&ToolOutput> {
+        self.output.as_ref()
+    }
 }
 
 impl Display for ToolError {
@@ -39,10 +63,7 @@ impl std::error::Error for ToolError {}
 
 impl From<PolicyError> for ToolError {
     fn from(error: PolicyError) -> Self {
-        Self {
-            code: error.error_code(),
-            message: error.to_string(),
-        }
+        Self::new(error.error_code(), error.to_string())
     }
 }
 
