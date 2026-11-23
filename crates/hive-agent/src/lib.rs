@@ -5,13 +5,12 @@
 //! stages (H05/H06/H08).
 
 mod approval;
-mod cancel;
 mod error;
 mod runner;
 mod spec;
 
 pub use approval::{ApprovalPolicy, ApprovalRequest, StoreApprovalGate};
-pub use cancel::CancellationToken;
 pub use error::AgentError;
+pub use hive_types::CancellationToken;
 pub use runner::{AgentOutcome, AgentRunner};
 pub use spec::AgentSpec;

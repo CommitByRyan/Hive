@@ -100,8 +100,21 @@ impl Store {
         retry_budget: u32,
         now_ms: i64,
     ) -> StoreResult<NodeRecord> {
+        self.add_node_with_id(NodeId::new(), mission_id, run_id, retry_budget, now_ms)
+    }
+
+    /// Create a pending node with a caller-chosen id, so a plan can persist
+    /// the exact node identity the scheduler drives.
+    pub fn add_node_with_id(
+        &mut self,
+        node_id: NodeId,
+        mission_id: MissionId,
+        run_id: RunId,
+        retry_budget: u32,
+        now_ms: i64,
+    ) -> StoreResult<NodeRecord> {
         let record = NodeRecord {
-            node_id: NodeId::new(),
+            node_id,
             mission_id,
             run_id,
             state: NodeState::Pending,
@@ -875,6 +888,59 @@ impl Store {
             "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
             params![next_state.as_str(), now_ms, node_id.to_string()],
         )?;
+        query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
+    }
+
+    /// Retry a node after a failed attempt: `failed -> retry_ready -> ready`,
+    /// incrementing `attempt_no` and clearing the lease in one transaction.
+    /// Emits no event; the caller emits `node.ready` for the new attempt.
+    pub fn retry_failed_node(&mut self, node_id: NodeId, now_ms: i64) -> StoreResult<NodeRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.state != NodeState::Failed {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is {}, expected failed",
+                current.state
+            )));
+        }
+        let _ = NodeState::Failed.transition(NodeState::RetryReady)?;
+        let ready = NodeState::RetryReady.transition(NodeState::Ready)?;
+        let next_attempt = current
+            .attempt_no
+            .checked_next()
+            .ok_or_else(|| StoreError::Conflict("attempt number exhausted".to_owned()))?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, attempt_no = ?2, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3 WHERE node_id = ?4",
+            params![ready.as_str(), next_attempt.get(), now_ms, node_id.to_string()],
+        )?;
+        tx.commit()?;
+        query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
+    }
+
+    /// Finalize a node after a failed attempt whose retry budget is exhausted:
+    /// `failed -> failed_final`, clearing the lease in one transaction.
+    /// Emits no event; `node.failed` was already emitted for this attempt.
+    pub fn abort_failed_node(&mut self, node_id: NodeId, now_ms: i64) -> StoreResult<NodeRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.state != NodeState::Failed {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is {}, expected failed",
+                current.state
+            )));
+        }
+        let next_state = NodeState::Failed.transition(NodeState::FailedFinal)?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+            params![next_state.as_str(), now_ms, node_id.to_string()],
+        )?;
+        tx.commit()?;
         query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
     }
 

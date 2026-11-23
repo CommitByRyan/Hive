@@ -267,6 +267,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-runtime"
+version = "0.1.0"
+dependencies = [
+ "hive-store",
+ "hive-types",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hive-store"
 version = "0.1.0"
 dependencies = [
