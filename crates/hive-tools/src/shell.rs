@@ -12,9 +12,27 @@ use hive_policy::ErrorCode;
 
 use crate::{ToolError, ToolOutput, ToolResult};
 
+/// Abstraction over OS process-tree isolation so tests can inject an
+/// assignment failure without a production switch.
+trait ProcessTree: Sized {
+    fn create() -> ToolResult<Self>;
+    fn assign(&mut self, child: &Child) -> ToolResult<()>;
+    fn terminate(&self) -> ToolResult<()>;
+}
+
 /// Run a program with literal argv (never via a shell), capturing bounded
 /// stdout/stderr and enforcing `timeout` with whole-tree cleanup.
 pub(crate) fn run(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    max_output: usize,
+) -> ToolResult<ToolOutput> {
+    run_with::<ProcessTreeGuard>(program, args, cwd, timeout, max_output)
+}
+
+fn run_with<G: ProcessTree>(
     program: &Path,
     args: &[String],
     cwd: &Path,
@@ -34,14 +52,16 @@ pub(crate) fn run(
         command.process_group(0);
     }
 
-    let mut guard = ProcessTreeGuard::create()?;
+    let mut guard = G::create()?;
     let mut child = command.spawn().map_err(|error| {
         ToolError::new(
             ErrorCode::ToolExecutionFailed,
             format!("cannot spawn {}: {error}", program.display()),
         )
     })?;
-    guard.assign(&child)?;
+    if let Err(cause) = guard.assign(&child) {
+        return cleanup_orphan(&mut child, program, cause);
+    }
 
     let stdout_thread = spawn_reader(child.stdout.take(), max_output);
     let stderr_thread = spawn_reader(child.stderr.take(), max_output);
@@ -119,6 +139,37 @@ pub(crate) fn run(
     })
 }
 
+/// Fail-closed cleanup for a child that spawned but was never assigned to a
+/// Job Object / process group. The child is killed and reaped directly; only
+/// then is the original assignment error returned.
+fn cleanup_orphan(child: &mut Child, program: &Path, cause: ToolError) -> ToolResult<ToolOutput> {
+    let pid = child.id();
+    let killed = child.kill().is_ok();
+    let reaped = child.wait().is_ok();
+    // Close any remaining pipe read ends so no handle outlives the cleanup.
+    drop(child.stdin.take());
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    if !killed || !reaped {
+        return Err(ToolError::new(
+            ErrorCode::ShellCleanupFailed,
+            format!(
+                "cannot clean up child process {pid} of {} after assignment failed: {}",
+                program.display(),
+                cause.message()
+            ),
+        ));
+    }
+    Err(ToolError::new(
+        cause.error_code(),
+        format!(
+            "{}: {} (child process {pid} was terminated)",
+            cause.code(),
+            cause.message()
+        ),
+    ))
+}
+
 fn configure_environment(command: &mut Command) {
     command.env_clear();
     #[cfg(windows)]
@@ -189,8 +240,8 @@ struct ProcessTreeGuard {
     pgid: i32,
 }
 
-impl ProcessTreeGuard {
-    #[cfg(windows)]
+#[cfg(windows)]
+impl ProcessTree for ProcessTreeGuard {
     fn create() -> ToolResult<Self> {
         use std::mem::size_of;
         use windows_sys::Win32::Foundation::CloseHandle;
@@ -226,12 +277,6 @@ impl ProcessTreeGuard {
         Ok(Self { job })
     }
 
-    #[cfg(unix)]
-    fn create() -> ToolResult<Self> {
-        Ok(Self { pgid: 0 })
-    }
-
-    #[cfg(windows)]
     fn assign(&mut self, child: &Child) -> ToolResult<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
@@ -245,13 +290,6 @@ impl ProcessTreeGuard {
         Ok(())
     }
 
-    #[cfg(unix)]
-    fn assign(&mut self, child: &Child) -> ToolResult<()> {
-        self.pgid = child.id() as i32;
-        Ok(())
-    }
-
-    #[cfg(windows)]
     fn terminate(&self) -> ToolResult<()> {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         let ok = unsafe { TerminateJobObject(self.job, 1) };
@@ -263,8 +301,19 @@ impl ProcessTreeGuard {
         }
         Ok(())
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl ProcessTree for ProcessTreeGuard {
+    fn create() -> ToolResult<Self> {
+        Ok(Self { pgid: 0 })
+    }
+
+    fn assign(&mut self, child: &Child) -> ToolResult<()> {
+        self.pgid = child.id() as i32;
+        Ok(())
+    }
+
     fn terminate(&self) -> ToolResult<()> {
         let status = Command::new("kill")
             .args(["-9", &format!("-{}", self.pgid)])
@@ -289,8 +338,87 @@ impl Drop for ProcessTreeGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::process::Child;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use hive_policy::ErrorCode;
     use hive_store::{classify_recovery, RecoveryDecision, SideEffectState, Store};
     use hive_types::{AttemptNo, EventId, EventInput, EventKind, LeaseToken, NodeState};
+
+    use super::{run_with, ProcessTree};
+    use crate::{ToolError, ToolResult};
+
+    thread_local! {
+        static ASSIGNED_PID: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct FailingAssign;
+
+    impl ProcessTree for FailingAssign {
+        fn create() -> ToolResult<Self> {
+            Ok(FailingAssign)
+        }
+
+        fn assign(&mut self, child: &Child) -> ToolResult<()> {
+            ASSIGNED_PID.with(|slot| slot.set(Some(child.id())));
+            Err(ToolError::new(
+                ErrorCode::ToolExecutionFailed,
+                "injected assign failure",
+            ))
+        }
+
+        fn terminate(&self) -> ToolResult<()> {
+            Ok(())
+        }
+    }
+
+    fn helper_binary() -> PathBuf {
+        let name = if cfg!(windows) {
+            "hive_shell_helper.exe"
+        } else {
+            "hive_shell_helper"
+        };
+        let mut dir = std::env::current_exe()
+            .expect("current exe")
+            .parent()
+            .map(PathBuf::from);
+        while let Some(current) = dir {
+            let candidate = current.join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+            dir = current.parent().map(PathBuf::from);
+        }
+        panic!("hive_shell_helper binary not found");
+    }
+
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn process_alive(pid: u32) -> bool {
+        std::fs::metadata(format!("/proc/{pid}")).is_ok()
+    }
 
     #[test]
     fn uncertain_shell_completion_requires_recovery() {
@@ -340,5 +468,30 @@ mod tests {
             .find(|record| record.node_id == node.node_id)
             .expect("reclaimed node");
         assert_eq!(reclaimed_node.state, NodeState::NeedsRecovery);
+    }
+
+    #[test]
+    fn assign_failure_kills_spawned_child_without_orphan() {
+        let helper = helper_binary();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "hive-tools-orphan-{}-{counter}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let args = vec!["sleep".to_owned(), "60000".to_owned()];
+        let result = run_with::<FailingAssign>(&helper, &args, &dir, Duration::from_secs(5), 1024);
+        assert!(result.is_err());
+        assert_eq!(result.as_ref().unwrap_err().code(), "tool.execution_failed");
+
+        let pid = ASSIGNED_PID.with(|slot| slot.get()).expect("pid recorded");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !process_alive(pid),
+            "child process {pid} must be killed after assign failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
