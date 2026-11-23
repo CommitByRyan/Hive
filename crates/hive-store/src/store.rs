@@ -910,20 +910,56 @@ impl Store {
         Ok(out)
     }
 
+    /// Reclaim expired leases: `leased -> ready` emits `node.ready` and
+    /// `running -> needs_recovery` emits `node.needs_recovery` (reason
+    /// `lease_expired`). Each state transition and its event commit in one
+    /// `IMMEDIATE` transaction, and the row update is state-guarded so a row
+    /// already reclaimed elsewhere never emits a duplicate event.
     pub fn reclaim_expired_leases(&mut self, now_ms: i64) -> StoreResult<Vec<NodeRecord>> {
         let expired = self.find_expired_leases(now_ms)?;
         let mut reclaimed = Vec::with_capacity(expired.len());
         for node in expired {
-            let next_state = match node.state {
-                NodeState::Leased => NodeState::Ready,
-                NodeState::Running => NodeState::NeedsRecovery,
+            let (next_state, kind, reason) = match node.state {
+                NodeState::Leased => (NodeState::Ready, EventKind::NodeReady, None),
+                NodeState::Running => (
+                    NodeState::NeedsRecovery,
+                    EventKind::NodeNeedsRecovery,
+                    Some("lease_expired"),
+                ),
                 _ => continue,
             };
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let validated = node.state.transition(next_state)?;
-            self.conn.execute(
-                "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
-                params![validated.as_str(), now_ms, node.node_id.to_string()],
+            let affected = tx.execute(
+                "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3 AND state = ?4",
+                params![validated.as_str(), now_ms, node.node_id.to_string(), node.state.as_str()],
             )?;
+            if affected != 1 {
+                tx.commit()?;
+                continue;
+            }
+            let payload = match reason {
+                Some(reason) => serde_json::json!({
+                    "reason": reason,
+                    "last_state": node.state.as_str(),
+                }),
+                None => serde_json::json!({}),
+            };
+            let event = EventInput {
+                event_id: EventId::new(),
+                kind,
+                mission_id: node.mission_id,
+                run_id: Some(node.run_id),
+                node_id: Some(node.node_id),
+                session_id: None,
+                attempt_no: Some(node.attempt_no),
+                trace_id: None,
+                payload,
+            };
+            insert_event(&tx, &event)?;
+            tx.commit()?;
             reclaimed.push(query_node(&self.conn, node.node_id)?.expect("node exists"));
         }
         Ok(reclaimed)
@@ -4120,6 +4156,76 @@ mod tests {
             .expect("present");
         assert_eq!(node.state, NodeState::NeedsRecovery);
         assert!(node.lease_token.is_none());
+    }
+
+    #[test]
+    fn lease_reclaim_writes_ready_event_in_same_transaction() {
+        let (mut store, _mission, _run, node) = setup();
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let token = LeaseToken::generate();
+        store
+            .lease_node(node.node_id, &token, "exec", 1_000, 0)
+            .expect("lease");
+
+        let reclaimed = store.reclaim_expired_leases(2_000).expect("reclaim");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].state, NodeState::Ready);
+        assert_eq!(reclaimed[0].attempt_no.get(), 1);
+        assert!(reclaimed[0].lease_token.is_none());
+
+        let events = store.read_all_events().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == EventKind::NodeReady)
+                .count(),
+            1
+        );
+
+        // A second reclaim finds nothing and emits no duplicate event.
+        assert!(store
+            .reclaim_expired_leases(2_000)
+            .expect("again")
+            .is_empty());
+        let events = store.read_all_events().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == EventKind::NodeReady)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lease_reclaim_writes_needs_recovery_event() {
+        let (mut store, _mission, _run, node) = setup();
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let token = LeaseToken::generate();
+        store
+            .lease_node(node.node_id, &token, "exec", 1_000, 0)
+            .expect("lease");
+        store
+            .update_node_state(node.node_id, NodeState::Running, 0)
+            .expect("running");
+
+        let reclaimed = store.reclaim_expired_leases(2_000).expect("reclaim");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].state, NodeState::NeedsRecovery);
+        assert!(reclaimed[0].lease_token.is_none());
+
+        let events = store.read_all_events().expect("events");
+        let recovery: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::NodeNeedsRecovery)
+            .collect();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].payload["reason"], "lease_expired");
+        assert_eq!(recovery[0].payload["last_state"], "running");
     }
 
     #[test]

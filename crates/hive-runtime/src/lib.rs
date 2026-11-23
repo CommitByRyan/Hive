@@ -10,6 +10,7 @@
 mod clock;
 mod error;
 mod executor;
+mod lifecycle;
 mod plan;
 mod recovery;
 mod routine;
@@ -19,6 +20,7 @@ mod threaded;
 pub use clock::{Clock, SystemClock, TestClock};
 pub use error::RuntimeError;
 pub use executor::{ExecOutcome, NodeExecutor};
+pub use lifecycle::{run_startup, tick_once, TickReport};
 pub use plan::{validate_plan, NodeSpec, Plan, PlanError, PlanNode, Topology};
 pub use recovery::{run_startup_recovery, RecoveryReport};
 pub use routine::{tick_routines, RoutineTickReport};
