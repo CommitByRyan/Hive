@@ -1,7 +1,7 @@
 use hive_types::{
     AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, HandoffArtifact,
-    HandoffDecision, HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState, RunId,
-    RunState, ToolCallId, TurnId,
+    HandoffDecision, HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState, RoutineId,
+    RunId, RunState, ToolCallId, TurnId,
 };
 use serde_json::Value;
 
@@ -445,6 +445,56 @@ pub struct BudgetSummary {
     pub consumed: i64,
     pub hard_limit: Option<i64>,
     pub remaining: Option<i64>,
+}
+
+/// A persisted Routine row (V6). `enabled` is `false` when a tick has disabled
+/// the row after encountering an invalid schedule or an unrecoverable fire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutineRecord {
+    pub routine_id: RoutineId,
+    pub name: String,
+    pub goal: String,
+    pub schedule: String,
+    pub enabled: bool,
+    pub timezone: String,
+    pub last_run_ms: Option<i64>,
+    pub next_run_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutineFireState {
+    Created,
+    Failed,
+}
+
+impl RoutineFireState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "created" => Some(Self::Created),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One fire window for a routine. `(routine_id, fire_at_ms)` is the primary
+/// key, so a window can be fired at most once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutineFireRecord {
+    pub routine_id: RoutineId,
+    pub fire_at_ms: i64,
+    pub mission_id: Option<MissionId>,
+    pub state: RoutineFireState,
+    pub created_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

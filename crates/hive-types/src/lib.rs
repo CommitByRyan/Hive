@@ -19,8 +19,15 @@ pub const DEFAULT_RENEWAL_SECONDS: u64 = 20;
 pub const DEFAULT_RETRY_BUDGET: u32 = 3;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECONDS: u64 = 600;
 
-pub const ID_PREFIXES: [&str; 12] = [
-    "m_", "r_", "n_", "a_", "tn_", "e_", "tc_", "ap_", "f_", "prj_", "tr_", "hd_",
+/// Reserved, well-formed v4 Mission identity used as the event scope for
+/// process-level events with no single Mission owner (currently
+/// `routine.updated` / `routine.deleted` / `routine.error`). It is not a
+/// `missions` row and must never be scheduled or queried as a normal Mission.
+/// See ADR 0006.
+pub const SYSTEM_SCOPE_MISSION_ID: &str = "m_00000000-0000-4000-8000-000000000000";
+
+pub const ID_PREFIXES: [&str; 13] = [
+    "m_", "r_", "n_", "a_", "tn_", "e_", "tc_", "ap_", "f_", "prj_", "tr_", "hd_", "rt_",
 ];
 
 #[derive(Debug, Error)]
@@ -79,6 +86,7 @@ pub enum IdPrefix {
     Project,
     Trace,
     Handoff,
+    Routine,
 }
 
 impl IdPrefix {
@@ -96,6 +104,7 @@ impl IdPrefix {
             Self::Project => "prj_",
             Self::Trace => "tr_",
             Self::Handoff => "hd_",
+            Self::Routine => "rt_",
         }
     }
 
@@ -113,6 +122,7 @@ impl IdPrefix {
             "prj_" => Ok(Self::Project),
             "tr_" => Ok(Self::Trace),
             "hd_" => Ok(Self::Handoff),
+            "rt_" => Ok(Self::Routine),
             other => Err(HiveError::InvalidId {
                 value: other.to_owned(),
                 reason: "unknown ID prefix".to_owned(),
@@ -239,6 +249,7 @@ define_prefixed_id!(ArtifactId, "f_", IdPrefix::Artifact);
 define_prefixed_id!(ProjectId, "prj_", IdPrefix::Project);
 define_prefixed_id!(TraceId, "tr_", IdPrefix::Trace);
 define_prefixed_id!(HandoffId, "hd_", IdPrefix::Handoff);
+define_prefixed_id!(RoutineId, "rt_", IdPrefix::Routine);
 
 /// Logical execution count for a Node. Starts at 1; zero is invalid.
 ///
@@ -1083,7 +1094,8 @@ mod tests {
         assert!(ProjectId::new().to_string().starts_with("prj_"));
         assert!(TraceId::new().to_string().starts_with("tr_"));
         assert!(HandoffId::new().to_string().starts_with("hd_"));
-        assert_eq!(ID_PREFIXES.len(), 12);
+        assert!(RoutineId::new().to_string().starts_with("rt_"));
+        assert_eq!(ID_PREFIXES.len(), 13);
     }
 
     #[test]
@@ -1282,6 +1294,26 @@ mod tests {
     }
 
     #[test]
+    fn routine_id_round_trips_and_rejects_wrong_prefix() {
+        let value = format!("rt_{UUID_V4}");
+        let routine = RoutineId::parse(&value).expect("valid routine id");
+        assert_eq!(routine.to_string(), value);
+        assert_eq!(routine.prefix(), IdPrefix::Routine);
+        assert_eq!(routine.as_uuid(), &Uuid::parse_str(UUID_V4).expect("uuid"));
+
+        let error = RoutineId::parse(&format!("m_{UUID_V4}")).expect_err("wrong prefix");
+        assert_eq!(error.code(), "invalid_id");
+    }
+
+    #[test]
+    fn system_scope_mission_id_is_valid_v4() {
+        let mission = MissionId::parse(SYSTEM_SCOPE_MISSION_ID).expect("valid system scope id");
+        assert_eq!(mission.to_string(), SYSTEM_SCOPE_MISSION_ID);
+        assert_eq!(mission.prefix(), IdPrefix::Mission);
+        assert_eq!(mission.as_uuid().get_version_num(), 4);
+    }
+
+    #[test]
     fn handoff_created_event_kind_round_trips() {
         assert_eq!(EventKind::HandoffCreated.as_str(), "handoff.created");
         assert_eq!(
@@ -1432,6 +1464,10 @@ mod tests {
             (EventKind::NodeNeedsRecovery, "node.needs_recovery"),
             (EventKind::ModelRetry, "model.retry"),
             (EventKind::ModelFallback, "model.fallback"),
+            (EventKind::RoutineTriggered, "routine.triggered"),
+            (EventKind::RoutineError, "routine.error"),
+            (EventKind::RoutineUpdated, "routine.updated"),
+            (EventKind::RoutineDeleted, "routine.deleted"),
         ] {
             assert_eq!(kind.as_str(), value);
             assert_eq!(EventKind::from_str(value).expect("parse"), kind);

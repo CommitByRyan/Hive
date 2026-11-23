@@ -49,6 +49,15 @@ impl ApiError {
             hive_store::StoreError::ApprovalConflict(message) => {
                 Self::conflict("approval_conflict", message)
             }
+            hive_store::StoreError::InvalidSchedule(message) => {
+                Self::bad_request("invalid_schedule", message)
+            }
+            hive_store::StoreError::InvalidTimezone(message) => {
+                Self::bad_request("invalid_timezone", message)
+            }
+            hive_store::StoreError::RoutineLimit => {
+                Self::bad_request("routine_limit", "routine limit reached")
+            }
             _ => Self::internal(error.to_string()),
         }
     }

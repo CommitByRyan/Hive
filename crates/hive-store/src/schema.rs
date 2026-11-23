@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::{StoreError, StoreResult};
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 pub const BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub fn apply_pragmas(conn: &Connection) -> StoreResult<()> {
@@ -37,6 +37,7 @@ fn apply_migration(conn: &Connection, target: i64) -> StoreResult<()> {
         3 => conn.execute_batch(V3_SCHEMA)?,
         4 => conn.execute_batch(V4_SCHEMA)?,
         5 => conn.execute_batch(V5_SCHEMA)?,
+        6 => conn.execute_batch(V6_SCHEMA)?,
         other => {
             return Err(StoreError::Conflict(format!(
                 "unknown migration version {other}"
@@ -267,4 +268,29 @@ CREATE TABLE budgets (
     PRIMARY KEY (scope_kind, scope_id, dimension)
 );
 CREATE INDEX idx_budgets_scope ON budgets(scope_kind, scope_id);
+"#;
+
+pub(crate) const V6_SCHEMA: &str = r#"
+CREATE TABLE routines (
+    routine_id    TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    goal          TEXT NOT NULL,
+    schedule      TEXT NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    timezone      TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    last_run_ms   INTEGER,
+    next_run_ms   INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_routines_due ON routines(enabled, next_run_ms);
+
+CREATE TABLE routine_fires (
+    routine_id    TEXT NOT NULL REFERENCES routines(routine_id) ON DELETE CASCADE,
+    fire_at_ms    INTEGER NOT NULL,
+    mission_id    TEXT,
+    state         TEXT NOT NULL CHECK (state IN ('created','failed')),
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (routine_id, fire_at_ms)
+);
 "#;

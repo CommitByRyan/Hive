@@ -1,5 +1,6 @@
 mod error;
 mod records;
+mod routine;
 mod schema;
 mod store;
 mod time;
@@ -15,10 +16,12 @@ pub use records::{
     can_retry, classify_recovery, AgentSessionRecord, AgentSessionState, ApprovalDecision,
     ApprovalInput, ApprovalRecord, ArtifactRecord, BudgetDimension, BudgetLimits, BudgetRecord,
     BudgetSummary, HandoffRecord, LeaseGuard, MissionAggregate, MissionListRecord, MissionRecord,
-    MissionSnapshotRecord, NewAgentSession, NewTurnUsage, NodeRecord, RecoveryDecision, RunRecord,
-    SideEffectState, SnapshotInput, SnapshotRecord, StateSnapshotRecord, ToolAuditRecord,
-    TurnRecord, TurnState, TurnUsageRecord, UsageSource,
+    MissionSnapshotRecord, NewAgentSession, NewTurnUsage, NodeRecord, RecoveryDecision,
+    RoutineFireRecord, RoutineFireState, RoutineRecord, RunRecord, SideEffectState, SnapshotInput,
+    SnapshotRecord, StateSnapshotRecord, ToolAuditRecord, TurnRecord, TurnState, TurnUsageRecord,
+    UsageSource,
 };
+pub use routine::{Schedule, DEFAULT_TIMEZONE};
 pub use schema::SCHEMA_VERSION;
-pub use store::Store;
+pub use store::{RoutineFireOutcome, Store};
 pub use time::{now_ms, now_rfc3339, rfc3339_from_ms};
