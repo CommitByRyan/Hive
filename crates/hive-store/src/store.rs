@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use hive_types::{
-    AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, EventInput, LeaseToken,
-    MissionId, MissionState, NodeId, NodeState, RunId, RunState, ToolCallId, TurnId,
-    EVENT_SCHEMA_VERSION,
+    AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, EventId, EventInput,
+    EventKind, Handoff, HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState, RunId,
+    RunState, ToolCallId, TurnId, EVENT_SCHEMA_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AgentSessionRecord, AgentSessionState, ApprovalDecision, ApprovalInput, ApprovalRecord,
-    LeaseGuard, MissionAggregate, MissionRecord, NewAgentSession, NewTurnUsage, NodeRecord,
-    RunRecord, SnapshotInput, SnapshotRecord, ToolAuditRecord, TurnRecord, TurnState,
+    HandoffRecord, LeaseGuard, MissionAggregate, MissionRecord, NewAgentSession, NewTurnUsage,
+    NodeRecord, RunRecord, SnapshotInput, SnapshotRecord, ToolAuditRecord, TurnRecord, TurnState,
     TurnUsageRecord, UsageSource,
 };
 use crate::schema;
@@ -1260,6 +1260,54 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Validate and persist a Handoff, emitting `handoff.created` in the same
+    /// transaction as the row insert so state and event never diverge.
+    pub fn insert_handoff(&mut self, handoff: &Handoff) -> StoreResult<HandoffRecord> {
+        handoff.validate()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = insert_handoff_on(&tx, handoff, now_ms())?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::HandoffCreated,
+            mission_id: handoff.mission_id,
+            run_id: Some(handoff.run_id),
+            node_id: Some(handoff.node_id),
+            session_id: None,
+            attempt_no: Some(handoff.provenance.attempt_no),
+            trace_id: None,
+            payload: serde_json::json!({
+                "handoff_id": record.handoff_id.to_string(),
+                "summary": handoff.summary,
+                "schema_version": handoff.schema_version,
+            }),
+        };
+        insert_event(&tx, &event)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn get_handoff(
+        &self,
+        node_id: NodeId,
+        attempt_no: AttemptNo,
+    ) -> StoreResult<Option<HandoffRecord>> {
+        query_handoff(&self.conn, node_id, attempt_no)
+    }
+
+    pub fn list_handoffs(&self, mission_id: MissionId) -> StoreResult<Vec<HandoffRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE mission_id = ?1 ORDER BY created_at_ms ASC"
+        ))?;
+        let rows = stmt.query_map(params![mission_id.to_string()], raw_handoff_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(parse_handoff(row?)?);
+        }
+        Ok(out)
+    }
 }
 
 const NODE_COLUMNS: &str = "node_id, mission_id, run_id, state, attempt_no, retry_budget, lease_token, lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms";
@@ -1267,6 +1315,185 @@ const NODE_COLUMNS: &str = "node_id, mission_id, run_id, state, attempt_no, retr
 const AGENT_SESSION_COLUMNS: &str = "session_id, mission_id, run_id, node_id, role, model, system_prompt, state, created_at_ms, updated_at_ms, closed_at_ms";
 
 const TURN_COLUMNS: &str = "turn_id, session_id, node_id, attempt_no, turn_index, request_model, finish_reason, state, output_preview, tool_call_count, created_at_ms, updated_at_ms";
+
+const HANDOFF_COLUMNS: &str = "handoff_id, mission_id, run_id, node_id, attempt_no, agent, schema_version, objective, summary, base_revision, created_at_ms, inputs_json, artifacts_json, decisions_json, assumptions_json, risks_json, open_questions_json, acceptance_json, recommended_next_json";
+
+type RawHandoff = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    u32,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+fn raw_handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawHandoff> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+    ))
+}
+
+fn parse_handoff(raw: RawHandoff) -> StoreResult<HandoffRecord> {
+    let (
+        handoff_id,
+        mission_id,
+        run_id,
+        node_id,
+        attempt_no,
+        agent,
+        schema_version,
+        objective,
+        summary,
+        base_revision,
+        created_at_ms,
+        inputs_json,
+        artifacts_json,
+        decisions_json,
+        assumptions_json,
+        risks_json,
+        open_questions_json,
+        acceptance_json,
+        recommended_next_json,
+    ) = raw;
+    Ok(HandoffRecord {
+        handoff_id: HandoffId::parse(&handoff_id)?,
+        mission_id: MissionId::parse(&mission_id)?,
+        run_id: RunId::parse(&run_id)?,
+        node_id: NodeId::parse(&node_id)?,
+        attempt_no: AttemptNo::new(attempt_no as u32)?,
+        agent,
+        schema_version,
+        objective,
+        summary,
+        base_revision,
+        created_at_ms,
+        inputs: serde_json::from_str(&inputs_json)?,
+        artifacts: serde_json::from_str(&artifacts_json)?,
+        decisions: serde_json::from_str(&decisions_json)?,
+        assumptions: serde_json::from_str(&assumptions_json)?,
+        risks: serde_json::from_str(&risks_json)?,
+        open_questions: serde_json::from_str(&open_questions_json)?,
+        acceptance: serde_json::from_str(&acceptance_json)?,
+        recommended_next: serde_json::from_str(&recommended_next_json)?,
+    })
+}
+
+fn query_handoff(
+    conn: &Connection,
+    node_id: NodeId,
+    attempt_no: AttemptNo,
+) -> StoreResult<Option<HandoffRecord>> {
+    let row = conn
+        .query_row(
+            &format!(
+                "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE node_id = ?1 AND attempt_no = ?2"
+            ),
+            params![node_id.to_string(), attempt_no.get()],
+            raw_handoff_row,
+        )
+        .optional()?;
+    row.map(parse_handoff).transpose()
+}
+
+fn insert_handoff_on(
+    conn: &Connection,
+    handoff: &Handoff,
+    created_at_ms: i64,
+) -> StoreResult<HandoffRecord> {
+    let record = HandoffRecord {
+        handoff_id: HandoffId::new(),
+        mission_id: handoff.mission_id,
+        run_id: handoff.run_id,
+        node_id: handoff.node_id,
+        attempt_no: handoff.provenance.attempt_no,
+        agent: handoff.agent.clone(),
+        schema_version: handoff.schema_version,
+        objective: handoff.objective.clone(),
+        summary: handoff.summary.clone(),
+        base_revision: handoff.provenance.base_revision.clone(),
+        created_at_ms,
+        inputs: handoff.inputs.clone(),
+        artifacts: handoff.artifacts.clone(),
+        decisions: handoff.decisions.clone(),
+        assumptions: handoff.assumptions.clone(),
+        risks: handoff.risks.clone(),
+        open_questions: handoff.open_questions.clone(),
+        acceptance: handoff.acceptance.clone(),
+        recommended_next: handoff.recommended_next.clone(),
+    };
+    let inputs_json = serde_json::to_string(&record.inputs)?;
+    let artifacts_json = serde_json::to_string(&record.artifacts)?;
+    let decisions_json = serde_json::to_string(&record.decisions)?;
+    let assumptions_json = serde_json::to_string(&record.assumptions)?;
+    let risks_json = serde_json::to_string(&record.risks)?;
+    let open_questions_json = serde_json::to_string(&record.open_questions)?;
+    let acceptance_json = serde_json::to_string(&record.acceptance)?;
+    let recommended_next_json = serde_json::to_string(&record.recommended_next)?;
+    let result = conn.execute(
+        "INSERT INTO handoffs (handoff_id, mission_id, run_id, node_id, attempt_no, agent, schema_version, objective, summary, base_revision, created_at_ms, inputs_json, artifacts_json, decisions_json, assumptions_json, risks_json, open_questions_json, acceptance_json, recommended_next_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![
+            record.handoff_id.to_string(),
+            record.mission_id.to_string(),
+            record.run_id.to_string(),
+            record.node_id.to_string(),
+            record.attempt_no.get(),
+            record.agent,
+            record.schema_version,
+            record.objective,
+            record.summary,
+            record.base_revision,
+            record.created_at_ms,
+            inputs_json,
+            artifacts_json,
+            decisions_json,
+            assumptions_json,
+            risks_json,
+            open_questions_json,
+            acceptance_json,
+            recommended_next_json,
+        ],
+    );
+    match result {
+        Ok(_) => Ok(record),
+        Err(err) if is_unique_violation(&err) => Err(StoreError::Conflict(format!(
+            "handoff already exists for node {} attempt {}",
+            handoff.node_id,
+            handoff.provenance.attempt_no.get()
+        ))),
+        Err(err) => Err(StoreError::from(err)),
+    }
+}
 
 type RawAgentSession = (
     String,
@@ -1882,8 +2109,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use hive_types::{
-        ApprovalState, AttemptNo, EventId, EventInput, EventKind, LeaseToken, MissionId, NodeId,
-        NodeState, RunId, ToolCallId,
+        AgentSessionId, ApprovalState, ArtifactId, AttemptNo, EventId, EventInput, EventKind,
+        Handoff, HandoffArtifact, HandoffProvenance, LeaseToken, MissionId, NodeId, NodeState,
+        RunId, ToolCallId, HANDOFF_SCHEMA_VERSION,
     };
 
     use super::Store;
@@ -1984,6 +2212,40 @@ mod tests {
             attempt_no: AttemptNo::FIRST,
             lease_token: LeaseToken::generate(),
             expires_at_ms,
+        }
+    }
+
+    fn handoff_input(
+        mission_id: MissionId,
+        run_id: RunId,
+        node_id: NodeId,
+        attempt_no: AttemptNo,
+    ) -> Handoff {
+        Handoff {
+            schema_version: HANDOFF_SCHEMA_VERSION,
+            mission_id,
+            run_id,
+            node_id,
+            agent: "worker".to_owned(),
+            objective: "read the note".to_owned(),
+            summary: "the note says hello".to_owned(),
+            inputs: Vec::new(),
+            artifacts: vec![HandoffArtifact {
+                id: ArtifactId::new(),
+                path: "artifacts/report.md".to_owned(),
+                sha256: "a".repeat(64),
+            }],
+            decisions: Vec::new(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+            acceptance: Vec::new(),
+            recommended_next: Vec::new(),
+            provenance: HandoffProvenance {
+                attempt_no,
+                base_revision: "abc123".to_owned(),
+                created_at: "2026-11-23T00:00:00Z".to_owned(),
+            },
         }
     }
 
@@ -2555,23 +2817,23 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_v3_tables() {
+    fn fresh_database_has_v4_tables() {
         let store = Store::open_in_memory().expect("store");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 6);
+        assert_eq!(tables, 7);
     }
 
     #[test]
-    fn v1_database_migrates_to_v3_and_preserves_rows() {
-        let dir = TempDir::new("v1-to-v3");
+    fn v1_database_migrates_to_v4_and_preserves_rows() {
+        let dir = TempDir::new("v1-to-v4");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
 
@@ -2587,7 +2849,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         let mission = store
             .get_mission(mission_id)
             .expect("mission")
@@ -2596,19 +2858,19 @@ mod tests {
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 6);
+        assert_eq!(tables, 7);
     }
 
     #[test]
-    fn v2_database_migrates_to_v3_and_preserves_rows() {
+    fn v2_database_migrates_to_v4_and_preserves_rows() {
         use crate::schema::V2_SCHEMA;
 
-        let dir = TempDir::new("v2-to-v3");
+        let dir = TempDir::new("v2-to-v4");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
         let run_id = RunId::new();
@@ -2648,7 +2910,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         assert_eq!(
             store
                 .get_mission(mission_id)
@@ -2671,6 +2933,141 @@ mod tests {
             )
             .expect("new tables");
         assert_eq!(new_tables, 3);
+    }
+
+    #[test]
+    fn v3_database_migrates_to_v4_and_preserves_rows() {
+        use crate::schema::{V2_SCHEMA, V3_SCHEMA};
+
+        let dir = TempDir::new("v3-to-v4");
+        let path = dir.path().join("hive.db");
+        let mission_id = MissionId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        let session_id = AgentSessionId::new().to_string();
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw conn");
+            conn.execute_batch(V1_SCHEMA).expect("v1");
+            conn.execute_batch(V2_SCHEMA).expect("v2");
+            conn.execute_batch(V3_SCHEMA).expect("v3");
+            conn.execute(
+                "INSERT INTO missions (mission_id, state, title, goal, created_at_ms, updated_at_ms) VALUES (?1, 'running', 'kept', 'goal', 1, 1)",
+                rusqlite::params![mission_id.to_string()],
+            )
+            .expect("mission");
+            conn.execute(
+                "INSERT INTO runs (run_id, mission_id, state, created_at_ms, updated_at_ms) VALUES (?1, ?2, 'running', 1, 1)",
+                rusqlite::params![run_id.to_string(), mission_id.to_string()],
+            )
+            .expect("run");
+            conn.execute(
+                "INSERT INTO nodes (node_id, mission_id, run_id, state, attempt_no, retry_budget, lease_token, lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, 'running', 1, 3, NULL, NULL, NULL, 1, 1)",
+                rusqlite::params![node_id.to_string(), mission_id.to_string(), run_id.to_string()],
+            )
+            .expect("node");
+            conn.execute(
+                "INSERT INTO agent_sessions (session_id, mission_id, run_id, node_id, role, model, system_prompt, state, created_at_ms, updated_at_ms, closed_at_ms) VALUES (?1, ?2, ?3, ?4, 'worker', 'auto/auto', '', 'active', 1, 1, NULL)",
+                rusqlite::params![
+                    session_id,
+                    mission_id.to_string(),
+                    run_id.to_string(),
+                    node_id.to_string()
+                ],
+            )
+            .expect("session");
+            conn.pragma_update(None, "user_version", 3).expect("set v3");
+        }
+
+        let store = Store::open(&path).expect("migrate");
+        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(
+            store
+                .get_mission(mission_id)
+                .expect("mission")
+                .expect("preserved")
+                .title,
+            "kept"
+        );
+        let sessions: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_sessions", [], |row| row.get(0))
+            .expect("sessions");
+        assert_eq!(sessions, 1);
+        let handoffs: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM handoffs", [], |row| row.get(0))
+            .expect("handoffs");
+        assert_eq!(handoffs, 0);
+    }
+
+    #[test]
+    fn handoff_round_trips_and_emits_event() {
+        let (mut store, mission, run, node) = setup();
+        let handoff = handoff_input(
+            mission.mission_id,
+            run.run_id,
+            node.node_id,
+            AttemptNo::FIRST,
+        );
+        let record = store.insert_handoff(&handoff).expect("insert");
+        assert_eq!(record.node_id, node.node_id);
+        assert_eq!(record.attempt_no, AttemptNo::FIRST);
+        assert_eq!(record.summary, "the note says hello");
+
+        let fetched = store
+            .get_handoff(node.node_id, AttemptNo::FIRST)
+            .expect("get")
+            .expect("present");
+        assert_eq!(fetched.handoff_id, record.handoff_id);
+        assert_eq!(fetched.mission_id, mission.mission_id);
+        assert_eq!(fetched.run_id, run.run_id);
+        assert_eq!(fetched.agent, "worker");
+        assert_eq!(fetched.schema_version, HANDOFF_SCHEMA_VERSION);
+        assert_eq!(fetched.objective, "read the note");
+        assert_eq!(fetched.base_revision, "abc123");
+        assert_eq!(fetched.artifacts.len(), 1);
+        assert_eq!(fetched.artifacts[0].path, "artifacts/report.md");
+
+        let listed = store.list_handoffs(mission.mission_id).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].handoff_id, record.handoff_id);
+
+        let events = store.read_all_events().expect("events");
+        let created = events
+            .iter()
+            .find(|event| event.kind == EventKind::HandoffCreated)
+            .expect("handoff.created");
+        assert_eq!(created.payload["handoff_id"], record.handoff_id.to_string());
+        assert_eq!(created.payload["schema_version"], HANDOFF_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn duplicate_handoff_node_attempt_is_rejected() {
+        let (mut store, mission, run, node) = setup();
+        let handoff = handoff_input(
+            mission.mission_id,
+            run.run_id,
+            node.node_id,
+            AttemptNo::FIRST,
+        );
+        store.insert_handoff(&handoff).expect("first insert");
+        let error = store.insert_handoff(&handoff).expect_err("duplicate");
+        assert!(matches!(error, StoreError::Conflict(_)));
+    }
+
+    #[test]
+    fn insert_handoff_rejects_invalid_handoff() {
+        let (mut store, mission, run, node) = setup();
+        let mut handoff = handoff_input(
+            mission.mission_id,
+            run.run_id,
+            node.node_id,
+            AttemptNo::FIRST,
+        );
+        handoff.summary = String::new();
+        let error = store.insert_handoff(&handoff).expect_err("invalid");
+        assert!(matches!(error, StoreError::State(_)));
     }
 
     #[test]

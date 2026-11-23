@@ -11,6 +11,7 @@ members = [
     "crates/hive-llm",
     "crates/hive-agent",
     "crates/hive-runtime",
+    "crates/hive-workspace",
 ]
 
 [workspace.package]

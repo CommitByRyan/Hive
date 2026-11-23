@@ -13,8 +13,10 @@ pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub use error::{StoreError, StoreResult};
 pub use records::{
     can_retry, classify_recovery, AgentSessionRecord, AgentSessionState, ApprovalDecision,
-    ApprovalInput, ApprovalRecord, LeaseGuard, MissionAggregate, MissionRecord, NewAgentSession,
-    NewTurnUsage, NodeRecord, RecoveryDecision, RunRecord, SideEffectState, SnapshotInput,
-    SnapshotRecord, ToolAuditRecord, TurnRecord, TurnState, TurnUsageRecord, UsageSource,
+    ApprovalInput, ApprovalRecord, HandoffRecord, LeaseGuard, MissionAggregate, MissionRecord,
+    NewAgentSession, NewTurnUsage, NodeRecord, RecoveryDecision, RunRecord, SideEffectState,
+    SnapshotInput, SnapshotRecord, ToolAuditRecord, TurnRecord, TurnState, TurnUsageRecord,
+    UsageSource,
 };
 pub use store::Store;
+pub use time::{now_ms, now_rfc3339, rfc3339_from_ms};

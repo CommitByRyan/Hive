@@ -1,6 +1,7 @@
 use hive_types::{
-    AgentSessionId, ApprovalId, ApprovalState, AttemptNo, LeaseToken, MissionId, MissionState,
-    NodeId, NodeState, RunId, RunState, ToolCallId, TurnId,
+    AgentSessionId, ApprovalId, ApprovalState, AttemptNo, HandoffArtifact, HandoffDecision,
+    HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState, RunId, RunState, ToolCallId,
+    TurnId,
 };
 use serde_json::Value;
 
@@ -260,6 +261,33 @@ pub struct TurnUsageRecord {
     pub source: UsageSource,
     pub request_id: Option<String>,
     pub created_at_ms: i64,
+}
+
+/// Persisted projection of a structured Handoff (PROTOCOL.md V4 contract).
+///
+/// Structured list fields are stored as JSON text in the `handoffs` table;
+/// `created_at_ms` is the store-assigned timestamp.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandoffRecord {
+    pub handoff_id: HandoffId,
+    pub mission_id: MissionId,
+    pub run_id: RunId,
+    pub node_id: NodeId,
+    pub attempt_no: AttemptNo,
+    pub agent: String,
+    pub schema_version: u32,
+    pub objective: String,
+    pub summary: String,
+    pub base_revision: String,
+    pub created_at_ms: i64,
+    pub inputs: Vec<String>,
+    pub artifacts: Vec<HandoffArtifact>,
+    pub decisions: Vec<HandoffDecision>,
+    pub assumptions: Vec<String>,
+    pub risks: Vec<String>,
+    pub open_questions: Vec<String>,
+    pub acceptance: Vec<String>,
+    pub recommended_next: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
