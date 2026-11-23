@@ -1,8 +1,9 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use hive_platform::{
+    default_path_platform, DirectoryEntry, DirectoryEntryKind, PathPlatform, PlatformError,
+};
 use hive_policy::{
     request_hash, ApprovalMode, HashRequest, NetworkPolicy, PathAccess, PathPolicy, PolicyError,
     RiskLevel, ShellPolicy, ToolRegistry,
@@ -16,8 +17,6 @@ use crate::{
     ApprovalGate, AuditSink, NormalizedToolRequest, ToolCall, ToolCallOutcome, ToolContext,
     ToolError, ToolOutput, ToolResult,
 };
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn default_registry() -> Result<ToolRegistry, ToolError> {
     let mut registry = ToolRegistry::new();
@@ -71,12 +70,14 @@ pub struct ToolDispatcher {
 }
 
 enum PreparedAction {
-    Read(PathBuf),
+    Read(hive_platform::PathHandle),
     Write {
-        path: PathBuf,
+        relative: PathBuf,
         content: Vec<u8>,
     },
-    List(PathBuf),
+    List {
+        handle: hive_platform::PathHandle,
+    },
     Shell {
         program: PathBuf,
         args: Vec<String>,
@@ -121,6 +122,15 @@ impl ToolDispatcher {
 
     pub fn shell(&self) -> &ShellPolicy {
         &self.shell
+    }
+
+    #[cfg(test)]
+    fn prepare_for_test(
+        &self,
+        request: &NormalizedToolRequest,
+        spec: &hive_policy::ToolSpec,
+    ) -> ToolResult<PreparedAction> {
+        self.prepare(request, spec)
     }
 
     pub fn dispatch(
@@ -221,17 +231,15 @@ impl ToolDispatcher {
         match request.tool_name.as_str() {
             "fs.read" => {
                 let path = string_arg(&request.arguments, "path")?;
-                let authorized = self.paths.authorize(0, path, PathAccess::Read)?;
-                Ok(PreparedAction::Read(authorized.final_path().to_path_buf()))
+                let authorized = self.paths.authorize_handle(0, path, PathAccess::Read)?;
+                Ok(PreparedAction::Read(authorized.into_platform_handle()))
             }
             "fs.list" => {
                 let path = string_arg(&request.arguments, "path")?;
-                let authorized = if path.is_empty() || path == "." {
-                    self.paths.authorize_root(0)?
-                } else {
-                    self.paths.authorize(0, path, PathAccess::List)?
-                };
-                Ok(PreparedAction::List(authorized.final_path().to_path_buf()))
+                let authorized = self.paths.authorize_handle_listing(0, path)?;
+                Ok(PreparedAction::List {
+                    handle: authorized.into_platform_handle(),
+                })
             }
             "fs.write" => {
                 let path = string_arg(&request.arguments, "path")?;
@@ -242,9 +250,23 @@ impl ToolDispatcher {
                     )
                     .into());
                 }
-                let authorized = self.paths.authorize(0, path, PathAccess::Write)?;
+                let root = self.paths.root(0)?;
+                let authorized = hive_policy::validate_relative_path(path)?;
+                if let Some(parent) = authorized.parent() {
+                    let parent = if parent.as_os_str().is_empty() {
+                        root
+                    } else {
+                        &root.join(parent)
+                    };
+                    if parent.exists() && !parent.is_dir() {
+                        return Err(ToolError::new(
+                            hive_policy::ErrorCode::PathUnsupportedForm,
+                            format!("write parent is not a directory: {path}"),
+                        ));
+                    }
+                }
                 Ok(PreparedAction::Write {
-                    path: authorized.final_path().to_path_buf(),
+                    relative: authorized,
                     content: content.as_bytes().to_vec(),
                 })
             }
@@ -282,9 +304,23 @@ impl ToolDispatcher {
         prepared: PreparedAction,
     ) -> ToolResult<ToolOutput> {
         match prepared {
-            PreparedAction::Read(path) => read_bounded(&path, spec.max_output),
-            PreparedAction::List(path) => list_bounded(&path, spec.max_output),
-            PreparedAction::Write { path, content } => write_atomic(&path, &content),
+            PreparedAction::Read(handle) => read_bounded(handle, spec.max_output),
+            PreparedAction::List { handle } => list_bounded(&handle, spec.max_output),
+            PreparedAction::Write { relative, content } => {
+                let platform = default_path_platform();
+                let root = platform
+                    .open_root(self.paths.root(0)?)
+                    .map_err(map_platform_error)?;
+                platform
+                    .atomic_write(&root, &relative, &content)
+                    .map_err(map_platform_error)?;
+                Ok(ToolOutput {
+                    content: String::new(),
+                    bytes: content.len(),
+                    truncated: false,
+                    summary: format!("wrote {} bytes", content.len()),
+                })
+            }
             PreparedAction::Shell { program, args, cwd } => {
                 crate::shell::run(&program, &args, &cwd, spec.timeout, spec.max_output)
             }
@@ -420,8 +456,26 @@ fn string_list_arg(arguments: &Value, name: &str) -> ToolResult<Vec<String>> {
     Ok(out)
 }
 
-fn read_bounded(path: &Path, max_output: usize) -> ToolResult<ToolOutput> {
-    let mut file = File::open(path)?;
+fn map_platform_error(error: PlatformError) -> ToolError {
+    ToolError::from(match error {
+        PlatformError::ReparsePoint(message) => {
+            hive_policy::PolicyError::PathReparseEscape(message)
+        }
+        PlatformError::OutsideRoot(message) | PlatformError::CrossVolume(message) => {
+            hive_policy::PolicyError::PathOutsideWorkspace(message)
+        }
+        PlatformError::NotFound(message) => hive_policy::PolicyError::PathNotFound(message),
+        PlatformError::Unsupported(message) => {
+            hive_policy::PolicyError::PathUnsupportedForm(message)
+        }
+        PlatformError::Io { context, source } => {
+            hive_policy::PolicyError::ToolExecutionFailed(format!("{context}: {source}"))
+        }
+    })
+}
+
+fn read_bounded(handle: hive_platform::PathHandle, max_output: usize) -> ToolResult<ToolOutput> {
+    let mut file = handle.into_file().map_err(map_platform_error)?;
     let limit = u64::try_from(max_output).unwrap_or(u64::MAX);
     let mut buffer = Vec::new();
     Read::by_ref(&mut file)
@@ -440,26 +494,22 @@ fn read_bounded(path: &Path, max_output: usize) -> ToolResult<ToolOutput> {
     })
 }
 
-fn list_bounded(path: &Path, max_output: usize) -> ToolResult<ToolOutput> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let kind = if file_type.is_symlink() {
-            "link"
-        } else if file_type.is_dir() {
-            "dir"
-        } else {
-            "file"
-        };
-        entries.push((entry.file_name().to_string_lossy().into_owned(), kind));
-    }
-    entries.sort_by_key(|(name, _)| name.to_lowercase());
+fn list_bounded(handle: &hive_platform::PathHandle, max_output: usize) -> ToolResult<ToolOutput> {
+    let platform = default_path_platform();
+    let mut entries = platform
+        .list_directory(handle)
+        .map_err(map_platform_error)?;
+    entries.sort_by_key(|entry| entry.name.to_lowercase());
 
     let mut lines = Vec::new();
     let mut bytes = 0usize;
     let mut truncated = false;
-    for (name, kind) in entries {
+    for DirectoryEntry { name, kind } in entries {
+        let kind = match kind {
+            DirectoryEntryKind::Link => "link",
+            DirectoryEntryKind::Directory => "dir",
+            DirectoryEntryKind::File => "file",
+        };
         let line = format!("{kind}\t{name}");
         let additional = if lines.is_empty() {
             line.len()
@@ -481,48 +531,6 @@ fn list_bounded(path: &Path, max_output: usize) -> ToolResult<ToolOutput> {
         truncated,
         summary: format!("listed {count} entries"),
     })
-}
-
-fn write_atomic(path: &Path, content: &[u8]) -> ToolResult<ToolOutput> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let temp = temp_path(path);
-    let write_result = (|| -> ToolResult<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    write_result?;
-    Ok(ToolOutput {
-        content: String::new(),
-        bytes: content.len(),
-        truncated: false,
-        summary: format!("wrote {} bytes", content.len()),
-    })
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "hive-temp".to_owned());
-    path.with_file_name(format!(
-        ".{file_name}.hive-tmp-{}-{counter}",
-        std::process::id()
-    ))
 }
 
 #[cfg(test)]
@@ -796,5 +804,202 @@ mod tests {
             .expect_err("extra");
         assert_eq!(error.code(), "tool.arguments_denied");
         assert!(audit.events().is_empty());
+    }
+
+    fn request(name: &str, arguments: serde_json::Value) -> NormalizedToolRequest {
+        NormalizedToolRequest {
+            tool_call_id: ToolCallId::new(),
+            tool_name: name.to_owned(),
+            tool_version: 1,
+            mission_id: MissionId::new(),
+            run_id: None,
+            node_id: NodeId::new(),
+            session_id: None,
+            attempt_no: AttemptNo::FIRST,
+            lease_token: LeaseToken::generate(),
+            arguments,
+            request_hash: "test".to_owned(),
+            policy_version: "v1".to_owned(),
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fs_read_reads_from_authorized_handle_after_path_swap() {
+        let temp = TempDir::new("read-swap");
+        std::fs::write(temp.path().join("file.txt"), b"authorized").expect("original");
+        let dispatcher = dispatcher(temp.path());
+        let spec = dispatcher.registry().get("fs.read").expect("spec");
+        let request = request("fs.read", json!({ "path": "file.txt" }));
+        let prepared = dispatcher
+            .prepare_for_test(&request, spec)
+            .expect("prepare");
+        std::fs::rename(temp.path().join("file.txt"), temp.path().join("old.txt"))
+            .expect("move original");
+        std::fs::write(temp.path().join("file.txt"), b"replacement").expect("replacement");
+        let output = dispatcher
+            .execute(&request, spec, prepared)
+            .expect("execute");
+        assert_eq!(output.content, "authorized");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("file.txt")).expect("new path"),
+            "replacement"
+        );
+    }
+
+    #[test]
+    fn fs_write_replaces_atomically_and_keeps_temp_clean() {
+        let temp = TempDir::new("atomic-replace");
+        std::fs::write(temp.path().join("out.txt"), b"old").expect("old");
+        let dispatcher = dispatcher(temp.path());
+        dispatcher
+            .dispatch(
+                &context(),
+                call("fs.write", json!({ "path": "out.txt", "content": "new" })),
+                &mut RecordingAuditSink::default(),
+                &mut AllowAllApprovals,
+            )
+            .expect("replace");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("out.txt")).expect("new"),
+            "new"
+        );
+        let leftovers = std::fs::read_dir(temp.path())
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("hive-tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn fs_write_cleans_temp_when_replace_fails() {
+        let temp = TempDir::new("replace-fails");
+        std::fs::create_dir(temp.path().join("target.txt")).expect("target directory");
+        std::fs::write(temp.path().join("keep.txt"), b"unchanged").expect("keep");
+        let dispatcher = dispatcher(temp.path());
+        let error = dispatcher
+            .dispatch(
+                &context(),
+                call(
+                    "fs.write",
+                    json!({ "path": "target.txt", "content": "replacement" }),
+                ),
+                &mut RecordingAuditSink::default(),
+                &mut AllowAllApprovals,
+            )
+            .expect_err("directory target");
+        assert_eq!(error.code(), "path.unsupported_form");
+        assert!(temp.path().join("target.txt").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("keep.txt")).expect("keep"),
+            "unchanged"
+        );
+        let leftovers = std::fs::read_dir(temp.path())
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("hive-tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fs_write_rejects_junction_parent_before_temp_creation() {
+        let outside = TempDir::new("write-junction-outside");
+        let temp = TempDir::new("write-junction");
+        let link = temp.path().join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !matches!(status, Ok(status) if status.success()) {
+            eprintln!("SKIP: NTFS junction creation unavailable");
+            return;
+        }
+        let dispatcher = dispatcher(temp.path());
+        let error = dispatcher
+            .dispatch(
+                &context(),
+                call(
+                    "fs.write",
+                    json!({ "path": "link/out.txt", "content": "denied" }),
+                ),
+                &mut RecordingAuditSink::default(),
+                &mut AllowAllApprovals,
+            )
+            .expect_err("junction parent");
+        assert_eq!(error.code(), "path.reparse_escape");
+        assert!(!outside.path().join("out.txt").exists());
+        let leftovers = std::fs::read_dir(outside.path())
+            .expect("outside")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("hive-tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir(link);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fs_write_replaces_leaf_with_authorized_parent_after_target_swap() {
+        let temp = TempDir::new("write-target-swap");
+        std::fs::write(temp.path().join("file.txt"), b"old").expect("old");
+        let dispatcher = dispatcher(temp.path());
+        let spec = dispatcher.registry().get("fs.write").expect("spec");
+        let request = request(
+            "fs.write",
+            json!({ "path": "file.txt", "content": "replacement" }),
+        );
+        let prepared = dispatcher
+            .prepare_for_test(&request, spec)
+            .expect("prepare");
+        std::fs::rename(temp.path().join("file.txt"), temp.path().join("old.txt"))
+            .expect("move old");
+        std::fs::write(temp.path().join("file.txt"), b"other").expect("other");
+        dispatcher
+            .execute(&request, spec, prepared)
+            .expect("replace");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("file.txt")).expect("new"),
+            "replacement"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("old.txt")).expect("old"),
+            "old"
+        );
+    }
+
+    #[test]
+    fn fs_list_uses_authorized_directory_handle() {
+        let temp = TempDir::new("list-handle");
+        std::fs::write(temp.path().join("file.txt"), b"file").expect("file");
+        let dispatcher = dispatcher(temp.path());
+        let outcome = dispatcher
+            .dispatch(
+                &context(),
+                call("fs.list", json!({ "path": "." })),
+                &mut RecordingAuditSink::default(),
+                &mut AllowAllApprovals,
+            )
+            .expect("list");
+        assert_eq!(outcome.output.content, "file\tfile.txt");
+        #[cfg(windows)]
+        assert!(
+            dispatcher
+                .paths()
+                .path_capabilities()
+                .listing_handle_relative
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !dispatcher
+                .paths()
+                .path_capabilities()
+                .listing_handle_relative
+        );
     }
 }

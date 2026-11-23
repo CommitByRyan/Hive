@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 hive-types = { path = "../hive-types" }
 hive-policy = { path = "../hive-policy" }
+hive-platform = { path = "../hive-platform" }
 hive-store = { path = "../hive-store" }
 serde_json.workspace = true
 
