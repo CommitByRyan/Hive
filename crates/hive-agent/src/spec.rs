@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 /// Static description of one Agent Session.
 ///
 /// `tool_allowlist` is an explicit allowlist: an empty list means the model
@@ -10,6 +12,7 @@ pub struct AgentSpec {
     pub tool_allowlist: Vec<String>,
     pub max_turns: u32,
     pub max_tokens: u32,
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl AgentSpec {
@@ -24,6 +27,7 @@ impl AgentSpec {
             tool_allowlist: Vec::new(),
             max_turns: Self::DEFAULT_MAX_TURNS,
             max_tokens: Self::DEFAULT_MAX_TOKENS,
+            workspace_root: None,
         }
     }
 
@@ -44,6 +48,11 @@ impl AgentSpec {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(root.into());
         self
     }
 }

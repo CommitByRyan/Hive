@@ -35,8 +35,11 @@ impl<T: ChatTransport> AgentRunner<'_, T> {
             .store_mut()
             .get_node(node.node_id)?
             .ok_or_else(|| StoreError::NotFound(format!("node {}", node.node_id)))?;
-        let spec = AgentSpec::new(node.spec.role.clone(), node.spec.model.clone())
+        let mut spec = AgentSpec::new(node.spec.role.clone(), node.spec.model.clone())
             .with_system_prompt(node.spec.objective.clone());
+        if let Some(root) = node.spec.workspace_root.clone() {
+            spec = spec.with_workspace_root(root);
+        }
         let session = self.store_mut().create_agent_session(&NewAgentSession {
             mission_id: record.mission_id,
             run_id: Some(record.run_id),
@@ -125,6 +128,36 @@ mod tests {
                 "message": {"role": "assistant", "content": content}
             }]
         })
+    }
+
+    fn init_git_repo(dir: &std::path::Path) -> String {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), b"base\n").expect("write");
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     #[test]
@@ -301,6 +334,58 @@ mod tests {
             .filter(|event| event.kind == EventKind::NodeStarted)
             .count();
         assert_eq!(started, 0, "a stale guard must not emit node.started");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_passes_workspace_root_to_handoff() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("hive-node-executor-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sha = init_git_repo(&dir);
+
+        let mut store = Store::open_in_memory().expect("store");
+        let mission = store.create_mission("m", "goal", 0).expect("mission");
+        let run = store.create_run(mission.mission_id, 0).expect("run");
+        let node_id = NodeId::new();
+        store
+            .add_node_with_id(node_id, mission.mission_id, run.run_id, 0, 0)
+            .expect("node");
+        store
+            .update_node_state(node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let lease_token = LeaseToken::generate();
+        let leased = store
+            .lease_node(node_id, &lease_token, "scheduler", 60_000, 0)
+            .expect("lease");
+        let guard = LeaseGuard {
+            attempt_no: leased.attempt_no,
+            lease_token,
+        };
+
+        let transport = MockTransport::new(vec![MockResponse::json(200, &completion("done"))]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(&dir).expect("dispatcher");
+        let token = CancellationToken::new();
+        let plan_node = PlanNode {
+            node_id,
+            deps: Vec::new(),
+            spec: NodeSpec::new("worker", "mock-model")
+                .with_workspace_root(dir.to_string_lossy().to_string()),
+            retry_budget: 0,
+        };
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut store, &dispatcher, &gateway);
+            runner.execute(&plan_node, &guard, &token)
+        };
+
+        assert!(matches!(outcome, ExecOutcome::Succeeded { .. }));
+        let handoffs = store.list_handoffs(mission.mission_id).expect("handoffs");
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].base_revision, sha);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
