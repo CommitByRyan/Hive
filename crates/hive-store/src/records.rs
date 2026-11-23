@@ -1,6 +1,6 @@
 use hive_types::{
     AgentSessionId, ApprovalId, ApprovalState, AttemptNo, LeaseToken, MissionId, MissionState,
-    NodeId, NodeState, RunId, RunState, ToolCallId,
+    NodeId, NodeState, RunId, RunState, ToolCallId, TurnId,
 };
 use serde_json::Value;
 
@@ -121,6 +121,154 @@ pub struct ToolAuditRecord {
     pub prev_hash: String,
     pub entry_hash: String,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentSessionState {
+    Active,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentSessionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Active)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSessionRecord {
+    pub session_id: AgentSessionId,
+    pub mission_id: MissionId,
+    pub run_id: Option<RunId>,
+    pub node_id: NodeId,
+    pub role: String,
+    pub model: String,
+    pub system_prompt: String,
+    pub state: AgentSessionState,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub closed_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewAgentSession<'a> {
+    pub mission_id: MissionId,
+    pub run_id: Option<RunId>,
+    pub node_id: NodeId,
+    pub role: &'a str,
+    pub model: &'a str,
+    pub system_prompt: &'a str,
+    pub now_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnState {
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TurnState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "started" => Some(Self::Started),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnRecord {
+    pub turn_id: TurnId,
+    pub session_id: AgentSessionId,
+    pub node_id: NodeId,
+    pub attempt_no: AttemptNo,
+    pub turn_index: u32,
+    pub request_model: String,
+    pub finish_reason: Option<String>,
+    pub state: TurnState,
+    pub output_preview: String,
+    pub tool_call_count: u32,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsageSource {
+    Estimated,
+    Authoritative,
+}
+
+impl UsageSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Estimated => "estimated",
+            Self::Authoritative => "authoritative",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "estimated" => Some(Self::Estimated),
+            "authoritative" => Some(Self::Authoritative),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnUsageRecord {
+    pub turn_id: TurnId,
+    pub session_id: AgentSessionId,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub source: UsageSource,
+    pub request_id: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewTurnUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub source: UsageSource,
+    pub request_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

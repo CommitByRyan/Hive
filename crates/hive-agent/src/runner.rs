@@ -1,0 +1,1193 @@
+use std::time::Duration;
+
+use hive_llm::{ChatRequest, ChatResponse, ChatTransport, Gateway, Message, Role, Tool, Usage};
+use hive_store::{AgentSessionState, LeaseGuard, NewTurnUsage, Store, TurnState, UsageSource};
+use hive_tools::{
+    AuditSink, DenyApprovals, ToolCall, ToolContext, ToolDispatcher, ToolError, ToolResult,
+};
+use hive_types::{
+    AgentSessionId, ApprovalId, EventId, EventInput, EventKind, LeaseToken, MissionId, NodeId,
+    NodeState, RunId,
+};
+use serde_json::{json, Map, Value};
+
+use crate::{AgentError, AgentSpec, CancellationToken};
+
+const PREVIEW_CHARS: usize = 512;
+const DEFAULT_LEASE_SECONDS: u64 = 60;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentOutcome {
+    Completed {
+        session_id: AgentSessionId,
+        turns: u32,
+        final_text: String,
+    },
+    TurnLimitExceeded {
+        session_id: AgentSessionId,
+        turns: u32,
+    },
+    Cancelled {
+        session_id: AgentSessionId,
+        turns: u32,
+    },
+    WaitingApproval {
+        session_id: AgentSessionId,
+        turns: u32,
+        approval_id: ApprovalId,
+        tool_name: String,
+    },
+}
+
+/// Single-node executor.
+///
+/// Every node transition goes through [`Store::transition_node_cas`] with the
+/// lease guard; tool events are written through [`GuardedAuditSink`] so a stale
+/// executor cannot append results after its lease was replaced.
+pub struct AgentRunner<'a, T: ChatTransport> {
+    store: &'a mut Store,
+    tools: &'a ToolDispatcher,
+    gateway: &'a Gateway<T>,
+    lease_owner: String,
+    lease_ttl: Duration,
+}
+
+impl<'a, T: ChatTransport> AgentRunner<'a, T> {
+    pub fn new(store: &'a mut Store, tools: &'a ToolDispatcher, gateway: &'a Gateway<T>) -> Self {
+        Self {
+            store,
+            tools,
+            gateway,
+            lease_owner: format!("h04-{}", std::process::id()),
+            lease_ttl: Duration::from_secs(DEFAULT_LEASE_SECONDS),
+        }
+    }
+
+    pub fn with_lease(mut self, owner: impl Into<String>, ttl: Duration) -> Self {
+        self.lease_owner = owner.into();
+        self.lease_ttl = ttl;
+        self
+    }
+
+    pub fn run_node(
+        &mut self,
+        session: AgentSessionId,
+        node: NodeId,
+        spec: &AgentSpec,
+        cancel: &CancellationToken,
+    ) -> Result<AgentOutcome, AgentError> {
+        let session_record = self
+            .store
+            .get_agent_session(session)?
+            .ok_or(AgentError::SessionNotFound(session))?;
+        if session_record.node_id != node {
+            return Err(AgentError::SessionNodeMismatch {
+                session,
+                expected: node,
+                actual: session_record.node_id,
+            });
+        }
+        let node_record = self
+            .store
+            .get_node(node)?
+            .ok_or_else(|| hive_store::StoreError::NotFound(format!("node {node}")))?;
+        let mission = self
+            .store
+            .get_mission(node_record.mission_id)?
+            .ok_or_else(|| {
+                hive_store::StoreError::NotFound(format!("mission {}", node_record.mission_id))
+            })?;
+        let mission_id = mission.mission_id;
+        let run_id = node_record.run_id;
+        let scope = NodeScope {
+            node,
+            mission_id,
+            run_id,
+            session,
+        };
+
+        let now = now_ms();
+        let lease_token = LeaseToken::generate();
+        let leased = self.store.lease_node(
+            node,
+            &lease_token,
+            &self.lease_owner,
+            now + self.lease_ttl_ms(),
+            now,
+        )?;
+        let guard = LeaseGuard {
+            attempt_no: leased.attempt_no,
+            lease_token,
+        };
+
+        if cancel.is_cancelled() {
+            return self.cancel_node(scope, &guard, NodeState::Leased, 0);
+        }
+
+        let started = node_event(
+            mission_id,
+            Some(run_id),
+            node,
+            session,
+            guard.attempt_no,
+            EventKind::NodeStarted,
+            json!({ "role": spec.role, "model": spec.model }),
+        );
+        self.store
+            .transition_node_cas(node, &guard, NodeState::Running, &started, now)?;
+
+        let mut messages = Vec::new();
+        if !spec.system_prompt.is_empty() {
+            messages.push(Message::system(spec.system_prompt.clone()));
+        }
+        let goal = if mission.goal.is_empty() {
+            "Execute this node.".to_owned()
+        } else {
+            mission.goal.clone()
+        };
+        messages.push(Message::user(goal));
+
+        let tools = self.tool_definitions(spec);
+        let mut turn_index = 0u32;
+
+        loop {
+            if cancel.is_cancelled() {
+                return self.cancel_node(scope, &guard, NodeState::Running, turn_index);
+            }
+            if turn_index >= spec.max_turns {
+                self.fail_node(scope, &guard, turn_index, "turn_limit_exceeded")?;
+                self.store
+                    .set_agent_session_state(session, AgentSessionState::Failed, now_ms())?;
+                return Ok(AgentOutcome::TurnLimitExceeded {
+                    session_id: session,
+                    turns: turn_index,
+                });
+            }
+            turn_index += 1;
+
+            let turn_now = now_ms();
+            self.store.renew_lease(
+                node,
+                &guard.lease_token,
+                &self.lease_owner,
+                turn_now + self.lease_ttl_ms(),
+                turn_now,
+            )?;
+            let turn_event = node_event(
+                mission_id,
+                Some(run_id),
+                node,
+                session,
+                guard.attempt_no,
+                EventKind::NodeTurn,
+                json!({
+                    "turn_index": turn_index,
+                    "model": spec.model,
+                    "message_count": messages.len(),
+                }),
+            );
+            self.store.append_event_guarded(node, &guard, &turn_event)?;
+            let turn = self.store.start_turn(
+                session,
+                node,
+                guard.attempt_no,
+                turn_index,
+                &spec.model,
+                turn_now,
+            )?;
+
+            let mut request = ChatRequest::new(spec.model.clone(), messages.clone())
+                .with_max_tokens(spec.max_tokens);
+            if !tools.is_empty() {
+                request.tools = Some(tools.clone());
+            }
+
+            let response = match self.gateway.complete(&request) {
+                Ok(response) => response,
+                Err(error) => {
+                    let message = error.to_string();
+                    self.store.finish_turn(
+                        turn.turn_id,
+                        TurnState::Failed,
+                        None,
+                        "",
+                        0,
+                        now_ms(),
+                    )?;
+                    self.fail_node(scope, &guard, turn_index, &message)?;
+                    self.store.set_agent_session_state(
+                        session,
+                        AgentSessionState::Failed,
+                        now_ms(),
+                    )?;
+                    return Err(AgentError::Llm(error));
+                }
+            };
+
+            let output_text = response.text().unwrap_or_default().to_owned();
+            let tool_calls = response
+                .message()
+                .and_then(|message| message.tool_calls.clone())
+                .unwrap_or_default();
+            let finish_reason = response
+                .finish_reason()
+                .map(|reason| reason.as_str().to_owned());
+            let preview = preview(&output_text);
+            let usage = build_usage(&response, &request, &output_text, &tool_calls);
+            self.store
+                .record_turn_usage(turn.turn_id, &usage, now_ms())?;
+
+            if cancel.is_cancelled() {
+                self.store.finish_turn(
+                    turn.turn_id,
+                    TurnState::Cancelled,
+                    finish_reason.as_deref(),
+                    &preview,
+                    tool_calls.len() as u32,
+                    now_ms(),
+                )?;
+                return self.cancel_node(scope, &guard, NodeState::Running, turn_index);
+            }
+
+            if !tool_calls.is_empty() {
+                let assistant = response.message().cloned().unwrap_or_else(|| Message {
+                    role: Role::Assistant,
+                    tool_calls: Some(tool_calls.clone()),
+                    ..Message::default()
+                });
+                messages.push(assistant);
+
+                let mut results = Vec::with_capacity(tool_calls.len());
+                for (index, call) in tool_calls.iter().enumerate() {
+                    let call_id = call
+                        .id
+                        .clone()
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| format!("call_{turn_index}_{index}"));
+                    let tool_name = call.name().to_owned();
+                    let arguments = match call.parse_arguments() {
+                        Ok(arguments) => arguments,
+                        Err(error) => {
+                            self.record_tool_denied(
+                                scope,
+                                &guard,
+                                &tool_name,
+                                "tool.invalid_arguments",
+                                &error.to_string(),
+                            )?;
+                            results.push(Message::tool_result(
+                                call_id,
+                                json!({
+                                    "error": "tool.invalid_arguments",
+                                    "message": error.to_string(),
+                                })
+                                .to_string(),
+                            ));
+                            continue;
+                        }
+                    };
+                    if !spec
+                        .tool_allowlist
+                        .iter()
+                        .any(|allowed| allowed == &tool_name)
+                    {
+                        self.record_tool_denied(
+                            scope,
+                            &guard,
+                            &tool_name,
+                            "tool.not_allowed",
+                            "tool is not in the agent allowlist",
+                        )?;
+                        results.push(Message::tool_result(
+                            call_id,
+                            json!({
+                                "error": "tool.not_allowed",
+                                "message": format!("{tool_name} is not in the agent allowlist"),
+                            })
+                            .to_string(),
+                        ));
+                        continue;
+                    }
+
+                    let context = ToolContext {
+                        mission_id,
+                        run_id: Some(run_id),
+                        node_id: node,
+                        session_id: Some(session),
+                        attempt_no: guard.attempt_no,
+                        lease_token: guard.lease_token.clone(),
+                        policy_version: "v1".to_owned(),
+                    };
+                    let outcome = {
+                        let mut audit = GuardedAuditSink {
+                            store: &mut *self.store,
+                            node_id: node,
+                            guard: guard.clone(),
+                        };
+                        let mut approvals = DenyApprovals;
+                        self.tools.dispatch(
+                            &context,
+                            ToolCall::new(tool_name, arguments),
+                            &mut audit,
+                            &mut approvals,
+                        )
+                    };
+                    match outcome {
+                        Ok(outcome) => {
+                            results.push(Message::tool_result(call_id, outcome.output.content));
+                        }
+                        Err(error) if error.code() == "tool.stale_execution" => {
+                            return Err(AgentError::Store(hive_store::StoreError::StaleExecution));
+                        }
+                        Err(error) => {
+                            results.push(Message::tool_result(
+                                call_id,
+                                json!({
+                                    "error": error.code(),
+                                    "message": error.message(),
+                                })
+                                .to_string(),
+                            ));
+                        }
+                    }
+                }
+                messages.extend(results);
+                self.store.finish_turn(
+                    turn.turn_id,
+                    TurnState::Completed,
+                    finish_reason.as_deref(),
+                    &preview,
+                    tool_calls.len() as u32,
+                    now_ms(),
+                )?;
+                continue;
+            }
+
+            if output_text.trim().is_empty() {
+                self.store.finish_turn(
+                    turn.turn_id,
+                    TurnState::Failed,
+                    finish_reason.as_deref(),
+                    "",
+                    0,
+                    now_ms(),
+                )?;
+                self.fail_node(scope, &guard, turn_index, "empty_response")?;
+                self.store
+                    .set_agent_session_state(session, AgentSessionState::Failed, now_ms())?;
+                return Err(AgentError::EmptyResponse);
+            }
+
+            self.store.finish_turn(
+                turn.turn_id,
+                TurnState::Completed,
+                finish_reason.as_deref(),
+                &preview,
+                tool_calls.len() as u32,
+                now_ms(),
+            )?;
+            let succeeded = node_event(
+                mission_id,
+                Some(run_id),
+                node,
+                session,
+                guard.attempt_no,
+                EventKind::NodeSucceeded,
+                json!({
+                    "turns": turn_index,
+                    "finish_reason": finish_reason,
+                    "final_preview": preview,
+                }),
+            );
+            self.store.transition_node_cas(
+                node,
+                &guard,
+                NodeState::Succeeded,
+                &succeeded,
+                now_ms(),
+            )?;
+            self.store
+                .set_agent_session_state(session, AgentSessionState::Completed, now_ms())?;
+            return Ok(AgentOutcome::Completed {
+                session_id: session,
+                turns: turn_index,
+                final_text: output_text,
+            });
+        }
+    }
+
+    fn lease_ttl_ms(&self) -> i64 {
+        i64::try_from(self.lease_ttl.as_millis()).unwrap_or(i64::MAX)
+    }
+
+    fn tool_definitions(&self, spec: &AgentSpec) -> Vec<Tool> {
+        let mut tools = Vec::new();
+        for name in &spec.tool_allowlist {
+            let Some(tool_spec) = self.tools.registry().get(name) else {
+                continue;
+            };
+            let mut properties = Map::new();
+            for argument in &tool_spec.allowed_arguments {
+                properties.insert(argument.clone(), json!({ "type": "string" }));
+            }
+            let schema = json!({
+                "type": "object",
+                "properties": properties,
+                "required": tool_spec.required_arguments,
+            });
+            tools.push(Tool::function(tool_spec.name.clone(), schema));
+        }
+        tools
+    }
+
+    fn record_tool_denied(
+        &mut self,
+        scope: NodeScope,
+        guard: &LeaseGuard,
+        tool_name: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), AgentError> {
+        let intent = node_event(
+            scope.mission_id,
+            Some(scope.run_id),
+            scope.node,
+            scope.session,
+            guard.attempt_no,
+            EventKind::NodeToolCall,
+            json!({ "tool_name": tool_name, "phase": "intent" }),
+        );
+        self.store
+            .append_event_guarded(scope.node, guard, &intent)?;
+        let result = node_event(
+            scope.mission_id,
+            Some(scope.run_id),
+            scope.node,
+            scope.session,
+            guard.attempt_no,
+            EventKind::NodeToolResult,
+            json!({
+                "tool_name": tool_name,
+                "status": "error",
+                "code": code,
+                "message": message,
+            }),
+        );
+        self.store
+            .append_event_guarded(scope.node, guard, &result)?;
+        Ok(())
+    }
+
+    fn fail_node(
+        &mut self,
+        scope: NodeScope,
+        guard: &LeaseGuard,
+        turns: u32,
+        reason: &str,
+    ) -> Result<(), AgentError> {
+        let event = node_event(
+            scope.mission_id,
+            Some(scope.run_id),
+            scope.node,
+            scope.session,
+            guard.attempt_no,
+            EventKind::NodeFailed,
+            json!({ "reason": reason, "turns": turns }),
+        );
+        self.store
+            .transition_node_cas(scope.node, guard, NodeState::Failed, &event, now_ms())?;
+        Ok(())
+    }
+
+    fn cancel_node(
+        &mut self,
+        scope: NodeScope,
+        guard: &LeaseGuard,
+        from: NodeState,
+        turns: u32,
+    ) -> Result<AgentOutcome, AgentError> {
+        debug_assert!(matches!(from, NodeState::Leased | NodeState::Running));
+        let event = node_event(
+            scope.mission_id,
+            Some(scope.run_id),
+            scope.node,
+            scope.session,
+            guard.attempt_no,
+            EventKind::NodeCancelled,
+            json!({ "turns": turns }),
+        );
+        self.store.transition_node_cas(
+            scope.node,
+            guard,
+            NodeState::Cancelled,
+            &event,
+            now_ms(),
+        )?;
+        self.store.set_agent_session_state(
+            scope.session,
+            AgentSessionState::Cancelled,
+            now_ms(),
+        )?;
+        Ok(AgentOutcome::Cancelled {
+            session_id: scope.session,
+            turns,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NodeScope {
+    node: NodeId,
+    mission_id: MissionId,
+    run_id: RunId,
+    session: AgentSessionId,
+}
+
+struct GuardedAuditSink<'a> {
+    store: &'a mut Store,
+    node_id: NodeId,
+    guard: LeaseGuard,
+}
+
+impl AuditSink for GuardedAuditSink<'_> {
+    fn append(&mut self, event: &EventInput) -> ToolResult<()> {
+        self.store
+            .append_event_guarded(self.node_id, &self.guard, event)
+            .map(|_| ())
+            .map_err(ToolError::from)
+    }
+}
+
+fn node_event(
+    mission_id: MissionId,
+    run_id: Option<RunId>,
+    node_id: NodeId,
+    session_id: AgentSessionId,
+    attempt_no: hive_types::AttemptNo,
+    kind: EventKind,
+    payload: Value,
+) -> EventInput {
+    EventInput {
+        event_id: EventId::new(),
+        kind,
+        mission_id,
+        run_id,
+        node_id: Some(node_id),
+        session_id: Some(session_id),
+        attempt_no: Some(attempt_no),
+        trace_id: None,
+        payload,
+    }
+}
+
+fn build_usage(
+    response: &ChatResponse,
+    request: &ChatRequest,
+    output_text: &str,
+    tool_calls: &[hive_llm::ToolCall],
+) -> NewTurnUsage {
+    if let Some(usage) = response.usage.as_ref() {
+        return authoritative_usage(usage, request_id(response));
+    }
+    let prompt = serde_json::to_string(&request.messages)
+        .map(|encoded| estimate_tokens(&encoded))
+        .unwrap_or(1);
+    let mut completion_text = output_text.to_owned();
+    for call in tool_calls {
+        completion_text.push_str(&call.function.arguments);
+    }
+    let completion = estimate_tokens(&completion_text);
+    NewTurnUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt.saturating_add(completion),
+        source: UsageSource::Estimated,
+        request_id: None,
+    }
+}
+
+fn authoritative_usage(usage: &Usage, request_id: Option<String>) -> NewTurnUsage {
+    let prompt_tokens = u64::from(usage.prompt_tokens);
+    let completion_tokens = u64::from(usage.completion_tokens);
+    let total_tokens = u64::from(usage.total_tokens).max(prompt_tokens + completion_tokens);
+    NewTurnUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        source: UsageSource::Authoritative,
+        request_id,
+    }
+}
+
+fn request_id(response: &ChatResponse) -> Option<String> {
+    (!response.id.is_empty()).then(|| response.id.clone())
+}
+
+fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64 / 4).max(1)
+}
+
+fn preview(text: &str) -> String {
+    text.chars().take(PREVIEW_CHARS).collect()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use hive_llm::{
+        ChatTransport, HttpResponse, LlmError, MockResponse, MockTransport, RetryPolicy,
+    };
+    use hive_store::{AgentSessionRecord, MissionRecord, NewAgentSession, NodeRecord, RunRecord};
+    use hive_types::{AttemptNo, MissionId};
+    use serde_json::json;
+
+    use super::*;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "hive-agent-{name}-{}-{counter}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        store: Store,
+        mission: MissionRecord,
+        run: RunRecord,
+        node: NodeRecord,
+        session: AgentSessionRecord,
+        dir: TempDir,
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let dir = TempDir::new(name);
+        let mut store = Store::open_in_memory().expect("store");
+        let mission = store
+            .create_mission("m", "read the note", 0)
+            .expect("mission");
+        let run = store.create_run(mission.mission_id, 0).expect("run");
+        let node = store
+            .add_node(mission.mission_id, run.run_id, 3, 0)
+            .expect("node");
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let session = store
+            .create_agent_session(&NewAgentSession {
+                mission_id: mission.mission_id,
+                run_id: Some(run.run_id),
+                node_id: node.node_id,
+                role: "worker",
+                model: "mock-model",
+                system_prompt: "be concise",
+                now_ms: 0,
+            })
+            .expect("session");
+        Fixture {
+            store,
+            mission,
+            run,
+            node,
+            session,
+            dir,
+        }
+    }
+
+    fn spec() -> AgentSpec {
+        AgentSpec::new("worker", "mock-model")
+            .with_system_prompt("be concise")
+            .with_tools(["fs.read".to_owned()])
+    }
+
+    fn completion(content: &str, usage: Option<Value>) -> Value {
+        let mut value = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": content}
+            }]
+        });
+        if let Some(usage) = usage {
+            value["usage"] = usage;
+        }
+        value
+    }
+
+    fn tool_completion(tool_name: &str, arguments: Value) -> Value {
+        json!({
+            "id": "chatcmpl-tool",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": serde_json::to_string(&arguments).expect("arguments")
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        })
+    }
+
+    fn kinds(store: &Store, mission_id: MissionId) -> Vec<EventKind> {
+        store
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.mission_id == mission_id)
+            .map(|event| event.kind)
+            .collect()
+    }
+
+    #[test]
+    fn single_turn_answer_succeeds_with_expected_events() {
+        let mut f = fixture("single");
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion(
+                "the answer",
+                Some(json!({"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8})),
+            ),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect("run")
+        };
+        assert_eq!(
+            outcome,
+            AgentOutcome::Completed {
+                session_id: f.session.session_id,
+                turns: 1,
+                final_text: "the answer".to_owned(),
+            }
+        );
+        assert_eq!(
+            kinds(&f.store, f.mission.mission_id),
+            vec![
+                EventKind::NodeStarted,
+                EventKind::NodeTurn,
+                EventKind::NodeSucceeded
+            ]
+        );
+        let node = f
+            .store
+            .get_node(f.node.node_id)
+            .expect("node")
+            .expect("present");
+        assert_eq!(node.state, NodeState::Succeeded);
+        assert!(node.lease_token.is_none());
+
+        let turns = f.store.list_turns(f.session.session_id).expect("turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, TurnState::Completed);
+        let usage = f
+            .store
+            .get_turn_usage(turns[0].turn_id)
+            .expect("usage")
+            .expect("present");
+        assert_eq!(usage.source, UsageSource::Authoritative);
+        assert_eq!(usage.total_tokens, 8);
+        assert_eq!(usage.request_id.as_deref(), Some("chatcmpl-test"));
+        assert_eq!(
+            f.store
+                .get_agent_session(f.session.session_id)
+                .expect("session")
+                .expect("present")
+                .state,
+            AgentSessionState::Completed
+        );
+    }
+
+    #[test]
+    fn tool_call_round_trip_reads_file_and_feeds_result_back() {
+        let mut f = fixture("tool");
+        std::fs::write(f.dir.path().join("note.txt"), b"hello hive").expect("note");
+        let transport = MockTransport::new(vec![
+            MockResponse::json(
+                200,
+                &tool_completion("fs.read", json!({"path": "note.txt"})),
+            ),
+            MockResponse::json(200, &completion("read it", None)),
+        ]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect("run")
+        };
+        assert!(matches!(outcome, AgentOutcome::Completed { turns: 2, .. }));
+        assert_eq!(
+            kinds(&f.store, f.mission.mission_id),
+            vec![
+                EventKind::NodeStarted,
+                EventKind::NodeTurn,
+                EventKind::NodeToolCall,
+                EventKind::NodeToolStarted,
+                EventKind::NodeToolResult,
+                EventKind::NodeTurn,
+                EventKind::NodeSucceeded
+            ]
+        );
+        let requests = gateway.transport().requests();
+        assert_eq!(requests.len(), 2);
+        let last = requests[1].messages.last().expect("tool message");
+        assert_eq!(last.role, Role::Tool);
+        assert_eq!(last.tool_call_id.as_deref(), Some("call_1"));
+        assert!(last.text().expect("content").contains("hello hive"));
+    }
+
+    #[test]
+    fn tool_error_is_fed_back_and_model_continues() {
+        let mut f = fixture("tool-error");
+        let transport = MockTransport::new(vec![
+            MockResponse::json(
+                200,
+                &tool_completion("fs.read", json!({"path": "missing.txt"})),
+            ),
+            MockResponse::json(200, &completion("recovered", None)),
+        ]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect("run")
+        };
+        assert!(matches!(outcome, AgentOutcome::Completed { turns: 2, .. }));
+        let requests = gateway.transport().requests();
+        let last = requests[1].messages.last().expect("tool message");
+        assert_eq!(last.role, Role::Tool);
+        let payload: Value =
+            serde_json::from_str(last.text().expect("content")).expect("json result");
+        assert_eq!(payload["error"], "path.not_found");
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Succeeded
+        );
+    }
+
+    #[test]
+    fn turn_limit_marks_node_failed() {
+        let mut f = fixture("turn-limit");
+        let transport = MockTransport::new(vec![
+            MockResponse::json(
+                200,
+                &tool_completion("fs.read", json!({"path": "note.txt"})),
+            ),
+            MockResponse::json(200, &completion("never reached", None)),
+        ]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        std::fs::write(f.dir.path().join("note.txt"), b"x").expect("note");
+        let token = CancellationToken::new();
+        let limited = spec().with_max_turns(1);
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &limited, &token)
+                .expect("run")
+        };
+        assert_eq!(
+            outcome,
+            AgentOutcome::TurnLimitExceeded {
+                session_id: f.session.session_id,
+                turns: 1,
+            }
+        );
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Failed
+        );
+        let events = f.store.read_all_events().expect("events");
+        let failed = events
+            .iter()
+            .find(|event| event.kind == EventKind::NodeFailed)
+            .expect("failed event");
+        assert_eq!(failed.payload["reason"], "turn_limit_exceeded");
+    }
+
+    struct CancelAfterFirstResponse {
+        inner: MockTransport,
+        token: CancellationToken,
+    }
+
+    impl ChatTransport for CancelAfterFirstResponse {
+        fn send(&self, request: &ChatRequest) -> Result<HttpResponse, LlmError> {
+            let response = self.inner.send(request)?;
+            if self.inner.request_count() == 1 {
+                self.token.cancel();
+            }
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn cancellation_between_turns_marks_node_cancelled() {
+        let mut f = fixture("cancel");
+        let token = CancellationToken::new();
+        let transport = CancelAfterFirstResponse {
+            inner: MockTransport::new(vec![
+                MockResponse::json(
+                    200,
+                    &tool_completion("fs.read", json!({"path": "note.txt"})),
+                ),
+                MockResponse::json(200, &completion("unused", None)),
+            ]),
+            token: token.clone(),
+        };
+        let gateway = Gateway::with_policy(transport, RetryPolicy::immediate(0));
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect("run")
+        };
+        assert_eq!(
+            outcome,
+            AgentOutcome::Cancelled {
+                session_id: f.session.session_id,
+                turns: 1,
+            }
+        );
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Cancelled
+        );
+        assert_eq!(
+            kinds(&f.store, f.mission.mission_id),
+            vec![
+                EventKind::NodeStarted,
+                EventKind::NodeTurn,
+                EventKind::NodeCancelled
+            ]
+        );
+        assert_eq!(
+            f.store
+                .get_agent_session(f.session.session_id)
+                .expect("session")
+                .expect("present")
+                .state,
+            AgentSessionState::Cancelled
+        );
+    }
+
+    #[test]
+    fn stale_lease_commit_is_rejected() {
+        let mut f = fixture("stale");
+        let token = LeaseToken::generate();
+        f.store
+            .lease_node(f.node.node_id, &token, "first", 10_000, 0)
+            .expect("lease");
+        let guard = LeaseGuard {
+            attempt_no: AttemptNo::FIRST,
+            lease_token: token,
+        };
+        let started = node_event(
+            f.mission.mission_id,
+            Some(f.run.run_id),
+            f.node.node_id,
+            f.session.session_id,
+            AttemptNo::FIRST,
+            EventKind::NodeStarted,
+            json!({}),
+        );
+        f.store
+            .transition_node_cas(f.node.node_id, &guard, NodeState::Running, &started, 1)
+            .expect("running");
+
+        let stale = LeaseGuard {
+            attempt_no: AttemptNo::FIRST,
+            lease_token: LeaseToken::generate(),
+        };
+        let succeeded = node_event(
+            f.mission.mission_id,
+            Some(f.run.run_id),
+            f.node.node_id,
+            f.session.session_id,
+            AttemptNo::FIRST,
+            EventKind::NodeSucceeded,
+            json!({}),
+        );
+        let error = f
+            .store
+            .transition_node_cas(f.node.node_id, &stale, NodeState::Succeeded, &succeeded, 2)
+            .expect_err("stale");
+        assert!(matches!(error, hive_store::StoreError::StaleExecution));
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Running
+        );
+    }
+
+    #[test]
+    fn missing_usage_is_recorded_as_estimated() {
+        let mut f = fixture("estimated");
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion("some answer", None),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+        {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect("run");
+        }
+        let turns = f.store.list_turns(f.session.session_id).expect("turns");
+        let usage = f
+            .store
+            .get_turn_usage(turns[0].turn_id)
+            .expect("usage")
+            .expect("present");
+        assert_eq!(usage.source, UsageSource::Estimated);
+        assert!(usage.prompt_tokens >= 1);
+        assert!(usage.completion_tokens >= 1);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
+    }
+
+    #[test]
+    fn disallowed_tool_is_reported_without_execution() {
+        let mut f = fixture("not-allowed");
+        std::fs::write(f.dir.path().join("note.txt"), b"secret").expect("note");
+        let transport = MockTransport::new(vec![
+            MockResponse::json(
+                200,
+                &tool_completion("fs.read", json!({"path": "note.txt"})),
+            ),
+            MockResponse::json(200, &completion("ok", None)),
+        ]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+        let no_tools = AgentSpec::new("worker", "mock-model");
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &no_tools, &token)
+                .expect("run")
+        };
+        assert!(matches!(outcome, AgentOutcome::Completed { turns: 2, .. }));
+        let requests = gateway.transport().requests();
+        assert!(requests[0].tools.is_none());
+        let last = requests[1].messages.last().expect("tool message");
+        let payload: Value =
+            serde_json::from_str(last.text().expect("content")).expect("json result");
+        assert_eq!(payload["error"], "tool.not_allowed");
+        let events = f.store.read_all_events().expect("events");
+        assert!(events
+            .iter()
+            .all(|event| event.kind != EventKind::NodeToolStarted));
+    }
+
+    #[test]
+    fn turn_limit_zero_fails_without_calling_model() {
+        let mut f = fixture("zero-turns");
+        let transport = MockTransport::default();
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+        let zero = spec().with_max_turns(0);
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &zero, &token)
+                .expect("run")
+        };
+        assert_eq!(
+            outcome,
+            AgentOutcome::TurnLimitExceeded {
+                session_id: f.session.session_id,
+                turns: 0,
+            }
+        );
+        assert_eq!(gateway.transport().request_count(), 0);
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Failed
+        );
+    }
+}

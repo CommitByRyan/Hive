@@ -12,6 +12,7 @@ mod gateway;
 mod retry;
 mod sse;
 mod transport;
+mod ureq_transport;
 mod wire;
 
 pub use accumulate::{
@@ -23,6 +24,7 @@ pub use gateway::Gateway;
 pub use retry::{FailureKind, RetryDecision, RetryPolicy};
 pub use sse::{SseEvent, SseParser};
 pub use transport::{collect_stream, ChatTransport, HttpResponse, MockResponse, MockTransport};
+pub use ureq_transport::UreqTransport;
 pub use wire::{
     ChatChunk, ChatRequest, ChatResponse, Choice, ChunkChoice, CompletionTokensDetails, Delta,
     FinishReason, FunctionCall, FunctionCallDelta, FunctionDefinition, Message,

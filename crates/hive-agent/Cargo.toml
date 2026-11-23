@@ -1,0 +1,14 @@
+[package]
+name = "hive-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-types = { path = "../hive-types" }
+hive-store = { path = "../hive-store" }
+hive-tools = { path = "../hive-tools" }
+hive-llm = { path = "../hive-llm" }
+serde_json.workspace = true
+thiserror.workspace = true

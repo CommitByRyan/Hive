@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::{StoreError, StoreResult};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 pub const BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub fn apply_pragmas(conn: &Connection) -> StoreResult<()> {
@@ -34,6 +34,7 @@ fn apply_migration(conn: &Connection, target: i64) -> StoreResult<()> {
     match target {
         1 => conn.execute_batch(V1_SCHEMA)?,
         2 => conn.execute_batch(V2_SCHEMA)?,
+        3 => conn.execute_batch(V3_SCHEMA)?,
         other => {
             return Err(StoreError::Conflict(format!(
                 "unknown migration version {other}"
@@ -131,7 +132,7 @@ CREATE INDEX idx_snapshots_mission ON snapshots(mission_id);
 CREATE INDEX idx_snapshots_lookup ON snapshots(mission_id, kind, node_id, last_seq);
 "#;
 
-const V2_SCHEMA: &str = r#"
+pub(crate) const V2_SCHEMA: &str = r#"
 CREATE TABLE tool_calls (
     tool_call_id   TEXT PRIMARY KEY,
     mission_id     TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
@@ -175,4 +176,52 @@ CREATE TABLE tool_audit (
     created_at_ms  INTEGER NOT NULL
 );
 CREATE INDEX idx_tool_audit_mission ON tool_audit(mission_id, audit_id);
+"#;
+
+const V3_SCHEMA: &str = r#"
+CREATE TABLE agent_sessions (
+    session_id     TEXT PRIMARY KEY,
+    mission_id     TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
+    run_id         TEXT REFERENCES runs(run_id) ON DELETE CASCADE,
+    node_id        TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+    role           TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    system_prompt  TEXT NOT NULL DEFAULT '',
+    state          TEXT NOT NULL CHECK (state IN ('active','completed','failed','cancelled')),
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL,
+    closed_at_ms   INTEGER
+);
+CREATE INDEX idx_agent_sessions_node ON agent_sessions(node_id, created_at_ms);
+CREATE INDEX idx_agent_sessions_mission ON agent_sessions(mission_id, created_at_ms);
+
+CREATE TABLE turns (
+    turn_id         TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+    node_id         TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+    attempt_no      INTEGER NOT NULL,
+    turn_index      INTEGER NOT NULL,
+    request_model   TEXT NOT NULL,
+    finish_reason   TEXT,
+    state           TEXT NOT NULL CHECK (state IN ('started','completed','failed','cancelled')),
+    output_preview  TEXT NOT NULL DEFAULT '',
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    created_at_ms   INTEGER NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    UNIQUE (session_id, turn_index)
+);
+CREATE INDEX idx_turns_session ON turns(session_id, turn_index);
+CREATE INDEX idx_turns_node ON turns(node_id, attempt_no);
+
+CREATE TABLE turn_usage (
+    turn_id           TEXT PRIMARY KEY REFERENCES turns(turn_id) ON DELETE CASCADE,
+    session_id        TEXT NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+    prompt_tokens     INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    total_tokens      INTEGER NOT NULL,
+    source            TEXT NOT NULL CHECK (source IN ('estimated','authoritative')),
+    request_id        TEXT,
+    created_at_ms     INTEGER NOT NULL
+);
+CREATE INDEX idx_turn_usage_session ON turn_usage(session_id);
 "#;
