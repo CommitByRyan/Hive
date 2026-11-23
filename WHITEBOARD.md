@@ -44,8 +44,11 @@
 | H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | done, merged |
 | H05b | 可见对话 `01a207e0-8bd5-7ff1-8247-78c2156c82f3`（pro） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、语义收紧 | `.codex/worktrees/36e0/Hive` | done, merged |
 | H06 | 可见对话 `01a2080c-0533-7513-81c2-80f64f285384`（pro） | `crates/hive-workspace`、Handoff V4、租约复用 | `.codex/worktrees/3d26/Hive` | implementing |
+| H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | designing |
 
-合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
+合并基线：`f5ef9b4`（H05b verified + LF 规范化）。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突；H05b 合并后全量复验通过。
+
+仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
 ## 冻结契约
 

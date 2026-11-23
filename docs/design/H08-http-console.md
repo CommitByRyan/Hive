@@ -16,8 +16,8 @@
 
 | 方法与路径 | 请求体 | 成功响应 | 错误码 |
 |---|---|---|---|
-| `GET /api/health` | — | `{"ok":true,"schema_version":1,"mode":"live|demo","model_catalog_ready":true}` | `500 internal_error` |
-| `GET /api/state` | — | `{"schema_version":1,"last_seq":N,"config":{...},"missions":[...],"approvals":[...],"stats":{...}}` | `500` |
+| `GET /api/health` | — | `{"ok":true,"schema_version":4,"event_schema_version":1,"mode":"live|demo","model_catalog_ready":true}` | `500 internal_error` |
+| `GET /api/state` | — | `{"schema_version":4,"event_schema_version":1,"last_seq":N,"config":{...},"missions":[...],"approvals":[...],"stats":{...}}` | `500` |
 | `GET /api/missions` | query：`limit?`（默认 60，上限 200）、`offset?` | `{"missions":[...],"last_seq":N}` | `400 invalid_request`、`500` |
 | `POST /api/missions` | `{"title":"...","goal":"..."}`；`title` 可选、`goal` 必填且 trim 后 1..=16 KiB | `201 {"mission":{...,"last_seq":N}}` | `400 invalid_request`、`409 mission_conflict`、`413`、`500` |
 | `GET /api/missions/{id}` | — | `{"mission":{...},"runs":[...],"nodes":[...],"events":[...],"artifacts":[...],"messages":[...],"approvals":[...],"last_seq":N}` | `400 invalid_id`、`404 not_found`、`500` |
@@ -30,6 +30,7 @@
 
 说明：
 
+- `schema_version` 是**数据库 schema 版本**，唯一来源为 `hive_store::SCHEMA_VERSION`；示例中的 4 是 H06 合并后的值，实现必须读取常量，禁止硬编码。`event_schema_version` 才是 SSE/事件封套的 `EVENT_SCHEMA_VERSION`，两者不得混用。
 - `POST /api/routines/{id}`、`PATCH`、`DELETE` 不在用户指定的首版清单内；H09 若需要，应新增子路径设计而不是把语义塞进本文件。
 - `GET /api/missions/{id}` 分页：`events_after_seq`、`events_limit`（默认 500，上限 2000）、`runs_limit`、`nodes_limit`；事件必须升序。快照先返回，事件只补到响应生成时的 `last_seq`。
 - 响应中的 `mission` 含 `state`（持久状态）与 `observation`（派生状态）。UI 主显 `observation`，审计视图显示 `state`。
@@ -150,7 +151,7 @@ SSE 对审批显示的归约：`node.approval_requested` 添加 pending 卡片�
 
 以下均为可执行断言，建议放在 `hive-server` 集成测试与前端最小 E2E 测试：
 
-1. `GET /api/health` 返回 `ok=true`、`schema_version=1`，且不含 API Key、base URL。
+1. `GET /api/health` 返回 `ok=true`、`schema_version == hive_store::SCHEMA_VERSION`（H06 后为 4）、`event_schema_version=1`，且不含 API Key、base URL。
 2. `POST /api/missions` 空 goal、超长 goal、非 JSON 分别返回 `400/413/400`，不创建事件。
 3. `GET /api/missions/{id}` 返回 mission/runs/nodes 与 `last_seq=N`，且事件全部 `seq <= N`、升序。
 4. SSE 以 `after_seq=N` 连接后，先收到 `seq=N+1..M` 的持久补偿，再收到实时事件；帧 `id` 与 JSON `seq` 一致。
