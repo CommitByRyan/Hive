@@ -6,22 +6,29 @@
 
 use hive_llm::ChatTransport;
 use hive_runtime::{ExecOutcome, NodeExecutor, PlanNode};
-use hive_store::{NewAgentSession, StoreError};
+use hive_store::{LeaseGuard, NewAgentSession, StoreError};
 use hive_types::CancellationToken;
 
 use crate::{AgentError, AgentOutcome, AgentRunner, AgentSpec};
 
 impl<T: ChatTransport> NodeExecutor for AgentRunner<'_, T> {
-    fn execute(&mut self, node: &PlanNode, cancel: &CancellationToken) -> ExecOutcome {
-        map_outcome(self.run_for(node, cancel))
+    fn execute(
+        &mut self,
+        node: &PlanNode,
+        lease: &LeaseGuard,
+        cancel: &CancellationToken,
+    ) -> ExecOutcome {
+        map_outcome(self.run_for(node, lease, cancel))
     }
 }
 
 impl<T: ChatTransport> AgentRunner<'_, T> {
-    /// Create an agent session for `node` and drive it through `run_node`.
+    /// Create an agent session for `node` and drive it through
+    /// [`AgentRunner::run_node_with_lease`] using the scheduler's lease.
     fn run_for(
         &mut self,
         node: &PlanNode,
+        lease: &LeaseGuard,
         cancel: &CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
         let record = self
@@ -39,7 +46,7 @@ impl<T: ChatTransport> AgentRunner<'_, T> {
             system_prompt: spec.system_prompt.as_str(),
             now_ms: now_ms(),
         })?;
-        self.run_node(session.session_id, node.node_id, &spec, cancel)
+        self.run_node_with_lease(session.session_id, node.node_id, lease, &spec, cancel)
     }
 }
 
@@ -98,7 +105,7 @@ mod tests {
     use hive_runtime::NodeSpec;
     use hive_store::Store;
     use hive_tools::ToolDispatcher;
-    use hive_types::{AgentSessionId, ApprovalId, NodeId, NodeState};
+    use hive_types::{AgentSessionId, ApprovalId, EventKind, LeaseToken, NodeId, NodeState};
     use serde_json::json;
 
     use super::*;
@@ -193,6 +200,14 @@ mod tests {
         store
             .update_node_state(node_id, NodeState::Ready, 0)
             .expect("ready");
+        let lease_token = LeaseToken::generate();
+        let leased = store
+            .lease_node(node_id, &lease_token, "scheduler", 60_000, 0)
+            .expect("lease");
+        let guard = LeaseGuard {
+            attempt_no: leased.attempt_no,
+            lease_token,
+        };
 
         let transport = MockTransport::new(vec![MockResponse::json(200, &completion("done"))]);
         let gateway = Gateway::new(transport);
@@ -207,7 +222,7 @@ mod tests {
 
         let outcome = {
             let mut runner = AgentRunner::new(&mut store, &dispatcher, &gateway);
-            runner.execute(&plan_node, &token)
+            runner.execute(&plan_node, &guard, &token)
         };
 
         assert!(matches!(outcome, ExecOutcome::Succeeded { .. }));
@@ -219,6 +234,69 @@ mod tests {
                 .state,
             NodeState::Succeeded
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_with_stale_guard_returns_failure_without_starting() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("hive-node-executor-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let mut store = Store::open_in_memory().expect("store");
+        let mission = store.create_mission("m", "goal", 0).expect("mission");
+        let run = store.create_run(mission.mission_id, 0).expect("run");
+        let node_id = NodeId::new();
+        store
+            .add_node_with_id(node_id, mission.mission_id, run.run_id, 0, 0)
+            .expect("node");
+        store
+            .update_node_state(node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let lease_token = LeaseToken::generate();
+        let leased = store
+            .lease_node(node_id, &lease_token, "scheduler", 60_000, 0)
+            .expect("lease");
+        let wrong_guard = LeaseGuard {
+            attempt_no: leased.attempt_no,
+            lease_token: LeaseToken::generate(),
+        };
+
+        let transport = MockTransport::default();
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(&dir).expect("dispatcher");
+        let token = CancellationToken::new();
+        let plan_node = PlanNode {
+            node_id,
+            deps: Vec::new(),
+            spec: NodeSpec::new("worker", "mock-model"),
+            retry_budget: 0,
+        };
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut store, &dispatcher, &gateway);
+            runner.execute(&plan_node, &wrong_guard, &token)
+        };
+
+        assert!(matches!(
+            outcome,
+            ExecOutcome::Failed {
+                retryable: false,
+                ..
+            }
+        ));
+        let persisted = store.get_node(node_id).expect("get").expect("present");
+        assert_eq!(persisted.state, NodeState::Leased);
+        assert_eq!(persisted.lease_token.as_ref(), Some(&lease_token));
+        let started = store
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeStarted)
+            .count();
+        assert_eq!(started, 0, "a stale guard must not emit node.started");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

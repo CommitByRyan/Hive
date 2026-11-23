@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hive_store::{can_retry, LeaseGuard, NodeRecord, Store, StoreResult};
+use hive_store::{can_retry, LeaseGuard, NodeRecord, Store, StoreError, StoreResult};
 use hive_types::{
     AttemptNo, CancellationToken, EventEnvelope, EventId, EventInput, EventKind, LeaseToken,
     MissionId, NodeId, NodeState, RunId,
@@ -20,6 +20,7 @@ const LEASE_TTL_MS: i64 = 60_000;
 /// the runtime to issue raw `UPDATE` statements.
 pub trait StoreLike {
     fn append_event(&mut self, event: &EventInput) -> StoreResult<EventEnvelope>;
+    fn get_node(&self, node_id: NodeId) -> StoreResult<Option<NodeRecord>>;
     fn create_node(
         &mut self,
         node_id: NodeId,
@@ -83,6 +84,10 @@ pub trait StoreLike {
 impl StoreLike for Store {
     fn append_event(&mut self, event: &EventInput) -> StoreResult<EventEnvelope> {
         Store::append_event(self, event)
+    }
+
+    fn get_node(&self, node_id: NodeId) -> StoreResult<Option<NodeRecord>> {
+        Store::get_node(self, node_id)
     }
 
     fn create_node(
@@ -197,6 +202,7 @@ enum Phase {
     Pending,
     Ready,
     Offered,
+    Leased,
     Running,
     NeedsRecovery,
     Succeeded,
@@ -338,9 +344,14 @@ impl<S: StoreLike> Scheduler<S> {
             .collect()
     }
 
-    /// Mark an offered/ready node as started: lease it, move it to `running`
-    /// and emit `node.started` under the fresh lease guard.
-    pub fn on_started(&mut self, node_id: NodeId) -> Result<(), RuntimeError> {
+    /// Claim an offered/ready node: move it `ready -> leased`, stamp the next
+    /// `attempt_no` and return the [`LeaseGuard`] the executor must use.
+    ///
+    /// This is the scheduler's only guard acquisition entry point. The
+    /// `leased -> running` transition and the `node.started` event belong to
+    /// the executor ([`Self::start_running`] exists for the deterministic
+    /// scheduler and recovery tests).
+    pub fn on_started(&mut self, node_id: NodeId) -> Result<LeaseGuard, RuntimeError> {
         if self.halted {
             return Err(RuntimeError::NodeNotStartable(node_id));
         }
@@ -363,6 +374,27 @@ impl<S: StoreLike> Scheduler<S> {
             attempt_no: leased.attempt_no,
             lease_token: token,
         };
+        self.attempts.insert(node_id, guard.attempt_no.get());
+        self.guards.insert(node_id, guard.clone());
+        self.phases.insert(node_id, Phase::Leased);
+        Ok(guard)
+    }
+
+    /// Move a claimed (`leased`) node to `running` and emit `node.started`.
+    ///
+    /// The threaded executor performs this transition inside the executor
+    /// itself (`run_node_with_lease`); this method is for the deterministic
+    /// scheduler and for callers that need an explicit running state (e.g.
+    /// lease-recovery tests) without settling the node.
+    pub fn start_running(&mut self, node_id: NodeId) -> Result<(), RuntimeError> {
+        if self.phases.get(&node_id).copied() != Some(Phase::Leased) {
+            return Err(RuntimeError::NodeNotStartable(node_id));
+        }
+        let guard = self
+            .guards
+            .get(&node_id)
+            .cloned()
+            .ok_or(RuntimeError::NodeNotStartable(node_id))?;
         let started = self.node_event(
             node_id,
             guard.attempt_no.get(),
@@ -371,23 +403,25 @@ impl<S: StoreLike> Scheduler<S> {
         );
         self.store
             .start_node(node_id, &guard, &started, self.now_ms())?;
-
-        self.attempts.insert(node_id, guard.attempt_no.get());
-        self.guards.insert(node_id, guard);
         self.phases.insert(node_id, Phase::Running);
         Ok(())
     }
 
-    /// Settle a running node: persist its outcome, propagate readiness on
-    /// success, retry or finalize on failure, and skip downstream nodes that
-    /// can no longer run.
+    /// Settle a claimed or running node and propagate readiness.
+    ///
+    /// When the executor settled the node itself (the threaded path), the store
+    /// already holds a terminal state and this method only updates the
+    /// scheduler's DAG bookkeeping. In the deterministic path the scheduler
+    /// owns the settle: it starts a still-`leased` node first, then persists
+    /// the terminal transition and its event.
     pub fn on_finished(
         &mut self,
         node_id: NodeId,
         outcome: ExecOutcome,
     ) -> Result<(), RuntimeError> {
-        if self.phases.get(&node_id).copied() != Some(Phase::Running) {
-            return Err(RuntimeError::NodeNotInFlight(node_id));
+        match self.phases.get(&node_id).copied() {
+            Some(Phase::Leased | Phase::Running) => {}
+            _ => return Err(RuntimeError::NodeNotInFlight(node_id)),
         }
         let guard = self
             .guards
@@ -395,6 +429,28 @@ impl<S: StoreLike> Scheduler<S> {
             .cloned()
             .ok_or(RuntimeError::NodeNotInFlight(node_id))?;
         let attempt = self.attempts[&node_id];
+        let persisted = self
+            .store
+            .get_node(node_id)?
+            .ok_or_else(|| RuntimeError::Store(StoreError::NotFound(format!("node {node_id}"))))?;
+
+        if persisted.state.is_terminal() {
+            return self.propagate_terminal(node_id, outcome);
+        }
+
+        if persisted.state == NodeState::Failed {
+            self.guards.remove(&node_id);
+            return match outcome {
+                ExecOutcome::Failed { retryable, .. } => {
+                    self.handle_failure(node_id, attempt, retryable)
+                }
+                _ => Err(RuntimeError::NodeOutcomeMismatch(node_id)),
+            };
+        }
+
+        if persisted.state == NodeState::Leased {
+            self.start_running(node_id)?;
+        }
 
         match outcome {
             ExecOutcome::Succeeded { summary } => {
@@ -430,30 +486,7 @@ impl<S: StoreLike> Scheduler<S> {
                     self.now_ms(),
                 )?;
                 self.guards.remove(&node_id);
-
-                let budget = self
-                    .topology
-                    .node(node_id)
-                    .map(|node| node.retry_budget)
-                    .unwrap_or(0);
-                if retryable
-                    && can_retry(
-                        AttemptNo::new(attempt).expect("attempt starts at 1"),
-                        budget,
-                    )
-                {
-                    let next_attempt = attempt + 1;
-                    self.attempts.insert(node_id, next_attempt);
-                    let ready =
-                        self.node_event(node_id, next_attempt, EventKind::NodeReady, json!({}));
-                    self.store
-                        .retry_failed_node_and_emit(node_id, &ready, self.now_ms())?;
-                    self.phases.insert(node_id, Phase::Ready);
-                } else {
-                    self.store.abort_failed_node(node_id, self.now_ms())?;
-                    self.phases.insert(node_id, Phase::FailedFinal);
-                    self.skip_downstream(node_id)?;
-                }
+                self.handle_failure(node_id, attempt, retryable)?;
             }
             ExecOutcome::Cancelled => {
                 let event = self.node_event(node_id, attempt, EventKind::NodeCancelled, json!({}));
@@ -468,6 +501,65 @@ impl<S: StoreLike> Scheduler<S> {
                 self.guards.remove(&node_id);
                 self.skip_downstream(node_id)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Propagate the outcome of a node that was already settled by an external
+    /// executor (the threaded path). The store is the authority for terminal
+    /// state; this only updates DAG phases and downstream readiness.
+    fn propagate_terminal(
+        &mut self,
+        node_id: NodeId,
+        outcome: ExecOutcome,
+    ) -> Result<(), RuntimeError> {
+        let attempt = self.attempts[&node_id];
+        self.guards.remove(&node_id);
+        match outcome {
+            ExecOutcome::Succeeded { .. } => {
+                self.phases.insert(node_id, Phase::Succeeded);
+                self.unblock_dependents(node_id)?;
+            }
+            ExecOutcome::Failed { retryable, .. } => {
+                self.handle_failure(node_id, attempt, retryable)?;
+            }
+            ExecOutcome::Cancelled => {
+                self.phases.insert(node_id, Phase::Cancelled);
+                self.skip_downstream(node_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retry or finalize a node that is already in `failed` state, advancing
+    /// `attempt_no` only when the retry budget allows it.
+    fn handle_failure(
+        &mut self,
+        node_id: NodeId,
+        attempt: u32,
+        retryable: bool,
+    ) -> Result<(), RuntimeError> {
+        let budget = self
+            .topology
+            .node(node_id)
+            .map(|node| node.retry_budget)
+            .unwrap_or(0);
+        if retryable
+            && can_retry(
+                AttemptNo::new(attempt).expect("attempt starts at 1"),
+                budget,
+            )
+        {
+            let next_attempt = attempt + 1;
+            self.attempts.insert(node_id, next_attempt);
+            let ready = self.node_event(node_id, next_attempt, EventKind::NodeReady, json!({}));
+            self.store
+                .retry_failed_node_and_emit(node_id, &ready, self.now_ms())?;
+            self.phases.insert(node_id, Phase::Ready);
+        } else {
+            self.store.abort_failed_node(node_id, self.now_ms())?;
+            self.phases.insert(node_id, Phase::FailedFinal);
+            self.skip_downstream(node_id)?;
         }
         Ok(())
     }
@@ -488,7 +580,7 @@ impl<S: StoreLike> Scheduler<S> {
             .collect();
         for (node_id, phase) in snapshot {
             match phase {
-                Phase::Running => {
+                Phase::Running | Phase::Leased => {
                     if let Some(guard) = self.guards.remove(&node_id) {
                         let attempt = self.attempts[&node_id];
                         let event =
@@ -527,7 +619,7 @@ impl<S: StoreLike> Scheduler<S> {
     pub fn in_flight_count(&self) -> usize {
         self.phases
             .values()
-            .filter(|phase| matches!(phase, Phase::Offered | Phase::Running))
+            .filter(|phase| matches!(phase, Phase::Offered | Phase::Leased | Phase::Running))
             .count()
     }
 
@@ -535,6 +627,7 @@ impl<S: StoreLike> Scheduler<S> {
         match self.phases.get(&node_id).copied().unwrap_or(Phase::Pending) {
             Phase::Pending => NodeState::Pending,
             Phase::Ready | Phase::Offered => NodeState::Ready,
+            Phase::Leased => NodeState::Leased,
             Phase::Running => NodeState::Running,
             Phase::NeedsRecovery => NodeState::NeedsRecovery,
             Phase::Succeeded => NodeState::Succeeded,
@@ -857,11 +950,16 @@ mod tests {
             }
             assert!(sched.in_flight_count() <= 2, "parallel cap violated");
 
-            // finish the oldest running leaf
+            // finish the oldest in-flight leaf
             let running: Vec<NodeId> = leaves
                 .iter()
                 .copied()
-                .filter(|id| sched.node_state(*id) == NodeState::Running)
+                .filter(|id| {
+                    matches!(
+                        sched.node_state(*id),
+                        NodeState::Leased | NodeState::Running
+                    )
+                })
                 .collect();
             if running.is_empty() {
                 break;
@@ -927,8 +1025,8 @@ mod tests {
 
         assert_eq!(sched.node_state(b), NodeState::FailedFinal);
         assert_eq!(sched.node_state(d), NodeState::Skipped);
-        // C is a sibling and must keep running.
-        assert_eq!(sched.node_state(c), NodeState::Running);
+        // C is a sibling and must stay in flight (claimed but not settled).
+        assert_eq!(sched.node_state(c), NodeState::Leased);
         sched
             .on_finished(
                 c,
@@ -1083,6 +1181,248 @@ mod tests {
     }
 
     #[test]
+    fn on_started_returns_guard_matching_the_claim_without_starting() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 0)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        let persisted = sched.store().get_node(a).expect("get").expect("present");
+        assert_eq!(persisted.state, NodeState::Leased);
+        assert_eq!(persisted.lease_token.as_ref(), Some(&guard.lease_token));
+        assert_eq!(persisted.attempt_no, guard.attempt_no);
+        assert_eq!(persisted.attempt_no.get(), 1);
+
+        // The scheduler only claims; node.started belongs to the executor.
+        let events = sched.store().read_all_events().expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == EventKind::NodeStarted));
+
+        // Running to completion must not claim a second time: the attempt stays
+        // at 1 and exactly one node.started is emitted.
+        sched.start_running(a).expect("running");
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Succeeded {
+                    summary: "a".into(),
+                },
+            )
+            .expect("finish");
+        let finished = sched.store().get_node(a).expect("get").expect("present");
+        assert_eq!(finished.state, NodeState::Succeeded);
+        assert_eq!(finished.attempt_no.get(), 1);
+        let started = sched
+            .store()
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeStarted)
+            .count();
+        assert_eq!(started, 1);
+    }
+
+    #[test]
+    fn on_finished_propagates_when_executor_settled_the_node() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let plan = plan(
+            mission.mission_id,
+            run.run_id,
+            vec![node(a, &[], 0), node(b, &[a], 0)],
+        );
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        // Simulate the threaded executor settling the node out-of-band:
+        // leased -> running -> succeeded, without the scheduler's phase moving.
+        let started = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeStarted,
+            mission_id: mission.mission_id,
+            run_id: Some(run.run_id),
+            node_id: Some(a),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({}),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(a, &guard, NodeState::Running, &started, 0)
+            .expect("executor start");
+        let succeeded = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeSucceeded,
+            mission_id: mission.mission_id,
+            run_id: Some(run.run_id),
+            node_id: Some(a),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({}),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(a, &guard, NodeState::Succeeded, &succeeded, 1)
+            .expect("executor settle");
+
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Succeeded {
+                    summary: "a".into(),
+                },
+            )
+            .expect("propagate");
+
+        assert_eq!(sched.node_state(a), NodeState::Succeeded);
+        assert_eq!(sched.next_actions(), vec![Action::Start(b)]);
+    }
+
+    fn executor_marks_failed(
+        sched: &mut Scheduler<Store>,
+        node_id: NodeId,
+        guard: &LeaseGuard,
+        mission_id: MissionId,
+        run_id: RunId,
+    ) {
+        let started = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeStarted,
+            mission_id,
+            run_id: Some(run_id),
+            node_id: Some(node_id),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({}),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(node_id, guard, NodeState::Running, &started, 0)
+            .expect("executor start");
+        let failed = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeFailed,
+            mission_id,
+            run_id: Some(run_id),
+            node_id: Some(node_id),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({ "reason": "boom" }),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(node_id, guard, NodeState::Failed, &failed, 1)
+            .expect("executor fail");
+    }
+
+    #[test]
+    fn failed_node_retries_without_a_second_node_failed() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 3)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        executor_marks_failed(&mut sched, a, &guard, mission.mission_id, run.run_id);
+
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Failed {
+                    reason: "boom".into(),
+                    retryable: true,
+                },
+            )
+            .expect("retry");
+
+        let failed = sched
+            .store()
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeFailed)
+            .count();
+        assert_eq!(failed, 1, "exactly one node.failed");
+        assert_eq!(sched.node_state(a), NodeState::Ready);
+        assert_eq!(sched.next_actions(), vec![Action::Start(a)]);
+    }
+
+    #[test]
+    fn failed_node_finalizes_without_a_second_node_failed() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 0)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        executor_marks_failed(&mut sched, a, &guard, mission.mission_id, run.run_id);
+
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Failed {
+                    reason: "boom".into(),
+                    retryable: false,
+                },
+            )
+            .expect("finalize");
+
+        let failed = sched
+            .store()
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeFailed)
+            .count();
+        assert_eq!(failed, 1, "exactly one node.failed");
+        assert_eq!(sched.node_state(a), NodeState::FailedFinal);
+        assert_eq!(sched.next_actions(), vec![Action::Halt]);
+    }
+
+    #[test]
+    fn failed_node_with_non_failed_outcome_is_rejected() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 3)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        executor_marks_failed(&mut sched, a, &guard, mission.mission_id, run.run_id);
+
+        let error = sched
+            .on_finished(
+                a,
+                ExecOutcome::Succeeded {
+                    summary: "unexpected".into(),
+                },
+            )
+            .expect_err("outcome/state mismatch must be rejected");
+        assert!(matches!(error, RuntimeError::NodeOutcomeMismatch(_)));
+    }
+
+    #[test]
     fn events_sequence_matches_final_node_states() {
         let (mut store, mission, run) = make_store();
         let a = NodeId::new();
@@ -1158,8 +1498,8 @@ mod tests {
                 EventKind::NodeReady,
                 EventKind::NodeReady,
                 EventKind::NodeStarted,
-                EventKind::NodeStarted,
                 EventKind::NodeSucceeded,
+                EventKind::NodeStarted,
                 EventKind::NodeSucceeded,
                 EventKind::NodeReady,
                 EventKind::NodeStarted,
@@ -1207,6 +1547,7 @@ mod tests {
             .with_clock(clock.clone());
 
         sched.on_started(a).expect("start");
+        sched.start_running(a).expect("running");
         assert_eq!(sched.node_state(a), NodeState::Running);
 
         // The node's lease was granted for now_ms + 60_000; advancing the

@@ -1,3 +1,4 @@
+use hive_store::LeaseGuard;
 use hive_types::CancellationToken;
 
 use crate::plan::PlanNode;
@@ -19,5 +20,10 @@ pub enum ExecOutcome {
 /// Executes a single node. Implementations must be deterministic in tests and
 /// must honour `cancel` promptly; the threaded executor is deferred to H05b.
 pub trait NodeExecutor {
-    fn execute(&mut self, node: &PlanNode, cancel: &CancellationToken) -> ExecOutcome;
+    fn execute(
+        &mut self,
+        node: &PlanNode,
+        lease: &LeaseGuard,
+        cancel: &CancellationToken,
+    ) -> ExecOutcome;
 }

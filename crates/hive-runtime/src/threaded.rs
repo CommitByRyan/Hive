@@ -79,14 +79,14 @@ impl ThreadedExecutor {
 
                 let mut handles = Vec::with_capacity(starts.len());
                 for node_id in starts {
-                    scheduler.on_started(node_id)?;
+                    let guard = scheduler.on_started(node_id)?;
                     let plan_node = nodes.get(&node_id).cloned();
                     let cancel = cancel.clone();
                     let worker_store = Store::open(db_path)?;
                     let mut executor = make_executor(worker_store);
                     handles.push(scope.spawn(move || {
                         let outcome = match plan_node {
-                            Some(plan_node) => executor.execute(&plan_node, &cancel),
+                            Some(plan_node) => executor.execute(&plan_node, &guard, &cancel),
                             None => ExecOutcome::Failed {
                                 reason: format!("node {node_id} is missing from the plan"),
                                 retryable: false,
@@ -126,10 +126,11 @@ impl ThreadedExecutor {
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Barrier;
+    use std::sync::{Barrier, Mutex};
     use std::time::Duration;
 
-    use hive_types::{MissionId, RunId};
+    use hive_store::LeaseGuard;
+    use hive_types::{EventKind, MissionId, RunId};
 
     use super::*;
     use crate::plan::NodeSpec;
@@ -193,7 +194,12 @@ mod tests {
     }
 
     impl NodeExecutor for OverlapExecutor {
-        fn execute(&mut self, node: &PlanNode, _cancel: &CancellationToken) -> ExecOutcome {
+        fn execute(
+            &mut self,
+            node: &PlanNode,
+            _lease: &hive_store::LeaseGuard,
+            _cancel: &CancellationToken,
+        ) -> ExecOutcome {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             if node.spec.role == "mid" {
@@ -201,6 +207,42 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
             self.active.fetch_sub(1, Ordering::SeqCst);
+            ExecOutcome::Succeeded {
+                summary: node.node_id.to_string(),
+            }
+        }
+    }
+
+    /// Records the lease guard it receives and verifies it against the
+    /// scheduler's persisted claim, without claiming or settling the node
+    /// itself (the scheduler settles it via `on_finished`).
+    struct GuardRecordingExecutor {
+        store: Store,
+        seen: Arc<Mutex<Option<LeaseGuard>>>,
+    }
+
+    impl NodeExecutor for GuardRecordingExecutor {
+        fn execute(
+            &mut self,
+            node: &PlanNode,
+            lease: &LeaseGuard,
+            _cancel: &CancellationToken,
+        ) -> ExecOutcome {
+            let record = self
+                .store
+                .get_node(node.node_id)
+                .expect("get")
+                .expect("present");
+            assert_eq!(
+                record.lease_token.as_ref(),
+                Some(&lease.lease_token),
+                "executor guard token must match the scheduler's lease"
+            );
+            assert_eq!(
+                record.attempt_no, lease.attempt_no,
+                "executor guard attempt must match the scheduler's claim"
+            );
+            *self.seen.lock().expect("lock") = Some(lease.clone());
             ExecOutcome::Succeeded {
                 summary: node.node_id.to_string(),
             }
@@ -249,5 +291,50 @@ mod tests {
                 NodeState::Succeeded
             );
         }
+    }
+
+    #[test]
+    fn threaded_passes_scheduler_guard_without_second_lease() {
+        let dir = TempDir::new("guard");
+        let db_path = dir.path().join("hive.db");
+        let (mission_id, run_id) = {
+            let mut store = Store::open(&db_path).expect("pre-open");
+            let mission = store.create_mission("guard", "goal", 0).expect("mission");
+            let run = store.create_run(mission.mission_id, 0).expect("run");
+            (mission.mission_id, run.run_id)
+        };
+        let node_id = NodeId::new();
+        let plan = Plan {
+            plan_id: "guard".to_owned(),
+            mission_id,
+            run_id,
+            nodes: vec![node(node_id, &[], "worker")],
+        };
+        let seen = Arc::new(Mutex::new(None));
+        let cancel = CancellationToken::new();
+
+        let summary = ThreadedExecutor::run(&db_path, &plan, 1, &cancel, |store| {
+            GuardRecordingExecutor {
+                store,
+                seen: Arc::clone(&seen),
+            }
+        })
+        .expect("run");
+
+        assert_eq!(summary.succeeded, 1);
+        let guard = seen.lock().expect("lock").clone().expect("guard seen");
+        let store = Store::open(&db_path).expect("reopen");
+        let persisted = store.get_node(node_id).expect("get").expect("present");
+        assert_eq!(persisted.state, NodeState::Succeeded);
+        assert_eq!(persisted.attempt_no, guard.attempt_no);
+        assert_eq!(persisted.attempt_no.get(), 1);
+
+        let started = store
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeStarted && event.node_id == Some(node_id))
+            .count();
+        assert_eq!(started, 1, "exactly one node.started, no second lease");
     }
 }
