@@ -31,7 +31,7 @@
 | `s2-dag` | 10 节点全部成功，`node.started` 无重复，峰值并发 ≤ 4 | ok |
 | `s3-handoff` | 3 条 `handoff.created` 唯一、`base_revision` 非空、无整段对话倾倒 | ok |
 | `s4-retry` | 首 attempt 500 重试、恰好 1 条 `node.failed`、attempt 递增一次后 succeeded | ok |
-| `s5-budget` | `blocked: pending H09a`，未伪造预算 API | blocked |
+| `s5-budget` | token 硬上限触发 `node.budget_exceeded`（含 dimension/hard_limit）、`failed_final`、无 `node.ready` 自动重试、下游 skip | ok |
 | `s6-cancel` | 运行中取消：未终态节点 `cancelled`、无 `node.tool_started`、重启恢复扫描不重放 | ok |
 
 ## 4. 故障注入矩阵（`cargo test -p hive-eval`）
@@ -61,23 +61,23 @@ pwsh -NoProfile -File scripts/cargo.ps1 test --workspace
 pwsh -NoProfile -File scripts/cargo.ps1 run -p hive-eval -- scenario s1-single --runs 1
 ```
 
-每个场景支持 `--runs <n>` 与 `--out <path.jsonl>`；`s5-budget` 会输出 `blocked: pending H09a` 并写 `ok:false`。
+每个场景支持 `--runs <n>` 与 `--out <path.jsonl>`，输出稳定 JSONL；`s5-budget` 已接入并输出 `ok:true`。
 
-## 7. 场景样例（commit `55a179a`，单次运行）
+## 7. 场景样例（commit `b1a108c`，单次运行）
 
 ```jsonl
-{"scenario":"s1-single","commit":"55a179a","run":1,"workers":1,"nodes":1,"wall_ms":46,"events":6,"db_bytes":212992,"ok":true}
-{"scenario":"s2-dag","commit":"55a179a","run":1,"workers":4,"nodes":10,"wall_ms":193,"events":31,"db_bytes":229376,"ok":true}
-{"scenario":"s3-handoff","commit":"55a179a","run":1,"workers":1,"nodes":3,"wall_ms":110,"events":16,"db_bytes":225280,"ok":true}
-{"scenario":"s4-retry","commit":"55a179a","run":1,"workers":1,"nodes":1,"wall_ms":103,"events":10,"db_bytes":221184,"ok":true}
-{"scenario":"s5-budget","commit":"55a179a","run":1,"workers":0,"nodes":0,"wall_ms":0,"events":0,"db_bytes":0,"ok":false,"blocked":"pending H09a"}
-{"scenario":"s6-cancel","commit":"55a179a","run":1,"workers":1,"nodes":3,"wall_ms":43,"events":8,"db_bytes":4096,"ok":true}
+{"scenario":"s1-single","commit":"b1a108c","run":1,"workers":1,"nodes":1,"wall_ms":46,"events":6,"db_bytes":225280,"ok":true}
+{"scenario":"s2-dag","commit":"b1a108c","run":1,"workers":4,"nodes":10,"wall_ms":314,"events":31,"db_bytes":241664,"ok":true}
+{"scenario":"s3-handoff","commit":"b1a108c","run":1,"workers":1,"nodes":3,"wall_ms":127,"events":16,"db_bytes":237568,"ok":true}
+{"scenario":"s4-retry","commit":"b1a108c","run":1,"workers":1,"nodes":1,"wall_ms":109,"events":10,"db_bytes":233472,"ok":true}
+{"scenario":"s5-budget","commit":"b1a108c","run":1,"workers":1,"nodes":2,"wall_ms":78,"events":6,"db_bytes":225280,"ok":true}
+{"scenario":"s6-cancel","commit":"b1a108c","run":1,"workers":1,"nodes":3,"wall_ms":40,"events":8,"db_bytes":4096,"ok":true}
 ```
 
 ## 8. 未实现 / 未采集 / 已知限制
 
 - **性能结论**：p50/p95、`events/sec`、线性扩展、内存等未采集；由 H00 在无并行编译的机器状态下统一采集。本报告中的 `wall_ms` 仅为单次 harness 自测，不作性能论断。
-- **`s5-budget`**：依赖 H09a 的 V5 预算账本与 `node.budget_exceeded`，合并后接入。
+- **`s5-budget`**：已接入 H09a 的 V5 预算账本与 `node.budget_exceeded`；通过真实 `ThreadedExecutor` + `WorkerAgentExecutor` 路径验证。
 - **磁盘慢写**：未实现。
 - **`db_bytes`**：只统计主 `.db` 文件，不含 `-wal`/`-shm`；`s6-cancel` 因连接未 checkpoint 显示偏小，属预期。
 - **`handoff.base_revision`**：生产 `AgentRunner::build_handoff` 当前固定为 `"unknown"`；H10 只断言字段非空且 handoff_id 唯一，真实 git 溯源需后续阶段补（不属本阶段回归）。

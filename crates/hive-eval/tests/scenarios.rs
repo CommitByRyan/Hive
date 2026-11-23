@@ -36,8 +36,9 @@ fn cancel_scenario_reports_ok() {
 }
 
 #[test]
-fn budget_scenario_is_blocked_on_h09a() {
+fn budget_scenario_reports_ok() {
     let record = run_once(Scenario::Budget, "test", 1);
-    assert_eq!(record.blocked, Some("pending H09a"));
-    assert!(!record.ok);
+    assert!(record.ok, "s5-budget failed: {record:?}");
+    assert_eq!(record.scenario, "s5-budget");
+    assert_eq!(record.nodes, 2);
 }
