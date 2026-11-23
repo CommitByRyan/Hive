@@ -2,6 +2,7 @@
 
 > 唯一操作看板。所有对话先读本文件及自己的 runbook。
 > 只有 H00 总控可以修改本文件；其他阶段通过 handoff 汇报，不直接改白板。
+> 约定：完成的对话**不归档**，保留在侧栏供回看；归档记录当前为空。
 > 最近更新：2026-11-23
 
 ## 当前门
@@ -39,6 +40,7 @@
 | H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，`codex/h07-gateway` | done, merged |
 | H03b | 待派发 | 真实 Shell（argv/超时/进程树）、Win32 句柄级路径、连接级 IP 固定 | 新 worktree | pending |
 | H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
+| H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | implementing |
 
 合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
 
