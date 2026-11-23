@@ -6,6 +6,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::{Uuid, Variant};
 
+mod cancel;
+
+pub use cancel::CancellationToken;
+
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 pub const HANDOFF_SCHEMA_VERSION: u32 = 1;
