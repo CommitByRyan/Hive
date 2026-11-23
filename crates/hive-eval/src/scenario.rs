@@ -10,13 +10,14 @@ use hive_runtime::{
     install_plan, validate_plan, Action, ExecOutcome, NodeSpec, Plan, PlanNode, Scheduler,
     ThreadedExecutor,
 };
-use hive_store::Store;
+use hive_store::{BudgetDimension, BudgetLimits, Store};
 use hive_tools::ToolDispatcher;
 use hive_types::{CancellationToken, EventKind, MissionId, NodeId, NodeState, RunId};
 
 use crate::fakes::{ScriptedResponse, ScriptedTransport, SucceedingExecutor};
 use crate::harness::{
-    completion, count_events, create_mission_and_run, db_bytes, now_ms, RunRecord, TempDir,
+    completion, completion_with_usage, count_events, create_mission_and_run, db_bytes, now_ms,
+    RunRecord, TempDir,
 };
 
 /// The fixed scenario identifiers understood by the CLI.
@@ -306,19 +307,109 @@ fn run_retry(commit: &str, run_index: u32) -> RunRecord {
 }
 
 fn run_budget(commit: &str, run_index: u32) -> RunRecord {
-    // Budget accounting and `node.budget_exceeded` land with H09a; do not fake
-    // the API before it merges.
+    let dir = TempDir::new("s5-budget");
+    let db_path = dir.db_path();
+    let start = Instant::now();
+
+    let token_hard_limit: i64 = 10;
+    let (mission_id, run_id) = {
+        let mut store = Store::open(&db_path).expect("open");
+        create_mission_and_run(&mut store, "s5-budget", "exhaust the token budget")
+    };
+
+    let node_id = NodeId::new();
+    let downstream = NodeId::new();
+
+    // Set the node-level token budget before the run. The budgets row is keyed
+    // by the node id string with no foreign key to `nodes`, so it may precede
+    // `install_plan`.
+    {
+        let mut store = Store::open(&db_path).expect("open");
+        store
+            .set_budget(
+                "node",
+                &node_id.to_string(),
+                BudgetDimension::Tokens,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(token_hard_limit),
+                    soft_limit: None,
+                },
+                now_ms(),
+            )
+            .expect("set token budget");
+    }
+
+    let plan = Plan {
+        plan_id: "s5-budget".to_owned(),
+        mission_id,
+        run_id,
+        nodes: vec![
+            node(node_id, Vec::new(), "worker", 0),
+            node(downstream, vec![node_id], "leaf", 0),
+        ],
+    };
+
+    let transport = ScriptedTransport::new(vec![ScriptedResponse::ok_json(
+        &completion_with_usage("way over the hard limit", 8, 8, 16),
+    )]);
+    let gateway = Gateway::with_policy(transport, RetryPolicy::immediate(3));
+    let dispatcher = ToolDispatcher::with_default_root(dir.path()).expect("dispatcher");
+    let cancel = CancellationToken::new();
+    let factory = WorkerAgentExecutor::factory(Arc::new(dispatcher), Arc::new(gateway));
+    let summary =
+        ThreadedExecutor::run(&db_path, &plan, 1, &cancel, factory).expect("run s5-budget");
+
+    let store = Store::open(&db_path).expect("reopen");
+    let events = store.read_all_events().expect("events");
+    let budget_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::NodeBudgetExceeded)
+        .collect();
+    let budget_payload_ok = budget_events.len() == 1
+        && budget_events[0].node_id == Some(node_id)
+        && budget_events[0].payload["dimension"] == "tokens"
+        && budget_events[0].payload["hard_limit"] == token_hard_limit;
+
+    let node_record = store.get_node(node_id).expect("get").expect("present");
+    let failed_final = node_record.state == NodeState::FailedFinal;
+    let downstream_skipped = store
+        .get_node(downstream)
+        .expect("get")
+        .expect("present")
+        .state
+        == NodeState::Skipped;
+
+    // No automatic retry: the initial `node.ready` is the only one for the
+    // failed node, and no `node.failed` is emitted for a budget failure.
+    let node_ready_count = events
+        .iter()
+        .filter(|event| event.kind == EventKind::NodeReady && event.node_id == Some(node_id))
+        .count();
+    let node_failed_count = events
+        .iter()
+        .filter(|event| event.kind == EventKind::NodeFailed && event.node_id == Some(node_id))
+        .count();
+    let no_auto_retry = node_ready_count == 1 && node_failed_count == 0;
+
+    let ok = summary.succeeded == 0
+        && summary.skipped == 1
+        && budget_payload_ok
+        && failed_final
+        && downstream_skipped
+        && no_auto_retry;
+
     RunRecord {
         scenario: Scenario::Budget.name().to_owned(),
         commit: commit.to_owned(),
         run: run_index,
-        workers: 0,
-        nodes: 0,
-        wall_ms: 0,
-        events: 0,
-        db_bytes: 0,
-        ok: false,
-        blocked: Some("pending H09a"),
+        workers: 1,
+        nodes: 2,
+        wall_ms: start.elapsed().as_millis(),
+        events: events.len() as u64,
+        db_bytes: db_bytes(&db_path),
+        ok,
+        blocked: None,
     }
 }
 

@@ -110,6 +110,32 @@ pub fn completion(text: &str) -> serde_json::Value {
     })
 }
 
+/// A single-turn completion carrying an explicit authoritative usage block, so
+/// budget scenarios can deterministically cross a hard token limit.
+pub fn completion_with_usage(
+    text: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-eval",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "auto/eval",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": text}
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+    })
+}
+
 /// Count events of a given kind in a store's full event log.
 pub fn count_events(store: &Store, kind: EventKind) -> u64 {
     store
