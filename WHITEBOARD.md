@@ -7,9 +7,9 @@
 
 ## 当前门
 
-**H09a 预算恢复 + H03b-2 平台安全 + H06d-1 集成器（并行）**
+**H09b Routine + H03b-2 平台安全 + H06d-1 集成器（并行）**
 
-目标：H09a 落 V5 预算账本与 fail-closed 启动恢复；H03b-2 补 Win32 句柄路径与连接级 IP；H06d-1 补 worktree 合并预检与回收。H03b-1 与 H10 已合并，基线推进到 `d116166`。
+目标：H09b 落 V6 Routine 定时触发与 API；H03b-2 补 Win32 句柄路径与连接级 IP；H06d-1 补 worktree 合并预检与回收。H09a 已合并，基线推进到 `5f3769c`。
 
 状态：`in_progress`
 
@@ -31,9 +31,11 @@
 | H08 | 服务协议与 Web 控制台 | done, merged, verified | H05、H06、H07 |
 | H03b-1 | 真实 Shell：argv 直启、进程树、有界输出 | done, merged, verified（207/3） | H03 |
 | H03b-2 | Win32 句柄路径与连接级 IP | in_progress | H03b-1 |
-| H09a | 预算账本 + 启动恢复 | in_progress | H02、H08、H06c |
-| H09b | Routine 定时 | blocked | H09a |
+| H09a | 预算账本 + 启动恢复 | done, merged, verified（217/3 + 主仓全绿） | H02、H08、H06c |
+| H09b | Routine 定时与 API | in_progress | H09a |
 | H09c | 可观测与保留 | blocked | H09b |
+| H06d-1 | worktree 集成器与回收 | in_progress | H06 |
+| H06d-2 | Handoff 真实基线 | pending | H09a |
 | H10 | 评估、故障注入、性能 | harness done（217/3）；s5 与正式基准待 H09a | H06 |
 | H11 | 发布与迁移 | blocked | H10 |
 
@@ -46,7 +48,7 @@
 | H03 | H03 实施对话（pro 429，改 `auto/deepseek-v4.1-flash`） | `crates/hive-policy`、`crates/hive-tools`、migration V2 | `work/wt-h03`，`codex/h03-tools` | done, merged |
 | H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，`codex/h07-gateway` | done, merged |
 | H03b-1 | 可见对话 `01a20875-6db0-7561-ad50-2053e7832da2`（pro high） | `crates/hive-tools` 的 `shell.run`、`hive-policy` 程序/参数策略、测试 | `.codex/worktrees/ed04/Hive`，基线 `e720968` | done, merged `d116166`, verified 207/3 |
-| H09a | 可见对话 `01a20877-15e5-7ad0-a650-eb3df9f9e3b3`（pro high） | V5 budgets、原子扣减、budget_exceeded、启动恢复扫描 | `.codex/worktrees/b2fb/Hive`，基线 `46d381d` | in_progress |
+| H09a | 可见对话 `01a20877-15e5-7ad0-a650-eb3df9f9e3b3`（pro high） | V5 budgets、原子扣减、budget_exceeded、启动恢复扫描 | `.codex/worktrees/b2fb/Hive`，基线 `46d381d` | done, merged `5f3769c`, verified 217/3 |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | in_progress |
 | H10 | 可见对话 `01a20878-248d-73f3-8924-0dc64342445a`（flash high） | `crates/hive-eval`、确定性 fake、5 场景、故障注入 | `.codex/worktrees/ca7e/Hive` | done, merged `096edb1` |
 | H06d-1 | 可见对话 `01a20896-12bf-70c2-af65-97624eb3eb49`（flash high） | `crates/hive-workspace`、merge preview/merge、recycle | `.codex/worktrees/9744/Hive`，基线 `d116166` | in_progress |
@@ -59,7 +61,7 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`d116166`（H03b-1 合并后 H00 独立复验 `All checks passed`；H10 合并基线 217/3）。H08、H06b、H06c、H10 的测试均作为不退化门槛；`Cargo.lock` 由 H00 解冲突并复验。
+合并基线：`5f3769c`（H09a 合并后 H00 独立复验 `All checks passed`）。H08、H06b、H06c、H10、H03b-1 的测试均作为不退化门槛；V5 已冻结，V6 由 H09b 追加。
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
@@ -179,4 +181,5 @@
 | 2026-11-23 | H06c | `WorkerAgentExecutor<T>` 自持 Store、工厂 helper、真实 `ThreadedExecutor` 三条集成测试 | 分支与合并后均 `All checks passed`，190 passed / 3 ignored（+3） |
 | 2026-11-23 | H10 | `hive-eval` 确定性 fake、5 场景、故障注入与安全回归；s5 待 H09a | 分支与合并后均 `All checks passed`，217 passed / 3 ignored |
 | 2026-11-23 | H03b-1 | `ShellPolicy`、argv 直启、Job Object/进程组、有界输出、assign 失败清理 | 分支 207 passed / 3 ignored；合并后 `All checks passed` |
+| 2026-11-23 | H09a | V5 budgets、原子扣减、`node.budget_exceeded`、启动恢复五步、孤儿审批 fail-closed、AgentRunner 双路径接线 | 分支 217 passed / 3 ignored；合并后 `All checks passed`，迁移 fresh/V1–V4→V5 全绿 |
 
