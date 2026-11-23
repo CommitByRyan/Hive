@@ -142,7 +142,7 @@ pending --唯一有效决策--> approved
 
 1. `hive-policy`：错误码、纯路径/网络分类函数、注册表策略与审批决策接口；测试不依赖 OS 副作用。
 2. `hive-tools`：统一 dispatcher、严格参数校验、只读文件/有界 HTTP/禁用 Shell 适配器；无副作用 mock executor 验证流水线顺序。
-3. `hive-workspace`：Windows 句柄遍历与进程 Job Object；平台能力由 trait 隔离，非 Windows 构建明确能力等级。
+3. `hive-platform`：Windows 句柄遍历与进程 Job Object；平台能力由 trait 隔离，非 Windows 构建明确能力等级。`hive-workspace` 已在 H06 用于 git worktree 生命周期，不复用该名字。
 4. 接 H02 持久化：审批 CAS/恢复、工具副作用三段事件和审计校验；最后接 H04/H05 的取消、租约和并行调度，不在 H03 实现调度器。
 
 ## 10. H03 验收清单（测试名 -> 断言）
