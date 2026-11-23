@@ -35,6 +35,10 @@
 |---|---|---|---|---|
 | H01 | H00 | `crates/hive-types`、`crates/hive-config`、`crates/hive-cli`、工程根配置、H01 runbook | 契约修正后工作区 | done |
 | H02 | H02 实施对话（pro → 429，切 `auto/deepseek-v4.1-flash` 完成） | `crates/hive-store`、`crates/hive-events`、迁移与测试 | H01 verified 工作区 | done |
+| H03 | H03 实施对话（`auto/deepseek-v4-pro`） | `crates/hive-policy`、`crates/hive-tools`、`hive-store` 的 migration V2 | `work/wt-h03`，分支 `codex/h03-tools` | implementing |
+| H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，分支 `codex/h07-gateway` | implementing |
+
+基线：`9380fc3`。合并顺序：H03 → H07；`Cargo.toml` 的 member 行与 `Cargo.lock` 冲突由 H00 统一解决后重跑 verify。
 
 ## 冻结契约
 
