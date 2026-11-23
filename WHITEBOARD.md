@@ -7,9 +7,9 @@
 
 ## 当前门
 
-**H05 — 并行 DAG 调度（W4）**
+**H05b — 线程化执行器与语义收紧（W4b）**
 
-目标：依赖解析、就绪队列、租约续期、并发上限、取消传播、重试退避，把单节点闭环扩展成可并行 DAG。
+目标：把确定性调度状态机接上真实并发（每 worker 独立 Store 连接），并收紧租约、事务、attempt 时点三处语义偏差。
 
 状态：`ready to dispatch`
 
@@ -22,8 +22,9 @@
 | H02 | 持久化、事件日志、恢复 | done, verified | H01 |
 | H03 | 工具、审批、工作区安全 | done, verified（shell/Win32 留 H03b） | H02 |
 | H04 | 单 Agent 垂直闭环 | done, verified | H02、H03、H07 |
-| H05 | 并行 DAG 调度 | in_progress | H04 |
-| H06 | 多 Agent 协作与 worktree | blocked | H05 |
+| H05 | 并行 DAG 调度（状态机） | done, verified | H04 |
+| H05b | 线程化执行器 + 语义收紧 | in_progress | H05 |
+| H06 | 多 Agent 协作与 worktree | blocked | H05b |
 | H07 | 模型网关与路由 | done, verified（无真实 HTTP 适配器） | H01 |
 | H08 | 服务协议与 Web 控制台 | blocked | H05、H07 |
 | H09 | 定时、恢复、可观测性 | blocked | H02、H08 |
@@ -40,7 +41,8 @@
 | H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，`codex/h07-gateway` | done, merged |
 | H03b | 待派发 | 真实 Shell（argv/超时/进程树）、Win32 句柄级路径、连接级 IP 固定 | 新 worktree | pending |
 | H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
-| H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | implementing |
+| H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | done, merged |
+| H05b | 待派发（可见对话） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、租约/事务/attempt 语义收紧 | 新 worktree | ready |
 
 合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
 
@@ -149,4 +151,6 @@
 | 2026-11-23 | H07 | `hive-llm`：wire 类型、SSE 增量解析、tool_call 累积、模型目录、重试策略、MockTransport | 35 条测试；合并后全量 125 passed |
 | 2026-11-23 | H00 | W2 合并：`Cargo.toml`/`Cargo.lock` 冲突已解，main 全绿 | `scripts/verify.ps1`、`cargo test --workspace` |
 | 2026-11-23 | H04 | V3 迁移（sessions/turns/usage）、`UreqTransport`、`AgentRunner` 闭环、取消、`StoreApprovalGate` | 独立复验 138 passed / 3 ignored；V3 列已冻结进 PROTOCOL §10 |
+| 2026-11-23 | H08 | HTTP/SSE 与控制台设计（186 行，16 条测试断言） | 只读产出，未改代码 |
+| 2026-11-23 | H05 | `hive-runtime`：DAG 校验、就绪队列、`max_parallel`、取消、重试、事件序列；`CancellationToken` 上移 | 独立复验 156 passed / 3 ignored |
 
