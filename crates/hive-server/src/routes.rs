@@ -9,11 +9,11 @@ use serde_json::{json, Value};
 
 use hive_store::{
     ApprovalDecision, ApprovalRecord, ArtifactRecord, MissionListRecord, MissionRecord, NodeRecord,
-    RunRecord,
+    RoutineRecord, RunRecord,
 };
 use hive_types::{
     observe_mission, ApprovalId, ApprovalState, ArtifactId, EventId, EventInput, EventKind,
-    MissionId, NodeState,
+    MissionId, NodeState, RoutineId,
 };
 
 use crate::error::ApiError;
@@ -71,6 +71,22 @@ struct MessageBody {
 struct DecideBody {
     decision: String,
     note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRoutineBody {
+    name: String,
+    goal: String,
+    schedule: String,
+    timezone: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateRoutineBody {
+    enabled: Option<bool>,
+    schedule: Option<String>,
 }
 
 pub async fn health(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -522,14 +538,97 @@ pub async fn get_artifact(
 }
 
 pub async fn list_routines(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let _ = state;
-    Ok(json_response(StatusCode::OK, json!({ "routines": [] })))
+    let routines = {
+        let store = state.store.lock().map_err(|_| ApiError::store_lock())?;
+        store.list_routines().map_err(ApiError::store)?
+    };
+    let items: Vec<Value> = routines.iter().map(routine_json).collect();
+    Ok(json_response(StatusCode::OK, json!({ "routines": items })))
 }
 
-pub async fn create_routine() -> Result<Response, ApiError> {
-    Err(ApiError::bad_request(
-        "not_available_before_h09",
-        "routines are reserved for H09",
+pub async fn create_routine(
+    State(state): State<AppState>,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let payload: CreateRoutineBody = json_body(body).await?;
+    let name = payload.name.trim().to_owned();
+    let goal = payload.goal.trim().to_owned();
+    let schedule = payload.schedule.trim().to_owned();
+    if name.is_empty() || name.len() > 16 * 1024 {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "name must be 1..=16 KiB after trim",
+        ));
+    }
+    if goal.is_empty() || goal.len() > 16 * 1024 {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "goal must be 1..=16 KiB after trim",
+        ));
+    }
+    let timezone = payload
+        .timezone
+        .unwrap_or_else(|| hive_store::DEFAULT_TIMEZONE.to_owned());
+    let record = {
+        let mut store = state.store.lock().map_err(|_| ApiError::store_lock())?;
+        let now = hive_store::now_ms();
+        store
+            .create_routine(&name, &goal, &schedule, &timezone, now)
+            .map_err(ApiError::store)?
+    };
+    Ok(json_response(
+        StatusCode::CREATED,
+        json!({ "routine": routine_json(&record) }),
+    ))
+}
+
+pub async fn update_routine(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let routine_id = parse_routine_id(&id)?;
+    let payload: UpdateRoutineBody = json_body(body).await?;
+    if payload.enabled.is_none() && payload.schedule.is_none() {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "provide enabled and/or schedule",
+        ));
+    }
+    let schedule = payload.schedule.as_deref().map(str::trim);
+    let (record, envelope) = {
+        let mut store = state.store.lock().map_err(|_| ApiError::store_lock())?;
+        let now = hive_store::now_ms();
+        store
+            .update_routine(routine_id, payload.enabled, schedule, now)
+            .map_err(ApiError::store)?
+    };
+    state.broadcast(&envelope);
+    Ok(json_response(
+        StatusCode::OK,
+        json!({ "routine": routine_json(&record), "last_seq": envelope.seq }),
+    ))
+}
+
+pub async fn delete_routine(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let routine_id = parse_routine_id(&id)?;
+    let envelope = {
+        let mut store = state.store.lock().map_err(|_| ApiError::store_lock())?;
+        let now = hive_store::now_ms();
+        store
+            .delete_routine(routine_id, now)
+            .map_err(ApiError::store)?
+    };
+    state.broadcast(&envelope);
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "deleted": routine_id.to_string(),
+            "last_seq": envelope.seq,
+        }),
     ))
 }
 
@@ -601,6 +700,20 @@ fn node_json(node: &NodeRecord) -> Value {
     })
 }
 
+fn routine_json(routine: &RoutineRecord) -> Value {
+    json!({
+        "routine_id": routine.routine_id.to_string(),
+        "name": routine.name,
+        "goal": routine.goal,
+        "schedule": routine.schedule,
+        "enabled": routine.enabled,
+        "timezone": routine.timezone,
+        "last_run_ms": routine.last_run_ms,
+        "next_run_ms": routine.next_run_ms,
+        "created_at_ms": routine.created_at_ms,
+    })
+}
+
 fn approval_json(approval: &ApprovalRecord) -> Result<Value, ApiError> {
     Ok(json!({
         "id": approval.approval_id.to_string(),
@@ -666,6 +779,11 @@ fn parse_approval_id(value: &str) -> Result<ApprovalId, ApiError> {
 fn parse_artifact_id(value: &str) -> Result<ArtifactId, ApiError> {
     ArtifactId::parse(value)
         .map_err(|_| ApiError::bad_request("invalid_id", format!("invalid artifact id `{value}`")))
+}
+
+fn parse_routine_id(value: &str) -> Result<RoutineId, ApiError> {
+    RoutineId::parse(value)
+        .map_err(|_| ApiError::bad_request("invalid_id", format!("invalid routine id `{value}`")))
 }
 
 fn parse_cursor(value: &str) -> Result<u64, ApiError> {

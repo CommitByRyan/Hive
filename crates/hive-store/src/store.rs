@@ -2,10 +2,11 @@ use std::path::Path;
 
 use hive_types::{
     AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, EventId, EventInput,
-    EventKind, Handoff, HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState, RunId,
-    RunState, ToolCallId, TurnId, EVENT_SCHEMA_VERSION,
+    EventKind, Handoff, HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState,
+    RoutineId, RunId, RunState, ToolCallId, TurnId, EVENT_SCHEMA_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -14,17 +15,43 @@ use crate::records::{
     AgentSessionRecord, AgentSessionState, ApprovalDecision, ApprovalInput, ApprovalRecord,
     ArtifactRecord, BudgetDimension, BudgetLimits, BudgetRecord, BudgetSummary, HandoffRecord,
     LeaseGuard, MissionAggregate, MissionListRecord, MissionRecord, MissionSnapshotRecord,
-    NewAgentSession, NewTurnUsage, NodeRecord, RunRecord, SideEffectState, SnapshotInput,
-    SnapshotRecord, StateSnapshotRecord, ToolAuditRecord, TurnRecord, TurnState, TurnUsageRecord,
-    UsageSource,
+    NewAgentSession, NewTurnUsage, NodeRecord, RoutineRecord, RunRecord, SideEffectState,
+    SnapshotInput, SnapshotRecord, StateSnapshotRecord, ToolAuditRecord, TurnRecord, TurnState,
+    TurnUsageRecord, UsageSource,
 };
+use crate::routine;
 use crate::schema;
 use crate::time::{now_ms, now_rfc3339};
 use crate::{MAX_SEQ, SNAPSHOT_SCHEMA_VERSION};
 
+const MAX_ROUTINES: u64 = 50;
+
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
+}
+
+/// Result of attempting to fire one routine window.
+#[derive(Debug)]
+pub enum RoutineFireOutcome {
+    /// A Mission was created and `routine.triggered` was emitted.
+    Fired {
+        mission: MissionRecord,
+        fire_at_ms: i64,
+        envelope: EventEnvelope,
+    },
+    /// The window was already claimed by another tick.
+    AlreadyFired,
+    /// The routine is not due yet (or has been disabled).
+    NotDue,
+    /// The routine no longer exists.
+    NotFound,
+    /// The stored schedule became invalid; the row was disabled and
+    /// `routine.error` was emitted.
+    Disabled { envelope: EventEnvelope },
+    /// Mission creation failed; the window was recorded as failed without
+    /// replaying it.
+    Failed { fire_at_ms: i64 },
 }
 
 impl Store {
@@ -2075,6 +2102,387 @@ impl Store {
     pub fn list_artifacts(&self, mission_id: MissionId) -> StoreResult<Vec<ArtifactRecord>> {
         query_artifacts(&self.conn, mission_id)
     }
+
+    pub fn create_routine(
+        &mut self,
+        name: &str,
+        goal: &str,
+        schedule: &str,
+        timezone: &str,
+        now_ms: i64,
+    ) -> StoreResult<RoutineRecord> {
+        if !routine::validate_timezone(timezone) {
+            return Err(StoreError::InvalidTimezone(timezone.to_owned()));
+        }
+        let schedule_parsed = routine::parse_schedule(schedule)
+            .map_err(|error| StoreError::InvalidSchedule(error.to_string()))?;
+        if self.count_routines()? >= MAX_ROUTINES {
+            return Err(StoreError::RoutineLimit);
+        }
+        let record = RoutineRecord {
+            routine_id: RoutineId::new(),
+            name: name.to_owned(),
+            goal: goal.to_owned(),
+            schedule: schedule.trim().to_owned(),
+            enabled: true,
+            timezone: timezone.to_owned(),
+            last_run_ms: None,
+            next_run_ms: routine::first_next_run_ms(schedule_parsed, now_ms),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        self.conn.execute(
+            "INSERT INTO routines (routine_id, name, goal, schedule, enabled, timezone, last_run_ms, next_run_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.routine_id.to_string(),
+                record.name,
+                record.goal,
+                record.schedule,
+                record.enabled as i64,
+                record.timezone,
+                Option::<i64>::None,
+                record.next_run_ms,
+                record.created_at_ms,
+                record.updated_at_ms,
+            ],
+        )?;
+        Ok(record)
+    }
+
+    pub fn get_routine(&self, routine_id: RoutineId) -> StoreResult<Option<RoutineRecord>> {
+        query_routine(&self.conn, routine_id)
+    }
+
+    pub fn list_routines(&self) -> StoreResult<Vec<RoutineRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT routine_id, name, goal, schedule, enabled, timezone, last_run_ms, next_run_ms, created_at_ms, updated_at_ms FROM routines ORDER BY created_at_ms ASC, routine_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(parse_routine(row?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn count_routines(&self) -> StoreResult<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM routines", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Update `enabled` and/or `schedule`. When a schedule changes or the
+    /// routine is re-enabled, `next_run_ms` is recomputed from `now_ms` so
+    /// missed windows are skipped rather than replayed.
+    pub fn update_routine(
+        &mut self,
+        routine_id: RoutineId,
+        enabled: Option<bool>,
+        schedule: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<(RoutineRecord, EventEnvelope)> {
+        let current = query_routine(&self.conn, routine_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("routine {routine_id}")))?;
+        let new_enabled = enabled.unwrap_or(current.enabled);
+        let new_schedule = match schedule {
+            Some(schedule) => {
+                routine::parse_schedule(schedule)
+                    .map_err(|error| StoreError::InvalidSchedule(error.to_string()))?;
+                schedule.trim().to_owned()
+            }
+            None => current.schedule.clone(),
+        };
+        let mut changed = Vec::new();
+        if new_schedule != current.schedule {
+            changed.push("schedule");
+        }
+        if new_enabled != current.enabled {
+            changed.push("enabled");
+        }
+
+        let recompute =
+            changed.contains(&"schedule") || (enabled.is_some() && new_enabled && !current.enabled);
+        let next_run_ms = if recompute {
+            let parsed = routine::parse_schedule(&new_schedule)
+                .map_err(|error| StoreError::InvalidSchedule(error.to_string()))?;
+            routine::first_next_run_ms(parsed, now_ms)
+        } else {
+            current.next_run_ms
+        };
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE routines SET enabled = ?1, schedule = ?2, next_run_ms = ?3, updated_at_ms = ?4 WHERE routine_id = ?5",
+            params![
+                new_enabled as i64,
+                new_schedule,
+                next_run_ms,
+                now_ms,
+                routine_id.to_string(),
+            ],
+        )?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::RoutineUpdated,
+            mission_id: system_mission_id(),
+            run_id: None,
+            node_id: None,
+            session_id: None,
+            attempt_no: None,
+            trace_id: None,
+            payload: json!({
+                "routine_id": routine_id.to_string(),
+                "changed": changed,
+            }),
+        };
+        let envelope = insert_event(&tx, &event)?;
+        tx.commit()?;
+        let record = query_routine(&self.conn, routine_id)?.expect("routine was just updated");
+        Ok((record, envelope))
+    }
+
+    pub fn delete_routine(
+        &mut self,
+        routine_id: RoutineId,
+        _now_ms: i64,
+    ) -> StoreResult<EventEnvelope> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM routines WHERE routine_id = ?1",
+            params![routine_id.to_string()],
+        )?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("routine {routine_id}")));
+        }
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::RoutineDeleted,
+            mission_id: system_mission_id(),
+            run_id: None,
+            node_id: None,
+            session_id: None,
+            attempt_no: None,
+            trace_id: None,
+            payload: json!({ "routine_id": routine_id.to_string() }),
+        };
+        let envelope = insert_event(&tx, &event)?;
+        tx.commit()?;
+        Ok(envelope)
+    }
+
+    pub fn list_due_routines(&self, now_ms: i64) -> StoreResult<Vec<RoutineId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT routine_id FROM routines WHERE enabled = 1 AND next_run_ms <= ?1 ORDER BY next_run_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![now_ms], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(RoutineId::parse(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Fire one routine window if it is due. A single invalid row is disabled
+    /// and reported without failing the caller's broader tick loop.
+    pub fn fire_routine(
+        &mut self,
+        routine_id: RoutineId,
+        now_ms: i64,
+    ) -> StoreResult<RoutineFireOutcome> {
+        let row = match query_routine(&self.conn, routine_id)? {
+            Some(row) => row,
+            None => return Ok(RoutineFireOutcome::NotFound),
+        };
+        if !row.enabled {
+            return Ok(RoutineFireOutcome::NotDue);
+        }
+        let schedule = match routine::parse_schedule(&row.schedule) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                return self
+                    .disable_routine_and_emit(
+                        routine_id,
+                        "invalid_schedule",
+                        error.to_string(),
+                        now_ms,
+                    )
+                    .map(|envelope| RoutineFireOutcome::Disabled { envelope });
+            }
+        };
+        let fire_at_ms = row.next_run_ms;
+        if fire_at_ms > now_ms {
+            return Ok(RoutineFireOutcome::NotDue);
+        }
+        let new_next = routine::next_run_after(schedule, fire_at_ms, now_ms);
+
+        match self.fire_once(routine_id, &row, fire_at_ms, new_next, now_ms) {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                self.record_fire_failure(routine_id, fire_at_ms, new_next, now_ms)?;
+                Ok(RoutineFireOutcome::Failed { fire_at_ms })
+            }
+        }
+    }
+
+    fn fire_once(
+        &mut self,
+        routine_id: RoutineId,
+        row: &RoutineRecord,
+        fire_at_ms: i64,
+        new_next: i64,
+        now_ms: i64,
+    ) -> StoreResult<RoutineFireOutcome> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let claimed = tx.execute(
+            "UPDATE routines SET next_run_ms = ?1, last_run_ms = ?2, updated_at_ms = ?2 WHERE routine_id = ?3 AND next_run_ms = ?4 AND enabled = 1",
+            params![new_next, now_ms, routine_id.to_string(), fire_at_ms],
+        )?;
+        if claimed == 0 {
+            return Ok(RoutineFireOutcome::AlreadyFired);
+        }
+        let mission = MissionRecord {
+            mission_id: MissionId::new(),
+            state: MissionState::Queued,
+            title: row.name.clone(),
+            goal: row.goal.clone(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        tx.execute(
+            "INSERT INTO missions (mission_id, state, title, goal, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                mission.mission_id.to_string(),
+                mission.state.as_str(),
+                mission.title,
+                mission.goal,
+                mission.created_at_ms,
+                mission.updated_at_ms,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO routine_fires (routine_id, fire_at_ms, mission_id, state, created_at_ms) VALUES (?1, ?2, ?3, 'created', ?4)",
+            params![
+                routine_id.to_string(),
+                fire_at_ms,
+                mission.mission_id.to_string(),
+                now_ms,
+            ],
+        )?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::RoutineTriggered,
+            mission_id: mission.mission_id,
+            run_id: None,
+            node_id: None,
+            session_id: None,
+            attempt_no: None,
+            trace_id: None,
+            payload: json!({
+                "routine_id": routine_id.to_string(),
+                "fire_at_ms": fire_at_ms,
+                "mission_id": mission.mission_id.to_string(),
+            }),
+        };
+        let envelope = insert_event(&tx, &event)?;
+        tx.commit()?;
+        Ok(RoutineFireOutcome::Fired {
+            mission,
+            fire_at_ms,
+            envelope,
+        })
+    }
+
+    fn disable_routine_and_emit(
+        &mut self,
+        routine_id: RoutineId,
+        code: &str,
+        message: String,
+        now_ms: i64,
+    ) -> StoreResult<EventEnvelope> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE routines SET enabled = 0, updated_at_ms = ?1 WHERE routine_id = ?2",
+            params![now_ms, routine_id.to_string()],
+        )?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::RoutineError,
+            mission_id: system_mission_id(),
+            run_id: None,
+            node_id: None,
+            session_id: None,
+            attempt_no: None,
+            trace_id: None,
+            payload: json!({
+                "routine_id": routine_id.to_string(),
+                "code": code,
+                "message": message,
+            }),
+        };
+        let envelope = insert_event(&tx, &event)?;
+        tx.commit()?;
+        Ok(envelope)
+    }
+
+    fn record_fire_failure(
+        &mut self,
+        routine_id: RoutineId,
+        fire_at_ms: i64,
+        new_next: i64,
+        now_ms: i64,
+    ) -> StoreResult<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _ = tx.execute(
+            "INSERT INTO routine_fires (routine_id, fire_at_ms, mission_id, state, created_at_ms) VALUES (?1, ?2, NULL, 'failed', ?3)",
+            params![routine_id.to_string(), fire_at_ms, now_ms],
+        );
+        tx.execute(
+            "UPDATE routines SET next_run_ms = ?1, last_run_ms = ?2, updated_at_ms = ?2 WHERE routine_id = ?3",
+            params![new_next, now_ms, routine_id.to_string()],
+        )?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::RoutineError,
+            mission_id: system_mission_id(),
+            run_id: None,
+            node_id: None,
+            session_id: None,
+            attempt_no: None,
+            trace_id: None,
+            payload: json!({
+                "routine_id": routine_id.to_string(),
+                "code": "routine_fire_failed",
+                "message": "failed to create mission for routine window",
+            }),
+        };
+        insert_event(&tx, &event)?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 fn http_cursor(seq: u64) -> StoreResult<i64> {
@@ -3055,6 +3463,79 @@ fn tool_call_id_from(event: &EventInput) -> StoreResult<String> {
         .ok_or_else(|| StoreError::Conflict("tool event missing tool_call_id".to_owned()))
 }
 
+/// Fixed, well-formed v4 Mission identity for process-level events (the
+/// `routine.*` family other than `routine.triggered`) that have no single
+/// Mission owner. The `events` table requires a non-null `mission_id`, but
+/// these events must not be attributed to any real Mission.
+fn system_mission_id() -> MissionId {
+    MissionId::from_uuid(Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0000))
+        .expect("reserved system mission id is a valid v4 uuid")
+}
+
+fn query_routine(conn: &Connection, routine_id: RoutineId) -> StoreResult<Option<RoutineRecord>> {
+    let row = conn
+        .query_row(
+            "SELECT routine_id, name, goal, schedule, enabled, timezone, last_run_ms, next_run_ms, created_at_ms, updated_at_ms FROM routines WHERE routine_id = ?1",
+            params![routine_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(parse_routine).transpose()
+}
+
+fn parse_routine(
+    raw: (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+    ),
+) -> StoreResult<RoutineRecord> {
+    let (
+        routine_id,
+        name,
+        goal,
+        schedule,
+        enabled,
+        timezone,
+        last_run_ms,
+        next_run_ms,
+        created_at_ms,
+        updated_at_ms,
+    ) = raw;
+    Ok(RoutineRecord {
+        routine_id: RoutineId::parse(&routine_id)?,
+        name,
+        goal,
+        schedule,
+        enabled: enabled != 0,
+        timezone,
+        last_run_ms,
+        next_run_ms,
+        created_at_ms,
+        updated_at_ms,
+    })
+}
+
 fn insert_event(conn: &Connection, input: &EventInput) -> StoreResult<EventEnvelope> {
     let created_at = now_rfc3339();
     let created_at_ms = now_ms();
@@ -3191,7 +3672,7 @@ mod tests {
         RunId, ToolCallId, HANDOFF_SCHEMA_VERSION,
     };
 
-    use super::Store;
+    use super::{RoutineFireOutcome, Store};
     use crate::error::StoreError;
     use crate::records::{
         can_retry, AgentSessionState, ApprovalDecision, ApprovalInput, BudgetDimension,
@@ -3895,23 +4376,23 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_v5_tables() {
+    fn fresh_database_has_v6_tables() {
         let store = Store::open_in_memory().expect("store");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs','budgets')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs','budgets','routines','routine_fires')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 8);
+        assert_eq!(tables, 10);
     }
 
     #[test]
-    fn v1_database_migrates_to_v5_and_preserves_rows() {
-        let dir = TempDir::new("v1-to-v5");
+    fn v1_database_migrates_to_v6_and_preserves_rows() {
+        let dir = TempDir::new("v1-to-v6");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
 
@@ -3927,7 +4408,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         let mission = store
             .get_mission(mission_id)
             .expect("mission")
@@ -3936,19 +4417,19 @@ mod tests {
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs','budgets')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs','budgets','routines','routine_fires')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 8);
+        assert_eq!(tables, 10);
     }
 
     #[test]
-    fn v2_database_migrates_to_v5_and_preserves_rows() {
+    fn v2_database_migrates_to_v6_and_preserves_rows() {
         use crate::schema::V2_SCHEMA;
 
-        let dir = TempDir::new("v2-to-v5");
+        let dir = TempDir::new("v2-to-v6");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
         let run_id = RunId::new();
@@ -3988,7 +4469,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert_eq!(
             store
                 .get_mission(mission_id)
@@ -4014,10 +4495,10 @@ mod tests {
     }
 
     #[test]
-    fn v3_database_migrates_to_v5_and_preserves_rows() {
+    fn v3_database_migrates_to_v6_and_preserves_rows() {
         use crate::schema::{V2_SCHEMA, V3_SCHEMA};
 
-        let dir = TempDir::new("v3-to-v5");
+        let dir = TempDir::new("v3-to-v6");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
         let run_id = RunId::new();
@@ -4058,7 +4539,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert_eq!(
             store
                 .get_mission(mission_id)
@@ -4080,10 +4561,10 @@ mod tests {
     }
 
     #[test]
-    fn v4_database_migrates_to_v5_and_preserves_rows() {
+    fn v4_database_migrates_to_v6_and_preserves_rows() {
         use crate::schema::{V2_SCHEMA, V3_SCHEMA, V4_SCHEMA};
 
-        let dir = TempDir::new("v4-to-v5");
+        let dir = TempDir::new("v4-to-v6");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
         let run_id = RunId::new();
@@ -4114,7 +4595,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert_eq!(
             store
                 .get_mission(mission_id)
@@ -4831,5 +5312,243 @@ mod tests {
         for banned in ["api_key", "base_url", "price", "unit_price"] {
             assert!(!debug.contains(banned), "leaked {banned} in {debug}");
         }
+    }
+
+    #[test]
+    fn v5_database_migrates_to_v6_and_preserves_rows() {
+        use crate::schema::{V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA};
+
+        let dir = TempDir::new("v5-to-v6");
+        let path = dir.path().join("hive.db");
+        let mission_id = MissionId::new();
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw conn");
+            conn.execute_batch(V1_SCHEMA).expect("v1");
+            conn.execute_batch(V2_SCHEMA).expect("v2");
+            conn.execute_batch(V3_SCHEMA).expect("v3");
+            conn.execute_batch(V4_SCHEMA).expect("v4");
+            conn.execute_batch(V5_SCHEMA).expect("v5");
+            conn.execute(
+                "INSERT INTO missions (mission_id, state, title, goal, created_at_ms, updated_at_ms) VALUES (?1, 'queued', 'kept', 'goal', 1, 1)",
+                rusqlite::params![mission_id.to_string()],
+            )
+            .expect("mission");
+            conn.execute(
+                "INSERT INTO budgets (scope_kind, scope_id, dimension, currency, hard_limit, soft_limit, consumed, updated_at_ms) VALUES ('node', 'n_seed', 'tokens', NULL, 100, NULL, 7, 1)",
+                [],
+            )
+            .expect("budget");
+            conn.pragma_update(None, "user_version", 5).expect("set v5");
+        }
+
+        let store = Store::open(&path).expect("migrate");
+        assert_eq!(store.schema_version().expect("version"), 6);
+        assert_eq!(
+            store
+                .get_mission(mission_id)
+                .expect("mission")
+                .expect("preserved")
+                .title,
+            "kept"
+        );
+        let budgets: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM budgets", [], |row| row.get(0))
+            .expect("budgets");
+        assert_eq!(budgets, 1);
+        let consumed: i64 = store
+            .conn
+            .query_row(
+                "SELECT consumed FROM budgets WHERE scope_id = 'n_seed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("consumed");
+        assert_eq!(consumed, 7);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM routines", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("routines"),
+            0
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM routine_fires", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("fires"),
+            0
+        );
+    }
+
+    #[test]
+    fn create_routine_validates_schedule_timezone_and_limit() {
+        let mut store = Store::open_in_memory().expect("store");
+        assert!(matches!(
+            store.create_routine("n", "g", "garbage", "Asia/Shanghai", 0),
+            Err(StoreError::InvalidSchedule(_))
+        ));
+        assert!(matches!(
+            store.create_routine("n", "g", "every:5m", "UTC", 0),
+            Err(StoreError::InvalidTimezone(_))
+        ));
+        for _ in 0..50 {
+            store
+                .create_routine("n", "g", "every:5m", "Asia/Shanghai", 0)
+                .expect("routine");
+        }
+        assert!(matches!(
+            store.create_routine("n", "g", "every:5m", "Asia/Shanghai", 0),
+            Err(StoreError::RoutineLimit)
+        ));
+    }
+
+    #[test]
+    fn routine_crud_round_trips_and_emits_update_delete() {
+        let mut store = Store::open_in_memory().expect("store");
+        let routine = store
+            .create_routine("n", "g", "hourly", "Asia/Shanghai", 0)
+            .expect("create");
+        assert_eq!(routine.schedule, "hourly");
+        assert!(routine.enabled);
+        assert_eq!(routine.next_run_ms, 3_600_000);
+
+        let (updated, envelope) = store
+            .update_routine(routine.routine_id, Some(false), None, 10_000)
+            .expect("disable");
+        assert!(!updated.enabled);
+        assert_eq!(envelope.kind, EventKind::RoutineUpdated);
+
+        let (reenabled, _) = store
+            .update_routine(routine.routine_id, Some(true), None, 100_000)
+            .expect("re-enable");
+        assert!(reenabled.enabled);
+        assert_eq!(reenabled.next_run_ms, 100_000 + 3_600_000);
+
+        let (_, _) = store
+            .update_routine(routine.routine_id, None, Some("daily:09:00"), 0)
+            .expect("schedule change");
+        let changed = store
+            .get_routine(routine.routine_id)
+            .expect("get")
+            .expect("present");
+        assert_eq!(changed.schedule, "daily:09:00");
+
+        let envelope = store.delete_routine(routine.routine_id, 0).expect("delete");
+        assert_eq!(envelope.kind, EventKind::RoutineDeleted);
+        assert!(store
+            .get_routine(routine.routine_id)
+            .expect("get")
+            .is_none());
+
+        let events = store.read_all_events().expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::RoutineUpdated));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::RoutineDeleted));
+        // Routine lifecycle events are not node-scoped.
+        for event in events.iter().filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::RoutineUpdated | EventKind::RoutineDeleted
+            )
+        }) {
+            assert!(event.node_id.is_none());
+            assert!(event.attempt_no.is_none());
+        }
+    }
+
+    #[test]
+    fn fire_routine_is_idempotent_per_window() {
+        let mut store = Store::open_in_memory().expect("store");
+        let routine = store
+            .create_routine("n", "g", "every:5m", "Asia/Shanghai", 0)
+            .expect("routine");
+        let due = routine.next_run_ms;
+        let outcome = store.fire_routine(routine.routine_id, due).expect("fire");
+        assert!(matches!(
+            outcome,
+            RoutineFireOutcome::Fired { fire_at_ms, .. } if fire_at_ms == due
+        ));
+        let second = store
+            .fire_routine(routine.routine_id, due)
+            .expect("second fire");
+        assert!(matches!(second, RoutineFireOutcome::NotDue));
+
+        let missions: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM missions", [], |row| row.get(0))
+            .expect("missions");
+        assert_eq!(missions, 1);
+        let fires: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM routine_fires", [], |row| row.get(0))
+            .expect("fires");
+        assert_eq!(fires, 1);
+        let events = store.read_all_events().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == EventKind::RoutineTriggered)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fire_routine_disables_corrupted_schedule_and_continues() {
+        let mut store = Store::open_in_memory().expect("store");
+        let good = store
+            .create_routine("good", "g", "every:5m", "Asia/Shanghai", 0)
+            .expect("good");
+        let bad = store
+            .create_routine("bad", "g", "every:5m", "Asia/Shanghai", 0)
+            .expect("bad");
+        store
+            .conn
+            .execute(
+                "UPDATE routines SET schedule = 'garbage' WHERE routine_id = ?1",
+                rusqlite::params![bad.routine_id.to_string()],
+            )
+            .expect("corrupt");
+        let due = good.next_run_ms;
+
+        let good_outcome = store.fire_routine(good.routine_id, due).expect("good fire");
+        assert!(matches!(good_outcome, RoutineFireOutcome::Fired { .. }));
+        let bad_outcome = store.fire_routine(bad.routine_id, due).expect("bad fire");
+        assert!(matches!(bad_outcome, RoutineFireOutcome::Disabled { .. }));
+
+        let bad_row = store
+            .get_routine(bad.routine_id)
+            .expect("get")
+            .expect("row");
+        assert!(!bad_row.enabled);
+        let events = store.read_all_events().expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::RoutineError));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == EventKind::RoutineTriggered));
+    }
+
+    #[test]
+    fn daily_schedule_first_run_is_asia_shanghai_epoch() {
+        let mut store = Store::open_in_memory().expect("store");
+        let routine = store
+            .create_routine("n", "g", "daily:09:00", "Asia/Shanghai", 1_795_392_000_000)
+            .expect("routine");
+        assert_eq!(routine.next_run_ms, 1_795_395_600_000);
+        assert_eq!(
+            crate::time::rfc3339_from_ms(routine.next_run_ms),
+            "2026-11-23T01:00:00Z"
+        );
     }
 }

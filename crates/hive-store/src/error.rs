@@ -26,6 +26,12 @@ pub enum StoreError {
     LeaseTokenMismatch,
     #[error("budget exceeded for {dimension}")]
     BudgetExceeded { dimension: String },
+    #[error("invalid schedule: {0}")]
+    InvalidSchedule(String),
+    #[error("invalid timezone: {0}")]
+    InvalidTimezone(String),
+    #[error("routine limit reached")]
+    RoutineLimit,
 }
 
 impl StoreError {
@@ -36,6 +42,9 @@ impl StoreError {
             Self::StaleExecution => "tool.stale_execution",
             Self::LeaseTokenMismatch => "tool.stale_execution",
             Self::BudgetExceeded { .. } => "budget.exceeded",
+            Self::InvalidSchedule(_) => "invalid_schedule",
+            Self::InvalidTimezone(_) => "invalid_timezone",
+            Self::RoutineLimit => "routine_limit",
             Self::NotFound(_) => "not_found",
             Self::DuplicateEvent(_) => "duplicate_event",
             Self::SequenceExhausted => "sequence_exhausted",

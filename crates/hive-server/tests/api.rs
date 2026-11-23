@@ -45,6 +45,15 @@ fn post_json(uri: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
+fn delete(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn health_reports_schema_version_without_secrets() {
     let response = app().oneshot(get("/api/health")).await.unwrap();
@@ -255,4 +264,137 @@ async fn concurrent_approval_decisions_have_single_winner() {
         }
     }
     assert_eq!(winners, 1);
+}
+
+#[tokio::test]
+async fn create_routine_validates_schedule_and_timezone() {
+    for schedule in ["", "every:1m", "every:8d", "daily:24:00", "garbage"] {
+        let response = app()
+            .oneshot(post_json(
+                "/api/routines",
+                json!({ "name": "n", "goal": "g", "schedule": schedule }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "schedule {schedule}"
+        );
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "invalid_schedule",
+            "schedule {schedule}"
+        );
+    }
+
+    let response = app()
+        .oneshot(post_json(
+            "/api/routines",
+            json!({ "name": "n", "goal": "g", "schedule": "every:5m", "timezone": "UTC" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "invalid_timezone"
+    );
+}
+
+#[tokio::test]
+async fn create_routine_returns_created_fields() {
+    let response = app()
+        .oneshot(post_json(
+            "/api/routines",
+            json!({ "name": "n", "goal": "g", "schedule": "hourly" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = json_body(response).await;
+    assert!(body["routine"]["routine_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("rt_"));
+    assert_eq!(body["routine"]["schedule"], "hourly");
+    assert_eq!(body["routine"]["enabled"], true);
+    assert_eq!(body["routine"]["timezone"], "Asia/Shanghai");
+    assert!(body["routine"]["next_run_ms"].as_i64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn create_routine_enforces_limit_of_fifty() {
+    let app = app();
+    for _ in 0..50 {
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/routines",
+                json!({ "name": "n", "goal": "g", "schedule": "every:5m" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let response = app
+        .oneshot(post_json(
+            "/api/routines",
+            json!({ "name": "n", "goal": "g", "schedule": "every:5m" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["error"]["code"], "routine_limit");
+}
+
+#[tokio::test]
+async fn list_update_and_delete_routine() {
+    let app = app();
+    let created = app
+        .clone()
+        .oneshot(post_json(
+            "/api/routines",
+            json!({ "name": "n", "goal": "g", "schedule": "every:5m" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let routine_id = json_body(created).await["routine"]["routine_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let listed = app.clone().oneshot(get("/api/routines")).await.unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = json_body(listed).await;
+    assert_eq!(body["routines"].as_array().unwrap().len(), 1);
+
+    let updated = app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/routines/{routine_id}"),
+            json!({ "enabled": false }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(json_body(updated).await["routine"]["enabled"], false);
+
+    let deleted = app
+        .clone()
+        .oneshot(delete(&format!("/api/routines/{routine_id}")))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(json_body(deleted).await["deleted"], routine_id);
+
+    let listed = app.oneshot(get("/api/routines")).await.unwrap();
+    assert_eq!(
+        json_body(listed).await["routines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }

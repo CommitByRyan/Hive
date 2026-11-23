@@ -36,6 +36,10 @@ pub fn build_router(state: AppState) -> Router {
             "/routines",
             get(routes::list_routines).post(routes::create_routine),
         )
+        .route(
+            "/routines/{id}",
+            post(routes::update_routine).delete(routes::delete_routine),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api_guard,

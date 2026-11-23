@@ -12,6 +12,7 @@ mod error;
 mod executor;
 mod plan;
 mod recovery;
+mod routine;
 mod scheduler;
 mod threaded;
 
@@ -20,5 +21,6 @@ pub use error::RuntimeError;
 pub use executor::{ExecOutcome, NodeExecutor};
 pub use plan::{validate_plan, NodeSpec, Plan, PlanError, PlanNode, Topology};
 pub use recovery::{run_startup_recovery, RecoveryReport};
+pub use routine::{tick_routines, RoutineTickReport};
 pub use scheduler::{install_plan, Action, Scheduler, StoreLike};
 pub use threaded::{RunSummary, ThreadedExecutor};
