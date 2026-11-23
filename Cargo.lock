@@ -216,6 +216,7 @@ version = "0.1.0"
 dependencies = [
  "hive-llm",
  "hive-policy",
+ "hive-runtime",
  "hive-store",
  "hive-tools",
  "hive-types",

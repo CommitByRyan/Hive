@@ -239,6 +239,53 @@ impl Store {
         query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
     }
 
+    /// Claim a ready node for execution: `ready -> leased`, stamping the next
+    /// logical `attempt_no` and recording the new lease in one statement.
+    ///
+    /// This is the single place where `attempt_no` advances on the retry path:
+    /// the previous attempt failed and left the node `ready` again, and the
+    /// scheduler passes the next attempt number computed from the retry budget.
+    /// The first claim keeps `attempt_no` at 1.
+    pub fn claim_node(
+        &mut self,
+        node_id: NodeId,
+        lease_token: &LeaseToken,
+        lease_owner: &str,
+        lease_expires_at_ms: i64,
+        next_attempt_no: AttemptNo,
+        now_ms: i64,
+    ) -> StoreResult<NodeRecord> {
+        let current = query_node(&self.conn, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.state != NodeState::Ready {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is {}, expected ready",
+                current.state
+            )));
+        }
+        if next_attempt_no.get() < current.attempt_no.get() {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} attempt {} cannot regress to {}",
+                current.attempt_no.get(),
+                next_attempt_no.get()
+            )));
+        }
+        let next_state = NodeState::Ready.transition(NodeState::Leased)?;
+        self.conn.execute(
+            "UPDATE nodes SET state = ?1, attempt_no = ?2, lease_token = ?3, lease_owner = ?4, lease_expires_at_ms = ?5, updated_at_ms = ?6 WHERE node_id = ?7",
+            params![
+                next_state.as_str(),
+                next_attempt_no.get(),
+                lease_token.as_str(),
+                lease_owner,
+                lease_expires_at_ms,
+                now_ms,
+                node_id.to_string()
+            ],
+        )?;
+        query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
+    }
+
     pub fn append_event(&mut self, input: &EventInput) -> StoreResult<EventEnvelope> {
         let tx = self
             .conn
@@ -891,9 +938,11 @@ impl Store {
         query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
     }
 
-    /// Retry a node after a failed attempt: `failed -> retry_ready -> ready`,
-    /// incrementing `attempt_no` and clearing the lease in one transaction.
-    /// Emits no event; the caller emits `node.ready` for the new attempt.
+    /// Retry a node after a failed attempt: `failed -> retry_ready -> ready`
+    /// and clear the lease in one transaction, keeping `attempt_no` unchanged.
+    ///
+    /// `attempt_no` advances only when the node is next claimed
+    /// ([`Self::claim_node`]), not when it re-enters `ready`.
     pub fn retry_failed_node(&mut self, node_id: NodeId, now_ms: i64) -> StoreResult<NodeRecord> {
         let tx = self
             .conn
@@ -908,16 +957,46 @@ impl Store {
         }
         let _ = NodeState::Failed.transition(NodeState::RetryReady)?;
         let ready = NodeState::RetryReady.transition(NodeState::Ready)?;
-        let next_attempt = current
-            .attempt_no
-            .checked_next()
-            .ok_or_else(|| StoreError::Conflict("attempt number exhausted".to_owned()))?;
         tx.execute(
-            "UPDATE nodes SET state = ?1, attempt_no = ?2, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3 WHERE node_id = ?4",
-            params![ready.as_str(), next_attempt.get(), now_ms, node_id.to_string()],
+            "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+            params![ready.as_str(), now_ms, node_id.to_string()],
         )?;
         tx.commit()?;
         query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
+    }
+
+    /// Retry a node after a failed attempt and emit its `node.ready` event in
+    /// the same transaction: `failed -> retry_ready -> ready` + event insert.
+    ///
+    /// This is the guarded entry for the retry path so the state change and
+    /// the event can never be observed separately (PROTOCOL §2).
+    pub fn retry_failed_node_and_emit(
+        &mut self,
+        node_id: NodeId,
+        event: &EventInput,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, EventEnvelope)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.state != NodeState::Failed {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is {}, expected failed",
+                current.state
+            )));
+        }
+        let _ = NodeState::Failed.transition(NodeState::RetryReady)?;
+        let ready = NodeState::RetryReady.transition(NodeState::Ready)?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+            params![ready.as_str(), now_ms, node_id.to_string()],
+        )?;
+        let envelope = insert_event(&tx, event)?;
+        tx.commit()?;
+        let node = query_node(&self.conn, node_id)?.expect("node was just updated");
+        Ok((node, envelope))
     }
 
     /// Finalize a node after a failed attempt whose retry budget is exhausted:
@@ -2241,6 +2320,45 @@ mod tests {
 
         let aborted = store.abort_node(node.node_id, 3_000).expect("abort");
         assert_eq!(aborted.state, NodeState::FailedFinal);
+    }
+
+    #[test]
+    fn retry_failed_node_preserves_attempt_until_claim() {
+        let (mut store, _mission, _run, node) = setup();
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let token = LeaseToken::generate();
+        store
+            .lease_node(node.node_id, &token, "exec", 10_000, 0)
+            .expect("lease");
+        store
+            .update_node_state(node.node_id, NodeState::Running, 0)
+            .expect("running");
+        store
+            .update_node_state(node.node_id, NodeState::Failed, 1)
+            .expect("failed");
+
+        let retried = store.retry_failed_node(node.node_id, 2).expect("retry");
+        assert_eq!(retried.state, NodeState::Ready);
+        assert_eq!(
+            retried.attempt_no.get(),
+            1,
+            "attempt must not advance when re-entering ready"
+        );
+
+        let claimed = store
+            .claim_node(
+                node.node_id,
+                &LeaseToken::generate(),
+                "exec",
+                20_000,
+                AttemptNo::new(2).expect("attempt 2"),
+                3,
+            )
+            .expect("claim");
+        assert_eq!(claimed.state, NodeState::Leased);
+        assert_eq!(claimed.attempt_no.get(), 2, "attempt advances on claim");
     }
 
     #[test]

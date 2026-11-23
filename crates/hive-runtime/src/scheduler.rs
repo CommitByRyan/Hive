@@ -7,6 +7,7 @@ use hive_types::{
 };
 use serde_json::{json, Value};
 
+use crate::clock::{Clock, SystemClock};
 use crate::error::RuntimeError;
 use crate::executor::ExecOutcome;
 use crate::plan::{Plan, Topology};
@@ -33,12 +34,13 @@ pub trait StoreLike {
         event: &EventInput,
         now_ms: i64,
     ) -> StoreResult<(NodeRecord, EventEnvelope)>;
-    fn lease_node(
+    fn claim_node(
         &mut self,
         node_id: NodeId,
         token: &LeaseToken,
         owner: &str,
         expires_at_ms: i64,
+        next_attempt_no: AttemptNo,
         now_ms: i64,
     ) -> StoreResult<NodeRecord>;
     fn start_node(
@@ -56,7 +58,12 @@ pub trait StoreLike {
         event: &EventInput,
         now_ms: i64,
     ) -> StoreResult<(NodeRecord, EventEnvelope)>;
-    fn retry_failed_node(&mut self, node_id: NodeId, now_ms: i64) -> StoreResult<NodeRecord>;
+    fn retry_failed_node_and_emit(
+        &mut self,
+        node_id: NodeId,
+        event: &EventInput,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, EventEnvelope)>;
     fn abort_failed_node(&mut self, node_id: NodeId, now_ms: i64) -> StoreResult<NodeRecord>;
     fn skip_node(
         &mut self,
@@ -64,12 +71,13 @@ pub trait StoreLike {
         event: &EventInput,
         now_ms: i64,
     ) -> StoreResult<(NodeRecord, EventEnvelope)>;
-    fn cancel_ready_node(
+    fn cancel_node(
         &mut self,
         node_id: NodeId,
         event: &EventInput,
         now_ms: i64,
     ) -> StoreResult<(NodeRecord, EventEnvelope)>;
+    fn reclaim_expired_leases(&mut self, now_ms: i64) -> StoreResult<Vec<NodeRecord>>;
 }
 
 impl StoreLike for Store {
@@ -97,15 +105,24 @@ impl StoreLike for Store {
         Store::transition_node_and_emit(self, node_id, NodeState::Ready, event, now_ms)
     }
 
-    fn lease_node(
+    fn claim_node(
         &mut self,
         node_id: NodeId,
         token: &LeaseToken,
         owner: &str,
         expires_at_ms: i64,
+        next_attempt_no: AttemptNo,
         now_ms: i64,
     ) -> StoreResult<NodeRecord> {
-        Store::lease_node(self, node_id, token, owner, expires_at_ms, now_ms)
+        Store::claim_node(
+            self,
+            node_id,
+            token,
+            owner,
+            expires_at_ms,
+            next_attempt_no,
+            now_ms,
+        )
     }
 
     fn start_node(
@@ -129,8 +146,13 @@ impl StoreLike for Store {
         Store::transition_node_cas(self, node_id, guard, next, event, now_ms)
     }
 
-    fn retry_failed_node(&mut self, node_id: NodeId, now_ms: i64) -> StoreResult<NodeRecord> {
-        Store::retry_failed_node(self, node_id, now_ms)
+    fn retry_failed_node_and_emit(
+        &mut self,
+        node_id: NodeId,
+        event: &EventInput,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, EventEnvelope)> {
+        Store::retry_failed_node_and_emit(self, node_id, event, now_ms)
     }
 
     fn abort_failed_node(&mut self, node_id: NodeId, now_ms: i64) -> StoreResult<NodeRecord> {
@@ -146,13 +168,17 @@ impl StoreLike for Store {
         Store::transition_node_and_emit(self, node_id, NodeState::Skipped, event, now_ms)
     }
 
-    fn cancel_ready_node(
+    fn cancel_node(
         &mut self,
         node_id: NodeId,
         event: &EventInput,
         now_ms: i64,
     ) -> StoreResult<(NodeRecord, EventEnvelope)> {
         Store::transition_node_and_emit(self, node_id, NodeState::Cancelled, event, now_ms)
+    }
+
+    fn reclaim_expired_leases(&mut self, now_ms: i64) -> StoreResult<Vec<NodeRecord>> {
+        Store::reclaim_expired_leases(self, now_ms)
     }
 }
 
@@ -172,6 +198,7 @@ enum Phase {
     Ready,
     Offered,
     Running,
+    NeedsRecovery,
     Succeeded,
     FailedFinal,
     Cancelled,
@@ -190,7 +217,7 @@ pub struct Scheduler<S: StoreLike> {
     attempts: HashMap<NodeId, u32>,
     guards: HashMap<NodeId, LeaseGuard>,
     halted: bool,
-    now_ms: i64,
+    clock: Box<dyn Clock>,
 }
 
 impl<S: StoreLike> Scheduler<S> {
@@ -223,7 +250,7 @@ impl<S: StoreLike> Scheduler<S> {
             attempts,
             guards: HashMap::new(),
             halted: false,
-            now_ms: 0,
+            clock: Box::new(SystemClock),
         };
 
         let initial: Vec<NodeId> = scheduler
@@ -237,6 +264,39 @@ impl<S: StoreLike> Scheduler<S> {
             scheduler.mark_ready(node_id)?;
         }
         Ok(scheduler)
+    }
+
+    /// Replace the scheduler's time source. Useful for tests that advance a
+    /// controllable clock to exercise lease expiry without sleeping.
+    pub fn with_clock(mut self, clock: impl Clock + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
+    }
+
+    /// Reclaim expired leases: a `leased` node whose lease lapsed returns to
+    /// `ready`, while a `running` node whose lease lapsed becomes
+    /// `needs_recovery` (side effects uncertain, manual decision required).
+    pub fn reclaim_expired(&mut self) -> Result<Vec<NodeRecord>, RuntimeError> {
+        let now = self.now_ms();
+        let reclaimed = self.store.reclaim_expired_leases(now)?;
+        for node in &reclaimed {
+            match node.state {
+                NodeState::Ready => {
+                    self.guards.remove(&node.node_id);
+                    self.phases.insert(node.node_id, Phase::Ready);
+                }
+                NodeState::NeedsRecovery => {
+                    self.guards.remove(&node.node_id);
+                    self.phases.insert(node.node_id, Phase::NeedsRecovery);
+                }
+                _ => {}
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// Compute the next batch of actions, reserving offered nodes so the same
@@ -290,12 +350,14 @@ impl<S: StoreLike> Scheduler<S> {
         }
 
         let token = LeaseToken::generate();
-        let leased = self.store.lease_node(
+        let next_attempt = self.attempts[&node_id];
+        let leased = self.store.claim_node(
             node_id,
             &token,
             LEASE_OWNER,
-            self.now_ms + LEASE_TTL_MS,
-            self.now_ms,
+            self.now_ms() + LEASE_TTL_MS,
+            AttemptNo::new(next_attempt).expect("attempt starts at 1"),
+            self.now_ms(),
         )?;
         let guard = LeaseGuard {
             attempt_no: leased.attempt_no,
@@ -308,7 +370,7 @@ impl<S: StoreLike> Scheduler<S> {
             json!({}),
         );
         self.store
-            .start_node(node_id, &guard, &started, self.now_ms)?;
+            .start_node(node_id, &guard, &started, self.now_ms())?;
 
         self.attempts.insert(node_id, guard.attempt_no.get());
         self.guards.insert(node_id, guard);
@@ -347,7 +409,7 @@ impl<S: StoreLike> Scheduler<S> {
                     &guard,
                     NodeState::Succeeded,
                     &event,
-                    self.now_ms,
+                    self.now_ms(),
                 )?;
                 self.phases.insert(node_id, Phase::Succeeded);
                 self.guards.remove(&node_id);
@@ -360,8 +422,13 @@ impl<S: StoreLike> Scheduler<S> {
                     EventKind::NodeFailed,
                     json!({ "reason": reason }),
                 );
-                self.store
-                    .finish_node(node_id, &guard, NodeState::Failed, &event, self.now_ms)?;
+                self.store.finish_node(
+                    node_id,
+                    &guard,
+                    NodeState::Failed,
+                    &event,
+                    self.now_ms(),
+                )?;
                 self.guards.remove(&node_id);
 
                 let budget = self
@@ -375,15 +442,15 @@ impl<S: StoreLike> Scheduler<S> {
                         budget,
                     )
                 {
-                    self.store.retry_failed_node(node_id, self.now_ms)?;
                     let next_attempt = attempt + 1;
                     self.attempts.insert(node_id, next_attempt);
                     let ready =
                         self.node_event(node_id, next_attempt, EventKind::NodeReady, json!({}));
-                    self.store.append_event(&ready)?;
+                    self.store
+                        .retry_failed_node_and_emit(node_id, &ready, self.now_ms())?;
                     self.phases.insert(node_id, Phase::Ready);
                 } else {
-                    self.store.abort_failed_node(node_id, self.now_ms)?;
+                    self.store.abort_failed_node(node_id, self.now_ms())?;
                     self.phases.insert(node_id, Phase::FailedFinal);
                     self.skip_downstream(node_id)?;
                 }
@@ -395,7 +462,7 @@ impl<S: StoreLike> Scheduler<S> {
                     &guard,
                     NodeState::Cancelled,
                     &event,
-                    self.now_ms,
+                    self.now_ms(),
                 )?;
                 self.phases.insert(node_id, Phase::Cancelled);
                 self.guards.remove(&node_id);
@@ -431,16 +498,16 @@ impl<S: StoreLike> Scheduler<S> {
                             &guard,
                             NodeState::Cancelled,
                             &event,
-                            self.now_ms,
+                            self.now_ms(),
                         )?;
                         self.phases.insert(node_id, Phase::Cancelled);
                     }
                 }
-                Phase::Ready | Phase::Offered => {
+                Phase::Ready | Phase::Offered | Phase::Pending | Phase::NeedsRecovery => {
                     let attempt = self.attempts[&node_id];
                     let event =
                         self.node_event(node_id, attempt, EventKind::NodeCancelled, json!({}));
-                    self.store.cancel_ready_node(node_id, &event, self.now_ms)?;
+                    self.store.cancel_node(node_id, &event, self.now_ms())?;
                     self.phases.insert(node_id, Phase::Cancelled);
                 }
                 _ => {}
@@ -469,6 +536,7 @@ impl<S: StoreLike> Scheduler<S> {
             Phase::Pending => NodeState::Pending,
             Phase::Ready | Phase::Offered => NodeState::Ready,
             Phase::Running => NodeState::Running,
+            Phase::NeedsRecovery => NodeState::NeedsRecovery,
             Phase::Succeeded => NodeState::Succeeded,
             Phase::FailedFinal => NodeState::FailedFinal,
             Phase::Cancelled => NodeState::Cancelled,
@@ -503,7 +571,7 @@ impl<S: StoreLike> Scheduler<S> {
     fn mark_ready(&mut self, node_id: NodeId) -> Result<(), RuntimeError> {
         let attempt = self.attempts[&node_id];
         let event = self.node_event(node_id, attempt, EventKind::NodeReady, json!({}));
-        self.store.mark_ready(node_id, &event, self.now_ms)?;
+        self.store.mark_ready(node_id, &event, self.now_ms())?;
         self.phases.insert(node_id, Phase::Ready);
         Ok(())
     }
@@ -536,7 +604,7 @@ impl<S: StoreLike> Scheduler<S> {
             Some(Phase::Pending) => {
                 let attempt = self.attempts[&node_id];
                 let event = self.node_event(node_id, attempt, EventKind::NodeSkipped, json!({}));
-                self.store.skip_node(node_id, &event, self.now_ms)?;
+                self.store.skip_node(node_id, &event, self.now_ms())?;
                 self.phases.insert(node_id, Phase::Skipped);
                 let dependents = self.topology.dependents_of(node_id).to_vec();
                 for dependent in dependents {
@@ -605,6 +673,7 @@ pub fn install_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::plan::{NodeSpec, PlanNode};
     use hive_store::{MissionRecord, RunRecord, Store};
 
@@ -1123,5 +1192,72 @@ mod tests {
             Scheduler::new(topology, 0, CancellationToken::new(), store),
             Err(RuntimeError::ZeroParallelism)
         ));
+    }
+
+    #[test]
+    fn reclaim_expired_uses_injected_clock_running_becomes_needs_recovery() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 0)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let clock = TestClock::new(0);
+        let mut sched = Scheduler::new(topology, 1, CancellationToken::new(), store)
+            .expect("scheduler")
+            .with_clock(clock.clone());
+
+        sched.on_started(a).expect("start");
+        assert_eq!(sched.node_state(a), NodeState::Running);
+
+        // The node's lease was granted for now_ms + 60_000; advancing the
+        // injected clock past it must move the running node to needs_recovery.
+        clock.advance(61_000);
+        let reclaimed = sched.reclaim_expired().expect("reclaim");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(sched.node_state(a), NodeState::NeedsRecovery);
+        let persisted = sched.store().get_node(a).expect("get").expect("present");
+        assert_eq!(persisted.state, NodeState::NeedsRecovery);
+        assert!(persisted.lease_token.is_none());
+    }
+
+    #[test]
+    fn cancel_cascades_to_pending_nodes() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let c = NodeId::new();
+        let plan = plan(
+            mission.mission_id,
+            run.run_id,
+            vec![node(a, &[], 0), node(b, &[a], 0), node(c, &[a], 0)],
+        );
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 2, CancellationToken::new(), store).expect("scheduler");
+
+        // Only A is ready; B and C are still pending. Cancel before starting.
+        sched.cancel().expect("cancel");
+
+        for id in [a, b, c] {
+            assert_eq!(
+                sched
+                    .store()
+                    .get_node(id)
+                    .expect("get")
+                    .expect("present")
+                    .state,
+                NodeState::Cancelled
+            );
+        }
+        let cancelled_events = sched
+            .store()
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeCancelled)
+            .count();
+        assert_eq!(cancelled_events, 3);
+        assert_eq!(sched.next_actions(), vec![Action::Halt]);
     }
 }
