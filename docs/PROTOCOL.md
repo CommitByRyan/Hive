@@ -20,6 +20,7 @@ ap_<uuid>   Approval
 f_<uuid>    Artifact
 prj_<uuid>  Project
 tr_<uuid>   Trace
+hd_<uuid>   Handoff
 ```
 
 外部请求不得自行拼造内部 ID。
@@ -194,6 +195,7 @@ Run 是 Mission 的一次规划/执行生命周期；追加要求或恢复可以
 | `routine.triggered` | 定时任务触发 Mission |
 | `routine.error` | 定时表达式或触发失败 |
 | `artifact.saved` | 产物登记 |
+| `handoff.created` | 结构化交接写入 |
 | `model.retry` | 网关单次请求内部重试 |
 | `model.fallback` | 网关切换到备用模型 |
 
@@ -302,6 +304,17 @@ ID 已存在不代表表已存在。需要当前状态、原子 CAS、重启查�
 - `turns` 的 `output_preview` 只放有界摘要，完整输出走 artifact 或工具结果引用。
 - `turn_usage` 与 `turns` 一一对应；usage 缺失时写 `estimated`，不得写 0 冒充权威值。
 - 行是当前状态，`node.turn` / `node.thought` 等事件是通知；两者在同一事务提交。
+
+### V5 列契约（H06 冻结）
+
+`handoffs`：`handoff_id` 主键（`hd_<uuid>`），`mission_id`/`run_id`/`node_id` 外键，`attempt_no`、`agent`、`schema_version`、`objective`、`summary`、`base_revision`、`created_at_ms`；结构化字段以 JSON 文本存储：`inputs_json`、`artifacts_json`、`decisions_json`、`assumptions_json`、`risks_json`、`open_questions_json`、`acceptance_json`、`recommended_next_json`；`UNIQUE(node_id, attempt_no)`。
+
+规则：
+
+- 写入前必须按 §5 Handoff v1 校验必填字段与类型；校验失败不得落库。
+- Handoff 正文可以完整，但**不得**包含模型完整历史、完整工具日志、密钥、Cookie 或未脱敏个人信息；事件只带 `handoff_id`、摘要与 `schema_version`。
+- `artifact.saved` 不能冒充 Handoff；两者语义不同。
+- 同一 `(node_id, attempt_no)` 只能有一份 Handoff；重写必须新增 attempt 或显式版本化。
 
 迁移规则：
 

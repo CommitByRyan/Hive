@@ -7,11 +7,11 @@
 
 ## 当前门
 
-**H05b — 线程化执行器与语义收紧（W4b）**
+**H06 — 多 Agent 协作与 worktree（W5）**
 
-目标：把确定性调度状态机接上真实并发（每 worker 独立 Store 连接），并收紧租约、事务、attempt 时点三处语义偏差。
+目标：消除 AgentRunner 双重租借、实现结构化 Handoff 与独立 worktree 生命周期，让两个 Agent 可并行改不同目录而不互相污染。
 
-状态：`ready to dispatch`
+状态：`in_progress`
 
 ## 阶段状态
 
@@ -23,8 +23,8 @@
 | H03 | 工具、审批、工作区安全 | done, verified（shell/Win32 留 H03b） | H02 |
 | H04 | 单 Agent 垂直闭环 | done, verified | H02、H03、H07 |
 | H05 | 并行 DAG 调度（状态机） | done, verified | H04 |
-| H05b | 线程化执行器 + 语义收紧 | in_progress | H05 |
-| H06 | 多 Agent 协作与 worktree | blocked | H05b |
+| H05b | 线程化执行器 + 语义收紧 | done, verified | H05 |
+| H06 | 多 Agent 协作与 worktree | in_progress | H05b |
 | H07 | 模型网关与路由 | done, verified（无真实 HTTP 适配器） | H01 |
 | H08 | 服务协议与 Web 控制台 | blocked | H05、H07 |
 | H09 | 定时、恢复、可观测性 | blocked | H02、H08 |
@@ -42,7 +42,8 @@
 | H03b | 待派发 | 真实 Shell（argv/超时/进程树）、Win32 句柄级路径、连接级 IP 固定 | 新 worktree | pending |
 | H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
 | H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | done, merged |
-| H05b | 可见对话 `01a207e0-8bd5-7ff1-8247-78c2156c82f3`（`auto/deepseek-v4-pro`） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、租约/事务/attempt 语义收紧 | `.codex/worktrees/36e0/Hive` | implementing |
+| H05b | 可见对话 `01a207e0-8bd5-7ff1-8247-78c2156c82f3`（pro） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、语义收紧 | `.codex/worktrees/36e0/Hive` | done, merged |
+| H06 | 可见对话（待创建，pro） | `crates/hive-workspace`、Handoff V5、租约复用 | 新 worktree | dispatching |
 
 合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
 
@@ -153,4 +154,6 @@
 | 2026-11-23 | H04 | V3 迁移（sessions/turns/usage）、`UreqTransport`、`AgentRunner` 闭环、取消、`StoreApprovalGate` | 独立复验 138 passed / 3 ignored；V3 列已冻结进 PROTOCOL §10 |
 | 2026-11-23 | H08 | HTTP/SSE 与控制台设计（186 行，16 条测试断言） | 只读产出，未改代码 |
 | 2026-11-23 | H05 | `hive-runtime`：DAG 校验、就绪队列、`max_parallel`、取消、重试、事件序列；`CancellationToken` 上移 | 独立复验 156 passed / 3 ignored |
+| 2026-11-23 | H05b | `ThreadedExecutor`（每 worker 独立 Store）、`AgentRunner: NodeExecutor`、attempt 领取时递增、重试同事务、Clock 注入、取消级联 pending | 独立复验 166 passed / 3 ignored |
+| 2026-11-23 | H00 | 冻结 `hd_` 前缀、`handoff.created` 事件、V5 handoffs 列契约 | `docs/PROTOCOL.md` |
 
