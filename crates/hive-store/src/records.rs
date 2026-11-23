@@ -111,6 +111,18 @@ pub struct ApprovalRecord {
     pub consumed_at_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolAuditRecord {
+    pub audit_id: i64,
+    pub mission_id: MissionId,
+    pub tool_call_id: ToolCallId,
+    pub event_kind: String,
+    pub record: Value,
+    pub prev_hash: String,
+    pub entry_hash: String,
+    pub created_at_ms: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalDecision {
     Approved,

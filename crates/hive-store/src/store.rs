@@ -5,12 +5,13 @@ use hive_types::{
     MissionId, MissionState, NodeId, NodeState, RunId, RunState, ToolCallId, EVENT_SCHEMA_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     ApprovalDecision, ApprovalInput, ApprovalRecord, LeaseGuard, MissionAggregate, MissionRecord,
-    NodeRecord, RunRecord, SnapshotInput, SnapshotRecord,
+    NodeRecord, RunRecord, SnapshotInput, SnapshotRecord, ToolAuditRecord,
 };
 use crate::schema;
 use crate::time::{now_ms, now_rfc3339};
@@ -525,6 +526,153 @@ impl Store {
             out.push(parse_approval(row?)?);
         }
         Ok(out)
+    }
+
+    /// Consume an approved approval exactly once, guarded by the tool call,
+    /// request hash, attempt and lease token. All checks and the update happen
+    /// in one immediate transaction, so concurrent consumers cannot both win.
+    pub fn consume_approval(
+        &mut self,
+        approval_id: ApprovalId,
+        tool_call_id: ToolCallId,
+        request_hash: &str,
+        attempt_no: AttemptNo,
+        lease_token: &LeaseToken,
+        now_ms: i64,
+    ) -> StoreResult<ApprovalRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_approval(&tx, approval_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("approval {approval_id}")))?;
+
+        if current.consumed_at_ms.is_some() {
+            return Err(StoreError::ApprovalReplayed(format!(
+                "approval {approval_id} was already consumed"
+            )));
+        }
+        if current.state != ApprovalState::Approved {
+            return Err(StoreError::ApprovalConflict(format!(
+                "approval {approval_id} is {}, expected approved",
+                current.state
+            )));
+        }
+        if now_ms >= current.expires_at_ms {
+            return Err(StoreError::ApprovalConflict(format!(
+                "approval {approval_id} expired before consumption"
+            )));
+        }
+        if current.tool_call_id != tool_call_id
+            || current.request_hash != request_hash
+            || current.attempt_no != attempt_no
+            || current.lease_token.as_str() != lease_token.as_str()
+        {
+            return Err(StoreError::StaleExecution);
+        }
+
+        let affected = tx.execute(
+            "UPDATE approvals SET consumed_at_ms = ?1 WHERE approval_id = ?2 AND state = 'approved' AND consumed_at_ms IS NULL AND tool_call_id = ?3 AND request_hash = ?4 AND attempt_no = ?5 AND lease_token = ?6",
+            params![
+                now_ms,
+                approval_id.to_string(),
+                tool_call_id.to_string(),
+                request_hash,
+                attempt_no.get(),
+                lease_token.as_str(),
+            ],
+        )?;
+        if affected != 1 {
+            let latest = query_approval(&tx, approval_id)?;
+            if latest.and_then(|record| record.consumed_at_ms).is_some() {
+                return Err(StoreError::ApprovalReplayed(format!(
+                    "approval {approval_id} was consumed concurrently"
+                )));
+            }
+            return Err(StoreError::ApprovalConflict(format!(
+                "approval {approval_id} could not be consumed"
+            )));
+        }
+        tx.commit()?;
+        query_approval(&self.conn, approval_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("approval {approval_id}")))
+    }
+
+    /// Append one link to the append-only tool audit hash chain.
+    pub fn append_tool_audit(
+        &mut self,
+        mission_id: MissionId,
+        tool_call_id: ToolCallId,
+        event_kind: &str,
+        record: serde_json::Value,
+        now_ms: i64,
+    ) -> StoreResult<ToolAuditRecord> {
+        if event_kind.is_empty() {
+            return Err(StoreError::Conflict(
+                "tool audit event kind must not be empty".to_owned(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prev_hash: Option<String> = tx
+            .query_row(
+                "SELECT entry_hash FROM tool_audit ORDER BY audit_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let prev_hash = prev_hash.unwrap_or_else(|| "GENESIS".to_owned());
+        let record_json = serde_json::to_string(&record)?;
+        let entry_hash = audit_entry_hash(&prev_hash, &record_json);
+        tx.execute(
+            "INSERT INTO tool_audit (mission_id, tool_call_id, event_kind, record_json, prev_hash, entry_hash, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                mission_id.to_string(),
+                tool_call_id.to_string(),
+                event_kind,
+                record_json,
+                prev_hash,
+                entry_hash,
+                now_ms,
+            ],
+        )?;
+        let audit_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(ToolAuditRecord {
+            audit_id,
+            mission_id,
+            tool_call_id,
+            event_kind: event_kind.to_owned(),
+            record,
+            prev_hash,
+            entry_hash,
+            created_at_ms: now_ms,
+        })
+    }
+
+    pub fn verify_tool_audit_chain(&self) -> StoreResult<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT record_json, prev_hash, entry_hash FROM tool_audit ORDER BY audit_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut expected_prev = "GENESIS".to_owned();
+        for row in rows {
+            let (record_json, prev_hash, entry_hash) = row?;
+            if prev_hash != expected_prev {
+                return Ok(false);
+            }
+            if audit_entry_hash(&prev_hash, &record_json) != entry_hash {
+                return Ok(false);
+            }
+            expected_prev = entry_hash;
+        }
+        Ok(true)
     }
 
     pub fn expire_overdue_approvals(&mut self, now_ms: i64) -> StoreResult<Vec<ApprovalRecord>> {
@@ -1066,6 +1214,14 @@ fn is_unique_violation(err: &rusqlite::Error) -> bool {
     )
 }
 
+fn audit_entry_hash(prev_hash: &str, record_json: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(record_json.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1082,7 +1238,7 @@ mod tests {
         can_retry, ApprovalDecision, ApprovalInput, LeaseGuard, MissionRecord, NodeRecord,
         RunRecord, SnapshotInput,
     };
-    use crate::schema::{BUSY_TIMEOUT_MS, SCHEMA_VERSION};
+    use crate::schema::{BUSY_TIMEOUT_MS, SCHEMA_VERSION, V1_SCHEMA};
     use crate::{MAX_SEQ, SNAPSHOT_SCHEMA_VERSION};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1703,5 +1859,188 @@ mod tests {
         assert_eq!(updated.state, NodeState::WaitingApproval);
         assert_eq!(stored.state, ApprovalState::Pending);
         assert_eq!(envelope.kind, EventKind::NodeApprovalRequested);
+    }
+
+    #[test]
+    fn fresh_database_has_v2_tool_tables() {
+        let store = Store::open_in_memory().expect("store");
+        assert_eq!(store.schema_version().expect("version"), 2);
+        let tables: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table count");
+        assert_eq!(tables, 3);
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2_and_preserves_rows() {
+        let dir = TempDir::new("v1-to-v2");
+        let path = dir.path().join("hive.db");
+        let mission_id = MissionId::new();
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw conn");
+            conn.execute_batch(V1_SCHEMA).expect("v1 schema");
+            conn.execute(
+                "INSERT INTO missions (mission_id, state, title, goal, created_at_ms, updated_at_ms) VALUES (?1, 'queued', 'old', 'goal', 1, 1)",
+                rusqlite::params![mission_id.to_string()],
+            )
+            .expect("old mission");
+            conn.pragma_update(None, "user_version", 1).expect("set v1");
+        }
+
+        let store = Store::open(&path).expect("migrate");
+        assert_eq!(store.schema_version().expect("version"), 2);
+        let mission = store
+            .get_mission(mission_id)
+            .expect("mission")
+            .expect("preserved");
+        assert_eq!(mission.title, "old");
+        let tables: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table count");
+        assert_eq!(tables, 3);
+    }
+
+    #[test]
+    fn approval_can_be_consumed_only_once() {
+        let (mut store, mission, _run, node) = setup();
+        let input = approval_input(mission.mission_id, node.node_id, 10_000);
+        let tool_call_id = input.tool_call_id;
+        let request_hash = input.request_hash.clone();
+        let attempt_no = input.attempt_no;
+        let lease_token = input.lease_token.clone();
+        let approval = store.create_approval(&input).expect("create");
+        store
+            .decide_approval(
+                approval.approval_id,
+                ApprovalDecision::Approved,
+                "user",
+                1_000,
+            )
+            .expect("approve");
+
+        let consumed = store
+            .consume_approval(
+                approval.approval_id,
+                tool_call_id,
+                &request_hash,
+                attempt_no,
+                &lease_token,
+                2_000,
+            )
+            .expect("consume");
+        assert_eq!(consumed.consumed_at_ms, Some(2_000));
+
+        let error = store
+            .consume_approval(
+                approval.approval_id,
+                tool_call_id,
+                &request_hash,
+                attempt_no,
+                &lease_token,
+                2_001,
+            )
+            .expect_err("replay");
+        assert!(matches!(error, StoreError::ApprovalReplayed(_)));
+        assert_eq!(error.code(), "approval.replayed");
+    }
+
+    #[test]
+    fn approval_consumption_rejects_hash_and_lease_mismatch() {
+        let (mut store, mission, _run, node) = setup();
+        let input = approval_input(mission.mission_id, node.node_id, 10_000);
+        let tool_call_id = input.tool_call_id;
+        let attempt_no = input.attempt_no;
+        let lease_token = input.lease_token.clone();
+        let approval = store.create_approval(&input).expect("create");
+        store
+            .decide_approval(
+                approval.approval_id,
+                ApprovalDecision::Approved,
+                "user",
+                1_000,
+            )
+            .expect("approve");
+
+        let error = store
+            .consume_approval(
+                approval.approval_id,
+                tool_call_id,
+                "different-hash",
+                attempt_no,
+                &lease_token,
+                2_000,
+            )
+            .expect_err("hash mismatch");
+        assert!(matches!(error, StoreError::StaleExecution));
+        assert_eq!(error.code(), "tool.stale_execution");
+
+        let stale_lease = LeaseToken::generate();
+        let error = store
+            .consume_approval(
+                approval.approval_id,
+                tool_call_id,
+                &input.request_hash,
+                attempt_no,
+                &stale_lease,
+                2_000,
+            )
+            .expect_err("lease mismatch");
+        assert!(matches!(error, StoreError::StaleExecution));
+
+        store
+            .consume_approval(
+                approval.approval_id,
+                tool_call_id,
+                &input.request_hash,
+                attempt_no,
+                &lease_token,
+                2_000,
+            )
+            .expect("original request still consumable");
+    }
+
+    #[test]
+    fn tool_audit_chain_detects_tampering() {
+        let (mut store, mission, _run, _node) = setup();
+        let tool_call_id = ToolCallId::new();
+        store
+            .append_tool_audit(
+                mission.mission_id,
+                tool_call_id,
+                "node.tool_call",
+                serde_json::json!({ "tool": "fs.read", "path": "a.txt" }),
+                1,
+            )
+            .expect("first audit");
+        store
+            .append_tool_audit(
+                mission.mission_id,
+                tool_call_id,
+                "node.tool_result",
+                serde_json::json!({ "tool": "fs.read", "summary": "read 1 byte" }),
+                2,
+            )
+            .expect("second audit");
+        assert!(store.verify_tool_audit_chain().expect("verify"));
+
+        store
+            .conn
+            .execute(
+                "UPDATE tool_audit SET record_json = ?1 WHERE audit_id = 1",
+                rusqlite::params![r#"{"tool":"fs.read","path":"tampered"}"#],
+            )
+            .expect("tamper");
+        assert!(!store.verify_tool_audit_chain().expect("verify tampered"));
     }
 }
