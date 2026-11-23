@@ -25,7 +25,7 @@ impl<T: ChatTransport> NodeExecutor for AgentRunner<'_, T> {
 impl<T: ChatTransport> AgentRunner<'_, T> {
     /// Create an agent session for `node` and drive it through
     /// [`AgentRunner::run_node_with_lease`] using the scheduler's lease.
-    fn run_for(
+    pub(crate) fn run_for(
         &mut self,
         node: &PlanNode,
         lease: &LeaseGuard,
@@ -50,7 +50,7 @@ impl<T: ChatTransport> AgentRunner<'_, T> {
     }
 }
 
-fn map_outcome(outcome: Result<AgentOutcome, AgentError>) -> ExecOutcome {
+pub(crate) fn map_outcome(outcome: Result<AgentOutcome, AgentError>) -> ExecOutcome {
     match outcome {
         Ok(AgentOutcome::Completed { final_text, .. }) => ExecOutcome::Succeeded {
             summary: final_text,
