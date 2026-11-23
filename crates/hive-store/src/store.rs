@@ -2,7 +2,8 @@ use std::path::Path;
 
 use hive_types::{
     AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, EventInput, LeaseToken,
-    MissionId, MissionState, NodeId, NodeState, RunId, RunState, ToolCallId, EVENT_SCHEMA_VERSION,
+    MissionId, MissionState, NodeId, NodeState, RunId, RunState, ToolCallId, TurnId,
+    EVENT_SCHEMA_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -10,8 +11,10 @@ use uuid::Uuid;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    ApprovalDecision, ApprovalInput, ApprovalRecord, LeaseGuard, MissionAggregate, MissionRecord,
-    NodeRecord, RunRecord, SnapshotInput, SnapshotRecord, ToolAuditRecord,
+    AgentSessionRecord, AgentSessionState, ApprovalDecision, ApprovalInput, ApprovalRecord,
+    LeaseGuard, MissionAggregate, MissionRecord, NewAgentSession, NewTurnUsage, NodeRecord,
+    RunRecord, SnapshotInput, SnapshotRecord, ToolAuditRecord, TurnRecord, TurnState,
+    TurnUsageRecord, UsageSource,
 };
 use crate::schema;
 use crate::time::{now_ms, now_rfc3339};
@@ -206,9 +209,9 @@ impl Store {
     ) -> StoreResult<NodeRecord> {
         let current = query_node(&self.conn, node_id)?
             .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
-        if current.state != NodeState::Leased {
+        if !matches!(current.state, NodeState::Leased | NodeState::Running) {
             return Err(StoreError::Conflict(format!(
-                "node {node_id} is {}, expected leased",
+                "node {node_id} is {}, expected leased or running",
                 current.state
             )));
         }
@@ -287,10 +290,17 @@ impl Store {
             }
         }
         let next_state = current.state.transition(next)?;
-        tx.execute(
-            "UPDATE nodes SET state = ?1, updated_at_ms = ?2 WHERE node_id = ?3",
-            params![next_state.as_str(), now_ms, node_id.to_string()],
-        )?;
+        if next_state.is_terminal() {
+            tx.execute(
+                "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+                params![next_state.as_str(), now_ms, node_id.to_string()],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE nodes SET state = ?1, updated_at_ms = ?2 WHERE node_id = ?3",
+                params![next_state.as_str(), now_ms, node_id.to_string()],
+            )?;
+        }
         let envelope = insert_event(&tx, event)?;
         tx.commit()?;
         let node = query_node(&self.conn, node_id)?.expect("node was just updated");
@@ -308,6 +318,47 @@ impl Store {
             out.push(serde_json::from_str(&row?)?);
         }
         Ok(out)
+    }
+
+    /// Append an event that must be committed by the executor currently
+    /// holding `guard`. Unlike [`Self::append_event`] this rejects stale
+    /// attempts/tokens and terminal nodes in the same transaction.
+    pub fn append_event_guarded(
+        &mut self,
+        node_id: NodeId,
+        guard: &LeaseGuard,
+        event: &EventInput,
+    ) -> StoreResult<EventEnvelope> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.attempt_no != guard.attempt_no
+            || current.lease_token.as_ref() != Some(&guard.lease_token)
+        {
+            return Err(StoreError::StaleExecution);
+        }
+        if current.state.is_terminal() {
+            return Err(StoreError::StaleExecution);
+        }
+        if let Some(event_node) = event.node_id {
+            if event_node != node_id {
+                return Err(StoreError::Conflict(format!(
+                    "event node {event_node} does not match {node_id}"
+                )));
+            }
+        }
+        if let Some(event_attempt) = event.attempt_no {
+            if event_attempt != guard.attempt_no {
+                return Err(StoreError::Conflict(
+                    "event attempt_no does not match lease guard".to_owned(),
+                ));
+            }
+        }
+        let envelope = insert_event(&tx, event)?;
+        tx.commit()?;
+        Ok(envelope)
     }
 
     pub fn read_all_events(&self) -> StoreResult<Vec<EventEnvelope>> {
@@ -471,6 +522,54 @@ impl Store {
         let approval = create_approval_on(&tx, input, now_ms)?;
         let envelope = insert_event(&tx, event)?;
         tx.commit()?;
+        Ok((node, approval, envelope))
+    }
+
+    /// Lease-guarded variant of [`Self::transition_node_and_request_approval`].
+    ///
+    /// A stale executor cannot move a newer attempt into `waiting_approval` or
+    /// create an approval bound to an obsolete lease.
+    pub fn transition_node_cas_and_request_approval(
+        &mut self,
+        node_id: NodeId,
+        guard: &LeaseGuard,
+        input: &ApprovalInput,
+        event: &EventInput,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, ApprovalRecord, EventEnvelope)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.attempt_no != guard.attempt_no
+            || current.lease_token.as_ref() != Some(&guard.lease_token)
+        {
+            return Err(StoreError::StaleExecution);
+        }
+        if let Some(event_node) = event.node_id {
+            if event_node != node_id {
+                return Err(StoreError::Conflict(format!(
+                    "event node {event_node} does not match {node_id}"
+                )));
+            }
+        }
+        if let Some(event_attempt) = event.attempt_no {
+            if event_attempt != guard.attempt_no {
+                return Err(StoreError::Conflict(
+                    "event attempt_no does not match lease guard".to_owned(),
+                ));
+            }
+        }
+        let next_state = current.state.transition(NodeState::WaitingApproval)?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, updated_at_ms = ?2 WHERE node_id = ?3",
+            params![next_state.as_str(), now_ms, node_id.to_string()],
+        )?;
+        let approval = create_approval_on(&tx, input, now_ms)?;
+        let envelope = insert_event(&tx, event)?;
+        tx.commit()?;
+        let node = query_node(&self.conn, node_id)?.expect("node was just updated");
         Ok((node, approval, envelope))
     }
 
@@ -778,9 +877,419 @@ impl Store {
         )?;
         query_node(&self.conn, node_id).map(|record| record.expect("node was just updated"))
     }
+
+    pub fn create_agent_session(
+        &mut self,
+        input: &NewAgentSession<'_>,
+    ) -> StoreResult<AgentSessionRecord> {
+        let record = AgentSessionRecord {
+            session_id: AgentSessionId::new(),
+            mission_id: input.mission_id,
+            run_id: input.run_id,
+            node_id: input.node_id,
+            role: input.role.to_owned(),
+            model: input.model.to_owned(),
+            system_prompt: input.system_prompt.to_owned(),
+            state: AgentSessionState::Active,
+            created_at_ms: input.now_ms,
+            updated_at_ms: input.now_ms,
+            closed_at_ms: None,
+        };
+        self.conn.execute(
+            "INSERT INTO agent_sessions (session_id, mission_id, run_id, node_id, role, model, system_prompt, state, created_at_ms, updated_at_ms, closed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+            params![
+                record.session_id.to_string(),
+                input.mission_id.to_string(),
+                input.run_id.map(|id| id.to_string()),
+                input.node_id.to_string(),
+                record.role,
+                record.model,
+                record.system_prompt,
+                record.state.as_str(),
+                input.now_ms,
+                input.now_ms,
+            ],
+        )?;
+        Ok(record)
+    }
+
+    pub fn get_agent_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> StoreResult<Option<AgentSessionRecord>> {
+        query_agent_session(&self.conn, session_id)
+    }
+
+    pub fn set_agent_session_state(
+        &mut self,
+        session_id: AgentSessionId,
+        state: AgentSessionState,
+        now_ms: i64,
+    ) -> StoreResult<AgentSessionRecord> {
+        let closed_at = state.is_terminal().then_some(now_ms);
+        let affected = self.conn.execute(
+            "UPDATE agent_sessions SET state = ?1, updated_at_ms = ?2, closed_at_ms = ?3 WHERE session_id = ?4",
+            params![state.as_str(), now_ms, closed_at, session_id.to_string()],
+        )?;
+        if affected != 1 {
+            return Err(StoreError::NotFound(format!("session {session_id}")));
+        }
+        query_agent_session(&self.conn, session_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))
+    }
+
+    pub fn start_turn(
+        &mut self,
+        session_id: AgentSessionId,
+        node_id: NodeId,
+        attempt_no: AttemptNo,
+        turn_index: u32,
+        request_model: &str,
+        now_ms: i64,
+    ) -> StoreResult<TurnRecord> {
+        if turn_index == 0 {
+            return Err(StoreError::Conflict("turn index starts at 1".to_owned()));
+        }
+        let session = query_agent_session(&self.conn, session_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
+        if session.node_id != node_id {
+            return Err(StoreError::Conflict(format!(
+                "session {session_id} belongs to node {}",
+                session.node_id
+            )));
+        }
+        let record = TurnRecord {
+            turn_id: TurnId::new(),
+            session_id,
+            node_id,
+            attempt_no,
+            turn_index,
+            request_model: request_model.to_owned(),
+            finish_reason: None,
+            state: TurnState::Started,
+            output_preview: String::new(),
+            tool_call_count: 0,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        self.conn.execute(
+            "INSERT INTO turns (turn_id, session_id, node_id, attempt_no, turn_index, request_model, finish_reason, state, output_preview, tool_call_count, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, '', 0, ?8, ?8)",
+            params![
+                record.turn_id.to_string(),
+                session_id.to_string(),
+                node_id.to_string(),
+                attempt_no.get(),
+                turn_index,
+                request_model,
+                record.state.as_str(),
+                now_ms,
+            ],
+        )?;
+        Ok(record)
+    }
+
+    pub fn finish_turn(
+        &mut self,
+        turn_id: TurnId,
+        state: TurnState,
+        finish_reason: Option<&str>,
+        output_preview: &str,
+        tool_call_count: u32,
+        now_ms: i64,
+    ) -> StoreResult<TurnRecord> {
+        if state == TurnState::Started {
+            return Err(StoreError::Conflict(
+                "turn must finish with a terminal state".to_owned(),
+            ));
+        }
+        let affected = self.conn.execute(
+            "UPDATE turns SET state = ?1, finish_reason = ?2, output_preview = ?3, tool_call_count = ?4, updated_at_ms = ?5 WHERE turn_id = ?6",
+            params![
+                state.as_str(),
+                finish_reason,
+                output_preview,
+                tool_call_count,
+                now_ms,
+                turn_id.to_string(),
+            ],
+        )?;
+        if affected != 1 {
+            return Err(StoreError::NotFound(format!("turn {turn_id}")));
+        }
+        query_turn(&self.conn, turn_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("turn {turn_id}")))
+    }
+
+    pub fn record_turn_usage(
+        &mut self,
+        turn_id: TurnId,
+        usage: &NewTurnUsage,
+        now_ms: i64,
+    ) -> StoreResult<TurnUsageRecord> {
+        let turn = query_turn(&self.conn, turn_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("turn {turn_id}")))?;
+        let prompt_tokens = to_sql_integer(usage.prompt_tokens)?;
+        let completion_tokens = to_sql_integer(usage.completion_tokens)?;
+        let total_tokens = to_sql_integer(usage.total_tokens)?;
+        self.conn.execute(
+            "INSERT INTO turn_usage (turn_id, session_id, prompt_tokens, completion_tokens, total_tokens, source, request_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                turn_id.to_string(),
+                turn.session_id.to_string(),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                usage.source.as_str(),
+                usage.request_id,
+                now_ms,
+            ],
+        )?;
+        Ok(TurnUsageRecord {
+            turn_id,
+            session_id: turn.session_id,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            source: usage.source,
+            request_id: usage.request_id.clone(),
+            created_at_ms: now_ms,
+        })
+    }
+
+    pub fn get_turn(&self, turn_id: TurnId) -> StoreResult<Option<TurnRecord>> {
+        query_turn(&self.conn, turn_id)
+    }
+
+    pub fn get_turn_usage(&self, turn_id: TurnId) -> StoreResult<Option<TurnUsageRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT turn_id, session_id, prompt_tokens, completion_tokens, total_tokens, source, request_id, created_at_ms FROM turn_usage WHERE turn_id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![turn_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some((
+                turn_id,
+                session_id,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                source,
+                request_id,
+                created_at_ms,
+            )) => Ok(Some(TurnUsageRecord {
+                turn_id: TurnId::parse(&turn_id)?,
+                session_id: AgentSessionId::parse(&session_id)?,
+                prompt_tokens: from_sql_integer(prompt_tokens)?,
+                completion_tokens: from_sql_integer(completion_tokens)?,
+                total_tokens: from_sql_integer(total_tokens)?,
+                source: UsageSource::parse(&source).ok_or_else(|| {
+                    StoreError::Conflict(format!("unknown usage source {source}"))
+                })?,
+                request_id,
+                created_at_ms,
+            })),
+        }
+    }
+
+    pub fn list_turns(&self, session_id: AgentSessionId) -> StoreResult<Vec<TurnRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TURN_COLUMNS} FROM turns WHERE session_id = ?1 ORDER BY turn_index ASC"
+        ))?;
+        let rows = stmt.query_map(params![session_id.to_string()], raw_turn_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(parse_turn(row?)?);
+        }
+        Ok(out)
+    }
 }
 
 const NODE_COLUMNS: &str = "node_id, mission_id, run_id, state, attempt_no, retry_budget, lease_token, lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms";
+
+const AGENT_SESSION_COLUMNS: &str = "session_id, mission_id, run_id, node_id, role, model, system_prompt, state, created_at_ms, updated_at_ms, closed_at_ms";
+
+const TURN_COLUMNS: &str = "turn_id, session_id, node_id, attempt_no, turn_index, request_model, finish_reason, state, output_preview, tool_call_count, created_at_ms, updated_at_ms";
+
+type RawAgentSession = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    Option<i64>,
+);
+
+fn raw_agent_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAgentSession> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn parse_agent_session(raw: RawAgentSession) -> StoreResult<AgentSessionRecord> {
+    let (
+        session_id,
+        mission_id,
+        run_id,
+        node_id,
+        role,
+        model,
+        system_prompt,
+        state,
+        created_at_ms,
+        updated_at_ms,
+        closed_at_ms,
+    ) = raw;
+    Ok(AgentSessionRecord {
+        session_id: AgentSessionId::parse(&session_id)?,
+        mission_id: MissionId::parse(&mission_id)?,
+        run_id: match run_id {
+            Some(value) => Some(RunId::parse(&value)?),
+            None => None,
+        },
+        node_id: NodeId::parse(&node_id)?,
+        role,
+        model,
+        system_prompt,
+        state: AgentSessionState::parse(&state)
+            .ok_or_else(|| StoreError::Conflict(format!("unknown session state {state}")))?,
+        created_at_ms,
+        updated_at_ms,
+        closed_at_ms,
+    })
+}
+
+fn query_agent_session(
+    conn: &Connection,
+    session_id: AgentSessionId,
+) -> StoreResult<Option<AgentSessionRecord>> {
+    let row = conn
+        .query_row(
+            &format!("SELECT {AGENT_SESSION_COLUMNS} FROM agent_sessions WHERE session_id = ?1"),
+            params![session_id.to_string()],
+            raw_agent_session_row,
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some(raw) => Ok(Some(parse_agent_session(raw)?)),
+    }
+}
+
+type RawTurn = (
+    String,
+    String,
+    String,
+    u32,
+    u32,
+    String,
+    Option<String>,
+    String,
+    String,
+    u32,
+    i64,
+    i64,
+);
+
+fn raw_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurn> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+    ))
+}
+
+fn parse_turn(raw: RawTurn) -> StoreResult<TurnRecord> {
+    let (
+        turn_id,
+        session_id,
+        node_id,
+        attempt_no,
+        turn_index,
+        request_model,
+        finish_reason,
+        state,
+        output_preview,
+        tool_call_count,
+        created_at_ms,
+        updated_at_ms,
+    ) = raw;
+    Ok(TurnRecord {
+        turn_id: TurnId::parse(&turn_id)?,
+        session_id: AgentSessionId::parse(&session_id)?,
+        node_id: NodeId::parse(&node_id)?,
+        attempt_no: AttemptNo::new(attempt_no)?,
+        turn_index,
+        request_model,
+        finish_reason,
+        state: TurnState::parse(&state)
+            .ok_or_else(|| StoreError::Conflict(format!("unknown turn state {state}")))?,
+        output_preview,
+        tool_call_count,
+        created_at_ms,
+        updated_at_ms,
+    })
+}
+
+fn query_turn(conn: &Connection, turn_id: TurnId) -> StoreResult<Option<TurnRecord>> {
+    let row = conn
+        .query_row(
+            &format!("SELECT {TURN_COLUMNS} FROM turns WHERE turn_id = ?1"),
+            params![turn_id.to_string()],
+            raw_turn_row,
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some(raw) => Ok(Some(parse_turn(raw)?)),
+    }
+}
+
+fn to_sql_integer(value: u64) -> StoreResult<i64> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Conflict("token count exceeds SQLite INTEGER".to_owned()))
+}
+
+fn from_sql_integer(value: i64) -> StoreResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| StoreError::Conflict("negative token count in database".to_owned()))
+}
 
 type RawNode = (
     String,
@@ -1229,14 +1738,14 @@ mod tests {
 
     use hive_types::{
         ApprovalState, AttemptNo, EventId, EventInput, EventKind, LeaseToken, MissionId, NodeId,
-        NodeState, ToolCallId,
+        NodeState, RunId, ToolCallId,
     };
 
     use super::Store;
     use crate::error::StoreError;
     use crate::records::{
-        can_retry, ApprovalDecision, ApprovalInput, LeaseGuard, MissionRecord, NodeRecord,
-        RunRecord, SnapshotInput,
+        can_retry, AgentSessionState, ApprovalDecision, ApprovalInput, LeaseGuard, MissionRecord,
+        NewTurnUsage, NodeRecord, RunRecord, SnapshotInput, TurnState, UsageSource,
     };
     use crate::schema::{BUSY_TIMEOUT_MS, SCHEMA_VERSION, V1_SCHEMA};
     use crate::{MAX_SEQ, SNAPSHOT_SCHEMA_VERSION};
@@ -1862,23 +2371,23 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_v2_tool_tables() {
+    fn fresh_database_has_v3_tables() {
         let store = Store::open_in_memory().expect("store");
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.schema_version().expect("version"), 3);
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 3);
+        assert_eq!(tables, 6);
     }
 
     #[test]
-    fn v1_database_migrates_to_v2_and_preserves_rows() {
-        let dir = TempDir::new("v1-to-v2");
+    fn v1_database_migrates_to_v3_and_preserves_rows() {
+        let dir = TempDir::new("v1-to-v3");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
 
@@ -1894,7 +2403,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.schema_version().expect("version"), 3);
         let mission = store
             .get_mission(mission_id)
             .expect("mission")
@@ -1903,12 +2412,162 @@ mod tests {
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 3);
+        assert_eq!(tables, 6);
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3_and_preserves_rows() {
+        use crate::schema::V2_SCHEMA;
+
+        let dir = TempDir::new("v2-to-v3");
+        let path = dir.path().join("hive.db");
+        let mission_id = MissionId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+        let tool_call_id = ToolCallId::new();
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw conn");
+            conn.execute_batch(V1_SCHEMA).expect("v1 schema");
+            conn.execute_batch(V2_SCHEMA).expect("v2 schema");
+            conn.execute(
+                "INSERT INTO missions (mission_id, state, title, goal, created_at_ms, updated_at_ms) VALUES (?1, 'running', 'kept', 'goal', 1, 1)",
+                rusqlite::params![mission_id.to_string()],
+            )
+            .expect("mission");
+            conn.execute(
+                "INSERT INTO runs (run_id, mission_id, state, created_at_ms, updated_at_ms) VALUES (?1, ?2, 'running', 1, 1)",
+                rusqlite::params![run_id.to_string(), mission_id.to_string()],
+            )
+            .expect("run");
+            conn.execute(
+                "INSERT INTO nodes (node_id, mission_id, run_id, state, attempt_no, retry_budget, lease_token, lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, 'ready', 1, 3, NULL, NULL, NULL, 1, 1)",
+                rusqlite::params![node_id.to_string(), mission_id.to_string(), run_id.to_string()],
+            )
+            .expect("node");
+            conn.execute(
+                "INSERT INTO tool_calls (tool_call_id, mission_id, run_id, node_id, session_id, tool_name, tool_version, request_hash, attempt_no, lease_token, state, summary, truncated, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, NULL, 'fs.read', 1, 'hash', 1, 'lease', 'completed', 'kept tool call', 0, 1, 1)",
+                rusqlite::params![
+                    tool_call_id.to_string(),
+                    mission_id.to_string(),
+                    run_id.to_string(),
+                    node_id.to_string()
+                ],
+            )
+            .expect("tool call");
+            conn.pragma_update(None, "user_version", 2).expect("set v2");
+        }
+
+        let store = Store::open(&path).expect("migrate");
+        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(
+            store
+                .get_mission(mission_id)
+                .expect("mission")
+                .expect("preserved")
+                .title,
+            "kept"
+        );
+        let tool_calls: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("tool calls");
+        assert_eq!(tool_calls, 1);
+        let new_tables: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('agent_sessions','turns','turn_usage')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("new tables");
+        assert_eq!(new_tables, 3);
+    }
+
+    #[test]
+    fn agent_session_turn_and_usage_round_trip() {
+        let (mut store, mission, run, node) = setup();
+        let session = store
+            .create_agent_session(&crate::records::NewAgentSession {
+                mission_id: mission.mission_id,
+                run_id: Some(run.run_id),
+                node_id: node.node_id,
+                role: "worker",
+                model: "auto/auto",
+                system_prompt: "be brief",
+                now_ms: 10,
+            })
+            .expect("session");
+        assert_eq!(session.state, AgentSessionState::Active);
+        assert_eq!(
+            store
+                .get_agent_session(session.session_id)
+                .expect("get")
+                .expect("present")
+                .role,
+            "worker"
+        );
+
+        let turn = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                1,
+                "auto/auto",
+                11,
+            )
+            .expect("turn");
+        assert_eq!(turn.state, TurnState::Started);
+        let finished = store
+            .finish_turn(
+                turn.turn_id,
+                TurnState::Completed,
+                Some("stop"),
+                "done",
+                0,
+                12,
+            )
+            .expect("finish");
+        assert_eq!(finished.state, TurnState::Completed);
+        assert_eq!(finished.finish_reason.as_deref(), Some("stop"));
+
+        let usage = store
+            .record_turn_usage(
+                turn.turn_id,
+                &NewTurnUsage {
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                    total_tokens: 10,
+                    source: UsageSource::Authoritative,
+                    request_id: Some("chatcmpl-1".to_owned()),
+                },
+                13,
+            )
+            .expect("usage");
+        assert_eq!(usage.total_tokens, 10);
+        assert_eq!(
+            store
+                .get_turn_usage(turn.turn_id)
+                .expect("get usage")
+                .expect("present")
+                .source,
+            UsageSource::Authoritative
+        );
+        assert_eq!(
+            store.list_turns(session.session_id).expect("turns").len(),
+            1
+        );
+
+        let closed = store
+            .set_agent_session_state(session.session_id, AgentSessionState::Completed, 14)
+            .expect("close");
+        assert_eq!(closed.closed_at_ms, Some(14));
     }
 
     #[test]
