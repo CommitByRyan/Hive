@@ -6,9 +6,9 @@
 
 ## 当前门
 
-**H03 / H07 — 工具安全与模型网关（W2 并行）**
+**H04 — 单 Agent 垂直闭环（W3）**
 
-目标：H03 建立工具注册、审批消费与路径/网络/Shell 边界；H07 建立 OpenAI 兼容网关与流式解析。
+目标：把 H02 存储、H03 工具流水线、H07 网关串成一次完整运行：prompt → 模型 → 工具 → 结果 → 事件落库，可回放、可取消。
 
 状态：`ready to dispatch`
 
@@ -19,11 +19,11 @@
 | H00 | 总控、契约、集成、发布门 | active | 无 |
 | H01 | 契约与工程骨架 | done, verified | H00 |
 | H02 | 持久化、事件日志、恢复 | done, verified | H01 |
-| H03 | 工具、审批、工作区安全 | in_progress | H02 |
-| H04 | 单 Agent 垂直闭环 | blocked | H02、H03 |
+| H03 | 工具、审批、工作区安全 | done, verified（shell/Win32 留 H03b） | H02 |
+| H04 | 单 Agent 垂直闭环 | in_progress | H02、H03、H07 |
 | H05 | 并行 DAG 调度 | blocked | H04 |
 | H06 | 多 Agent 协作与 worktree | blocked | H05 |
-| H07 | 模型网关与路由 | in_progress | H01 |
+| H07 | 模型网关与路由 | done, verified（无真实 HTTP 适配器） | H01 |
 | H08 | 服务协议与 Web 控制台 | blocked | H05、H07 |
 | H09 | 定时、恢复、可观测性 | blocked | H02、H08 |
 | H10 | 评估、故障注入、性能 | blocked | H06 |
@@ -35,10 +35,11 @@
 |---|---|---|---|---|
 | H01 | H00 | `crates/hive-types`、`crates/hive-config`、`crates/hive-cli`、工程根配置、H01 runbook | 契约修正后工作区 | done |
 | H02 | H02 实施对话（pro → 429，切 `auto/deepseek-v4.1-flash` 完成） | `crates/hive-store`、`crates/hive-events`、迁移与测试 | H01 verified 工作区 | done |
-| H03 | H03 实施对话（`auto/deepseek-v4-pro`） | `crates/hive-policy`、`crates/hive-tools`、`hive-store` 的 migration V2 | `work/wt-h03`，分支 `codex/h03-tools` | implementing |
-| H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，分支 `codex/h07-gateway` | implementing |
+| H03 | H03 实施对话（pro 429，改 `auto/deepseek-v4.1-flash`） | `crates/hive-policy`、`crates/hive-tools`、migration V2 | `work/wt-h03`，`codex/h03-tools` | done, merged |
+| H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，`codex/h07-gateway` | done, merged |
+| H03b | 待派发 | 真实 Shell（argv/超时/进程树）、Win32 句柄级路径、连接级 IP 固定 | 新 worktree | pending |
 
-基线：`9380fc3`。合并顺序：H03 → H07；`Cargo.toml` 的 member 行与 `Cargo.lock` 冲突由 H00 统一解决后重跑 verify。
+合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
 
 ## 冻结契约
 
@@ -140,4 +141,7 @@
 | 2026-11-23 | R02 | 契约一致性审计 fail，12 项阻塞已全部裁决并写入 PROTOCOL | 审计报告 + 白板裁决表 |
 | 2026-11-23 | H02 | V1 schema（含 approvals）、逐步迁移、事务事件、CAS、快照、租约回收、EventBus | 独立复验：fmt/clippy 干净，59 tests 全过 |
 | 2026-11-23 | H00 | 新增 `docs/PYTHON_TO_RUST.md`、`scripts/` 封装、基线提交 | `git log`、`scripts/verify.ps1` |
+| 2026-11-23 | H03 | `hive-policy`（路径/网络/注册表/hash）+ `hive-tools`（dispatcher、fs.*、shell 拒绝）+ migration V2 + 审批消费 CAS | 分支自验 90 passed / 2 ignored；合并后复验通过 |
+| 2026-11-23 | H07 | `hive-llm`：wire 类型、SSE 增量解析、tool_call 累积、模型目录、重试策略、MockTransport | 35 条测试；合并后全量 125 passed |
+| 2026-11-23 | H00 | W2 合并：`Cargo.toml`/`Cargo.lock` 冲突已解，main 全绿 | `scripts/verify.ps1`、`cargo test --workspace` |
 
