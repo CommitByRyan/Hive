@@ -13,13 +13,14 @@ pub use cancel::CancellationToken;
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 pub const HANDOFF_SCHEMA_VERSION: u32 = 1;
+pub const HANDOFF_SUMMARY_MAX_BYTES: usize = 8 * 1024;
 pub const DEFAULT_LEASE_SECONDS: u64 = 60;
 pub const DEFAULT_RENEWAL_SECONDS: u64 = 20;
 pub const DEFAULT_RETRY_BUDGET: u32 = 3;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECONDS: u64 = 600;
 
-pub const ID_PREFIXES: [&str; 11] = [
-    "m_", "r_", "n_", "a_", "tn_", "e_", "tc_", "ap_", "f_", "prj_", "tr_",
+pub const ID_PREFIXES: [&str; 12] = [
+    "m_", "r_", "n_", "a_", "tn_", "e_", "tc_", "ap_", "f_", "prj_", "tr_", "hd_",
 ];
 
 #[derive(Debug, Error)]
@@ -40,6 +41,8 @@ pub enum HiveError {
     InvalidAttempt { value: u32, reason: String },
     #[error("invalid lease token: {reason}")]
     InvalidLeaseToken { reason: String },
+    #[error("invalid handoff field `{field}`: {reason}")]
+    InvalidHandoff { field: &'static str, reason: String },
     #[error("unsupported command `{command}`")]
     UnsupportedCommand { command: String },
     #[error("I/O error: {0}")]
@@ -55,6 +58,7 @@ impl HiveError {
             Self::InvalidState { .. } => "invalid_state",
             Self::InvalidAttempt { .. } => "invalid_attempt",
             Self::InvalidLeaseToken { .. } => "invalid_lease_token",
+            Self::InvalidHandoff { .. } => "invalid_handoff",
             Self::UnsupportedCommand { .. } => "unsupported_command",
             Self::Io(_) => "io_error",
         }
@@ -74,6 +78,7 @@ pub enum IdPrefix {
     Artifact,
     Project,
     Trace,
+    Handoff,
 }
 
 impl IdPrefix {
@@ -90,6 +95,7 @@ impl IdPrefix {
             Self::Artifact => "f_",
             Self::Project => "prj_",
             Self::Trace => "tr_",
+            Self::Handoff => "hd_",
         }
     }
 
@@ -106,6 +112,7 @@ impl IdPrefix {
             "f_" => Ok(Self::Artifact),
             "prj_" => Ok(Self::Project),
             "tr_" => Ok(Self::Trace),
+            "hd_" => Ok(Self::Handoff),
             other => Err(HiveError::InvalidId {
                 value: other.to_owned(),
                 reason: "unknown ID prefix".to_owned(),
@@ -231,6 +238,7 @@ define_prefixed_id!(ApprovalId, "ap_", IdPrefix::Approval);
 define_prefixed_id!(ArtifactId, "f_", IdPrefix::Artifact);
 define_prefixed_id!(ProjectId, "prj_", IdPrefix::Project);
 define_prefixed_id!(TraceId, "tr_", IdPrefix::Trace);
+define_prefixed_id!(HandoffId, "hd_", IdPrefix::Handoff);
 
 /// Logical execution count for a Node. Starts at 1; zero is invalid.
 ///
@@ -786,6 +794,7 @@ pub enum EventKind {
     RoutineTriggered,
     RoutineError,
     ArtifactSaved,
+    HandoffCreated,
     ModelRetry,
     ModelFallback,
 }
@@ -823,6 +832,7 @@ impl EventKind {
             Self::RoutineTriggered => "routine.triggered",
             Self::RoutineError => "routine.error",
             Self::ArtifactSaved => "artifact.saved",
+            Self::HandoffCreated => "handoff.created",
             Self::ModelRetry => "model.retry",
             Self::ModelFallback => "model.fallback",
         }
@@ -860,6 +870,7 @@ impl EventKind {
             "routine.triggered" => Ok(Self::RoutineTriggered),
             "routine.error" => Ok(Self::RoutineError),
             "artifact.saved" => Ok(Self::ArtifactSaved),
+            "handoff.created" => Ok(Self::HandoffCreated),
             "model.retry" => Ok(Self::ModelRetry),
             "model.fallback" => Ok(Self::ModelFallback),
             other => Err(HiveError::InvalidState {
@@ -938,6 +949,116 @@ impl EventEnvelope {
     }
 }
 
+/// A single artifact referenced by a structured Handoff.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HandoffArtifact {
+    pub id: ArtifactId,
+    pub path: String,
+    pub sha256: String,
+}
+
+/// A documented decision made while executing a node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HandoffDecision {
+    pub title: String,
+    pub rationale: String,
+}
+
+/// Where and when a Handoff was produced.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HandoffProvenance {
+    pub attempt_no: AttemptNo,
+    pub base_revision: String,
+    pub created_at: String,
+}
+
+/// Structured handoff between nodes, aligned with PROTOCOL.md section 5.
+///
+/// A Handoff deliberately excludes full model history, full tool logs,
+/// secrets, cookies and unredacted personal data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Handoff {
+    pub schema_version: u32,
+    pub mission_id: MissionId,
+    pub run_id: RunId,
+    pub node_id: NodeId,
+    pub agent: String,
+    pub objective: String,
+    pub summary: String,
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<HandoffArtifact>,
+    #[serde(default)]
+    pub decisions: Vec<HandoffDecision>,
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+    #[serde(default)]
+    pub risks: Vec<String>,
+    #[serde(default)]
+    pub open_questions: Vec<String>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub recommended_next: Vec<String>,
+    pub provenance: HandoffProvenance,
+}
+
+impl Handoff {
+    /// Validate required fields, the schema version, artifact hashes and
+    /// bounded-field limits. Validation failure must prevent persistence.
+    pub fn validate(&self) -> Result<(), HiveError> {
+        if self.schema_version != HANDOFF_SCHEMA_VERSION {
+            return Err(HiveError::InvalidHandoff {
+                field: "schema_version",
+                reason: format!("must equal {HANDOFF_SCHEMA_VERSION}"),
+            });
+        }
+        for (field, value) in [
+            ("agent", self.agent.as_str()),
+            ("objective", self.objective.as_str()),
+            ("summary", self.summary.as_str()),
+            (
+                "provenance.base_revision",
+                self.provenance.base_revision.as_str(),
+            ),
+            ("provenance.created_at", self.provenance.created_at.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(HiveError::InvalidHandoff {
+                    field,
+                    reason: "must not be empty".to_owned(),
+                });
+            }
+        }
+        if self.summary.len() > HANDOFF_SUMMARY_MAX_BYTES {
+            return Err(HiveError::InvalidHandoff {
+                field: "summary",
+                reason: format!("must be at most {HANDOFF_SUMMARY_MAX_BYTES} bytes"),
+            });
+        }
+        for artifact in &self.artifacts {
+            if artifact.path.trim().is_empty() {
+                return Err(HiveError::InvalidHandoff {
+                    field: "artifacts.path",
+                    reason: "must not be empty".to_owned(),
+                });
+            }
+            if !is_sha256_hex(&artifact.sha256) {
+                return Err(HiveError::InvalidHandoff {
+                    field: "artifacts.sha256",
+                    reason: "must be 64 lowercase hex digits".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,6 +1079,8 @@ mod tests {
         assert!(ArtifactId::new().to_string().starts_with("f_"));
         assert!(ProjectId::new().to_string().starts_with("prj_"));
         assert!(TraceId::new().to_string().starts_with("tr_"));
+        assert!(HandoffId::new().to_string().starts_with("hd_"));
+        assert_eq!(ID_PREFIXES.len(), 12);
     }
 
     #[test]
@@ -1135,6 +1258,99 @@ mod tests {
             EventKind::MissionCreated
         );
         assert!(EventKind::parse("node.unknown").is_err());
+    }
+
+    #[test]
+    fn handoff_id_round_trips_and_rejects_wrong_prefix() {
+        let value = format!("hd_{UUID_V4}");
+        let handoff = HandoffId::parse(&value).expect("valid handoff id");
+        assert_eq!(handoff.to_string(), value);
+        assert_eq!(handoff.prefix(), IdPrefix::Handoff);
+        assert_eq!(handoff.as_uuid(), &Uuid::parse_str(UUID_V4).expect("uuid"));
+
+        let error = HandoffId::parse(&format!("n_{UUID_V4}")).expect_err("wrong prefix");
+        assert_eq!(error.code(), "invalid_id");
+    }
+
+    #[test]
+    fn handoff_created_event_kind_round_trips() {
+        assert_eq!(EventKind::HandoffCreated.as_str(), "handoff.created");
+        assert_eq!(
+            EventKind::from_str("handoff.created").expect("parse"),
+            EventKind::HandoffCreated
+        );
+    }
+
+    #[test]
+    fn handoff_validation_enforces_contract() {
+        let sha = "a".repeat(64);
+        let valid = Handoff {
+            schema_version: HANDOFF_SCHEMA_VERSION,
+            mission_id: MissionId::new(),
+            run_id: RunId::new(),
+            node_id: NodeId::new(),
+            agent: "scout".to_owned(),
+            objective: "objective".to_owned(),
+            summary: "summary".to_owned(),
+            inputs: vec![],
+            artifacts: vec![HandoffArtifact {
+                id: ArtifactId::new(),
+                path: "artifacts/report.md".to_owned(),
+                sha256: sha.clone(),
+            }],
+            decisions: vec![],
+            assumptions: vec![],
+            risks: vec![],
+            open_questions: vec![],
+            acceptance: vec![],
+            recommended_next: vec![],
+            provenance: HandoffProvenance {
+                attempt_no: AttemptNo::FIRST,
+                base_revision: "abc123".to_owned(),
+                created_at: "2026-11-23T00:00:00Z".to_owned(),
+            },
+        };
+        assert!(valid.validate().is_ok());
+
+        let wrong_schema = Handoff {
+            schema_version: HANDOFF_SCHEMA_VERSION + 1,
+            ..valid.clone()
+        };
+        assert_eq!(
+            wrong_schema.validate().err().map(|e| e.code()),
+            Some("invalid_handoff")
+        );
+
+        let bad_sha = Handoff {
+            artifacts: vec![HandoffArtifact {
+                id: ArtifactId::new(),
+                path: "a".to_owned(),
+                sha256: "not-hex".to_owned(),
+            }],
+            ..valid.clone()
+        };
+        assert_eq!(
+            bad_sha.validate().err().map(|e| e.code()),
+            Some("invalid_handoff")
+        );
+
+        let long_summary = Handoff {
+            summary: "x".repeat(HANDOFF_SUMMARY_MAX_BYTES + 1),
+            ..valid.clone()
+        };
+        assert_eq!(
+            long_summary.validate().err().map(|e| e.code()),
+            Some("invalid_handoff")
+        );
+
+        let empty_agent = Handoff {
+            agent: " ".to_owned(),
+            ..valid
+        };
+        assert_eq!(
+            empty_agent.validate().err().map(|e| e.code()),
+            Some("invalid_handoff")
+        );
     }
 
     #[test]

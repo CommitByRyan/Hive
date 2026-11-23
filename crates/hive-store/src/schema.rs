@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::{StoreError, StoreResult};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 pub const BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub fn apply_pragmas(conn: &Connection) -> StoreResult<()> {
@@ -35,6 +35,7 @@ fn apply_migration(conn: &Connection, target: i64) -> StoreResult<()> {
         1 => conn.execute_batch(V1_SCHEMA)?,
         2 => conn.execute_batch(V2_SCHEMA)?,
         3 => conn.execute_batch(V3_SCHEMA)?,
+        4 => conn.execute_batch(V4_SCHEMA)?,
         other => {
             return Err(StoreError::Conflict(format!(
                 "unknown migration version {other}"
@@ -178,7 +179,7 @@ CREATE TABLE tool_audit (
 CREATE INDEX idx_tool_audit_mission ON tool_audit(mission_id, audit_id);
 "#;
 
-const V3_SCHEMA: &str = r#"
+pub(crate) const V3_SCHEMA: &str = r#"
 CREATE TABLE agent_sessions (
     session_id     TEXT PRIMARY KEY,
     mission_id     TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
@@ -224,4 +225,30 @@ CREATE TABLE turn_usage (
     created_at_ms     INTEGER NOT NULL
 );
 CREATE INDEX idx_turn_usage_session ON turn_usage(session_id);
+"#;
+
+pub(crate) const V4_SCHEMA: &str = r#"
+CREATE TABLE handoffs (
+    handoff_id            TEXT PRIMARY KEY,
+    mission_id            TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
+    run_id                TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    node_id               TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+    attempt_no            INTEGER NOT NULL,
+    agent                 TEXT NOT NULL,
+    schema_version        INTEGER NOT NULL,
+    objective             TEXT NOT NULL,
+    summary               TEXT NOT NULL,
+    base_revision         TEXT NOT NULL,
+    created_at_ms         INTEGER NOT NULL,
+    inputs_json           TEXT NOT NULL DEFAULT '[]',
+    artifacts_json        TEXT NOT NULL DEFAULT '[]',
+    decisions_json        TEXT NOT NULL DEFAULT '[]',
+    assumptions_json      TEXT NOT NULL DEFAULT '[]',
+    risks_json            TEXT NOT NULL DEFAULT '[]',
+    open_questions_json   TEXT NOT NULL DEFAULT '[]',
+    acceptance_json       TEXT NOT NULL DEFAULT '[]',
+    recommended_next_json TEXT NOT NULL DEFAULT '[]',
+    UNIQUE (node_id, attempt_no)
+);
+CREATE INDEX idx_handoffs_mission ON handoffs(mission_id, created_at_ms);
 "#;

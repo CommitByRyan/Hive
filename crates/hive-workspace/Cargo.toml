@@ -1,0 +1,10 @@
+[package]
+name = "hive-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-types = { path = "../hive-types" }
+thiserror.workspace = true

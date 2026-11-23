@@ -2,14 +2,17 @@ use std::time::Duration;
 
 use hive_llm::{ChatRequest, ChatResponse, ChatTransport, Gateway, Message, Role, Tool, Usage};
 use hive_policy::RiskLevel;
-use hive_store::{AgentSessionState, LeaseGuard, NewTurnUsage, Store, TurnState, UsageSource};
+use hive_store::{
+    now_rfc3339, AgentSessionState, LeaseGuard, NewTurnUsage, Store, TurnState, UsageSource,
+};
 use hive_tools::{
     AllowAllApprovals, ApprovalGate, AuditSink, DenyApprovals, ToolCall, ToolContext,
     ToolDispatcher, ToolError, ToolResult,
 };
 use hive_types::{
-    AgentSessionId, ApprovalId, EventId, EventInput, EventKind, LeaseToken, MissionId, NodeId,
-    NodeState, RunId,
+    AgentSessionId, ApprovalId, AttemptNo, EventId, EventInput, EventKind, Handoff,
+    HandoffProvenance, LeaseToken, MissionId, NodeId, NodeState, RunId, HANDOFF_SCHEMA_VERSION,
+    HANDOFF_SUMMARY_MAX_BYTES,
 };
 use serde_json::{json, Map, Value};
 
@@ -93,6 +96,37 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
         spec: &AgentSpec,
         cancel: &CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
+        let now = now_ms();
+        let lease_token = LeaseToken::generate();
+        let leased = self.store.lease_node(
+            node,
+            &lease_token,
+            &self.lease_owner,
+            now + self.lease_ttl_ms(),
+            now,
+        )?;
+        let guard = LeaseGuard {
+            attempt_no: leased.attempt_no,
+            lease_token,
+        };
+        self.run_node_with_lease(session, node, &guard, spec, cancel)
+    }
+
+    /// Run a node using a lease already granted by the scheduler.
+    ///
+    /// This method never calls [`Store::lease_node`]; the caller owns the
+    /// lease in `guard`. On success it constructs, validates and persists a
+    /// structured Handoff, then writes its `handoff_id` into the
+    /// `node.succeeded` event payload.
+    pub fn run_node_with_lease(
+        &mut self,
+        session: AgentSessionId,
+        node: NodeId,
+        guard: &LeaseGuard,
+        spec: &AgentSpec,
+        cancel: &CancellationToken,
+    ) -> Result<AgentOutcome, AgentError> {
+        let guard = (*guard).clone();
         let session_record = self
             .store
             .get_agent_session(session)?
@@ -123,24 +157,11 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
             session,
         };
 
-        let now = now_ms();
-        let lease_token = LeaseToken::generate();
-        let leased = self.store.lease_node(
-            node,
-            &lease_token,
-            &self.lease_owner,
-            now + self.lease_ttl_ms(),
-            now,
-        )?;
-        let guard = LeaseGuard {
-            attempt_no: leased.attempt_no,
-            lease_token,
-        };
-
         if cancel.is_cancelled() {
             return self.cancel_node(scope, &guard, NodeState::Leased, 0);
         }
 
+        let now = now_ms();
         let started = node_event(
             mission_id,
             Some(run_id),
@@ -162,7 +183,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
         } else {
             mission.goal.clone()
         };
-        messages.push(Message::user(goal));
+        messages.push(Message::user(goal.clone()));
 
         let tools = self.tool_definitions(spec);
         let mut turn_index = 0u32;
@@ -452,6 +473,16 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                 tool_calls.len() as u32,
                 now_ms(),
             )?;
+            let handoff = build_handoff(
+                mission_id,
+                run_id,
+                node,
+                spec,
+                guard.attempt_no,
+                &goal,
+                &output_text,
+            );
+            let handoff_record = self.store.insert_handoff(&handoff)?;
             let succeeded = node_event(
                 mission_id,
                 Some(run_id),
@@ -463,6 +494,8 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                     "turns": turn_index,
                     "finish_reason": finish_reason,
                     "final_preview": preview,
+                    "handoff_id": handoff_record.handoff_id,
+                    "summary": handoff.summary,
                 }),
             );
             self.store.transition_node_cas(
@@ -697,6 +730,50 @@ fn preview(text: &str) -> String {
     text.chars().take(PREVIEW_CHARS).collect()
 }
 
+fn build_handoff(
+    mission_id: MissionId,
+    run_id: RunId,
+    node: NodeId,
+    spec: &AgentSpec,
+    attempt_no: AttemptNo,
+    objective: &str,
+    final_text: &str,
+) -> Handoff {
+    Handoff {
+        schema_version: HANDOFF_SCHEMA_VERSION,
+        mission_id,
+        run_id,
+        node_id: node,
+        agent: spec.role.clone(),
+        objective: objective.to_owned(),
+        summary: clamp_summary(final_text),
+        inputs: Vec::new(),
+        artifacts: Vec::new(),
+        decisions: Vec::new(),
+        assumptions: Vec::new(),
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+        acceptance: Vec::new(),
+        recommended_next: Vec::new(),
+        provenance: HandoffProvenance {
+            attempt_no,
+            base_revision: "unknown".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    }
+}
+
+fn clamp_summary(text: &str) -> String {
+    if text.len() <= HANDOFF_SUMMARY_MAX_BYTES {
+        return text.to_owned();
+    }
+    let mut end = HANDOFF_SUMMARY_MAX_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -879,6 +956,7 @@ mod tests {
             vec![
                 EventKind::NodeStarted,
                 EventKind::NodeTurn,
+                EventKind::HandoffCreated,
                 EventKind::NodeSucceeded
             ]
         );
@@ -942,6 +1020,7 @@ mod tests {
                 EventKind::NodeToolStarted,
                 EventKind::NodeToolResult,
                 EventKind::NodeTurn,
+                EventKind::HandoffCreated,
                 EventKind::NodeSucceeded
             ]
         );
@@ -1440,6 +1519,115 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(f.dir.path().join("approved.txt")).expect("file"),
             "approved"
+        );
+    }
+
+    #[test]
+    fn external_lease_runs_without_second_lease_and_persists_handoff() {
+        let mut f = fixture("external-lease");
+        let external = LeaseToken::generate();
+        let leased = f
+            .store
+            .lease_node(f.node.node_id, &external, "scheduler", 60_000, 0)
+            .expect("lease");
+        assert_eq!(leased.lease_owner.as_deref(), Some("scheduler"));
+        let guard = LeaseGuard {
+            attempt_no: leased.attempt_no,
+            lease_token: external,
+        };
+
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion("delivered", None),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let outcome = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node_with_lease(
+                    f.session.session_id,
+                    f.node.node_id,
+                    &guard,
+                    &spec(),
+                    &token,
+                )
+                .expect("run")
+        };
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+
+        assert_eq!(
+            kinds(&f.store, f.mission.mission_id),
+            vec![
+                EventKind::NodeStarted,
+                EventKind::NodeTurn,
+                EventKind::HandoffCreated,
+                EventKind::NodeSucceeded
+            ]
+        );
+
+        let handoffs = f
+            .store
+            .list_handoffs(f.mission.mission_id)
+            .expect("handoffs");
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].node_id, f.node.node_id);
+
+        let succeeded = f
+            .store
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .find(|event| event.kind == EventKind::NodeSucceeded)
+            .expect("succeeded");
+        assert_eq!(
+            succeeded.payload["handoff_id"],
+            handoffs[0].handoff_id.to_string()
+        );
+    }
+
+    #[test]
+    fn external_lease_mismatch_returns_stale_execution() {
+        let mut f = fixture("stale-external-lease");
+        let external = LeaseToken::generate();
+        f.store
+            .lease_node(f.node.node_id, &external, "scheduler", 60_000, 0)
+            .expect("lease");
+        let guard = LeaseGuard {
+            attempt_no: AttemptNo::FIRST,
+            lease_token: LeaseToken::generate(),
+        };
+
+        let transport = MockTransport::default();
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let error = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node_with_lease(
+                    f.session.session_id,
+                    f.node.node_id,
+                    &guard,
+                    &spec(),
+                    &token,
+                )
+                .expect_err("stale lease")
+        };
+        assert!(matches!(
+            error,
+            AgentError::Store(hive_store::StoreError::StaleExecution)
+        ));
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Leased
         );
     }
 }
