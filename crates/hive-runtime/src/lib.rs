@@ -11,6 +11,7 @@ mod clock;
 mod error;
 mod executor;
 mod plan;
+mod recovery;
 mod scheduler;
 mod threaded;
 
@@ -18,5 +19,6 @@ pub use clock::{Clock, SystemClock, TestClock};
 pub use error::RuntimeError;
 pub use executor::{ExecOutcome, NodeExecutor};
 pub use plan::{validate_plan, NodeSpec, Plan, PlanError, PlanNode, Topology};
+pub use recovery::{run_startup_recovery, RecoveryReport};
 pub use scheduler::{install_plan, Action, Scheduler, StoreLike};
 pub use threaded::{RunSummary, ThreadedExecutor};

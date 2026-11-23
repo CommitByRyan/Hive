@@ -79,6 +79,10 @@ fn map_error(error: AgentError) -> ExecOutcome {
             reason: llm.to_string(),
             retryable: false,
         },
+        AgentError::BudgetExceeded { dimension } => ExecOutcome::Failed {
+            reason: format!("budget_exceeded:{dimension}"),
+            retryable: false,
+        },
         other => ExecOutcome::Failed {
             reason: other.to_string(),
             retryable: false,

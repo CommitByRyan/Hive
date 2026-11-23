@@ -382,6 +382,72 @@ pub enum SideEffectState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BudgetDimension {
+    Tokens,
+    Cost,
+    Requests,
+    ToolCalls,
+    WallMs,
+}
+
+impl BudgetDimension {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tokens => "tokens",
+            Self::Cost => "cost",
+            Self::Requests => "requests",
+            Self::ToolCalls => "tool_calls",
+            Self::WallMs => "wall_ms",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "tokens" => Some(Self::Tokens),
+            "cost" => Some(Self::Cost),
+            "requests" => Some(Self::Requests),
+            "tool_calls" => Some(Self::ToolCalls),
+            "wall_ms" => Some(Self::WallMs),
+            _ => None,
+        }
+    }
+}
+
+/// A persisted budget ledger row: the allocation (`hard_limit`/`soft_limit`)
+/// plus the materialized `consumed` counter. Facts remain authoritative in
+/// `turn_usage` (tokens/cost/requests) and `tool_calls` (tool_calls count).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BudgetRecord {
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub dimension: String,
+    pub currency: Option<String>,
+    pub hard_limit: Option<i64>,
+    pub soft_limit: Option<i64>,
+    pub consumed: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Allocation limits for one budget dimension. Grouped into a single value so
+/// the store setters stay below clippy's argument-count ceiling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BudgetLimits {
+    pub hard_limit: Option<i64>,
+    pub soft_limit: Option<i64>,
+}
+
+/// Read-only budget summary for one node. Deliberately exposes only the
+/// dimension, counters and limits — never API keys, base URLs or unit prices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BudgetSummary {
+    pub node_id: NodeId,
+    pub dimension: String,
+    pub consumed: i64,
+    pub hard_limit: Option<i64>,
+    pub remaining: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryDecision {
     SafeToRetry,
     NeedsRecovery,

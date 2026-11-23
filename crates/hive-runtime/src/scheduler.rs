@@ -15,6 +15,12 @@ use crate::plan::{Plan, Topology};
 const LEASE_OWNER: &str = "hive-runtime";
 const LEASE_TTL_MS: i64 = 60_000;
 
+/// Budget exhaustion is a distinct failure signal: the node emits
+/// `node.budget_exceeded` (never `node.failed`) and never retries.
+fn is_budget_exceeded(reason: &str) -> bool {
+    reason == "budget_exceeded" || reason.starts_with("budget_exceeded:")
+}
+
 /// Persistence boundary for the scheduler. Implementations must route every
 /// transition through a CAS entry point (state + lease guard) and never allow
 /// the runtime to issue raw `UPDATE` statements.
@@ -472,12 +478,13 @@ impl<S: StoreLike> Scheduler<S> {
                 self.unblock_dependents(node_id)?;
             }
             ExecOutcome::Failed { reason, retryable } => {
-                let event = self.node_event(
-                    node_id,
-                    attempt,
-                    EventKind::NodeFailed,
-                    json!({ "reason": reason }),
-                );
+                let budget_exceeded = is_budget_exceeded(&reason);
+                let kind = if budget_exceeded {
+                    EventKind::NodeBudgetExceeded
+                } else {
+                    EventKind::NodeFailed
+                };
+                let event = self.node_event(node_id, attempt, kind, json!({ "reason": reason }));
                 self.store.finish_node(
                     node_id,
                     &guard,
@@ -486,7 +493,7 @@ impl<S: StoreLike> Scheduler<S> {
                     self.now_ms(),
                 )?;
                 self.guards.remove(&node_id);
-                self.handle_failure(node_id, attempt, retryable)?;
+                self.handle_failure(node_id, attempt, retryable && !budget_exceeded)?;
             }
             ExecOutcome::Cancelled => {
                 let event = self.node_event(node_id, attempt, EventKind::NodeCancelled, json!({}));
@@ -1599,6 +1606,49 @@ mod tests {
             .filter(|event| event.kind == EventKind::NodeCancelled)
             .count();
         assert_eq!(cancelled_events, 3);
+        assert_eq!(sched.next_actions(), vec![Action::Halt]);
+    }
+
+    #[test]
+    fn budget_exceeded_finalizes_without_retry_or_node_ready() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 3)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        assert_eq!(sched.next_actions(), vec![Action::Start(a)]);
+        sched.on_started(a).expect("start");
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Failed {
+                    reason: "budget_exceeded:tokens".to_owned(),
+                    retryable: false,
+                },
+            )
+            .expect("finish");
+
+        assert_eq!(sched.node_state(a), NodeState::FailedFinal);
+        let events = sched.store().read_all_events().expect("events");
+        let budget_exceeded = events
+            .iter()
+            .filter(|event| event.kind == EventKind::NodeBudgetExceeded)
+            .count();
+        assert_eq!(budget_exceeded, 1, "must emit node.budget_exceeded");
+        let failed = events
+            .iter()
+            .filter(|event| event.kind == EventKind::NodeFailed)
+            .count();
+        assert_eq!(failed, 0, "budget exhaustion must not emit node.failed");
+        // The only `node.ready` is the initial ready marking, never a retry.
+        let ready = events
+            .iter()
+            .filter(|event| event.kind == EventKind::NodeReady)
+            .count();
+        assert_eq!(ready, 1, "no retry node.ready");
         assert_eq!(sched.next_actions(), vec![Action::Halt]);
     }
 }

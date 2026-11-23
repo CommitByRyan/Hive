@@ -24,6 +24,8 @@ pub enum StoreError {
     StaleExecution,
     #[error("lease token mismatch")]
     LeaseTokenMismatch,
+    #[error("budget exceeded for {dimension}")]
+    BudgetExceeded { dimension: String },
 }
 
 impl StoreError {
@@ -33,6 +35,7 @@ impl StoreError {
             Self::ApprovalConflict(_) => "approval.conflict",
             Self::StaleExecution => "tool.stale_execution",
             Self::LeaseTokenMismatch => "tool.stale_execution",
+            Self::BudgetExceeded { .. } => "budget.exceeded",
             Self::NotFound(_) => "not_found",
             Self::DuplicateEvent(_) => "duplicate_event",
             Self::SequenceExhausted => "sequence_exhausted",
