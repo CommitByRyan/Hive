@@ -131,6 +131,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-llm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hive-store"
 version = "0.1.0"
 dependencies = [

@@ -6,6 +6,7 @@ members = [
     "crates/hive-cli",
     "crates/hive-store",
     "crates/hive-events",
+    "crates/hive-llm",
 ]
 
 [workspace.package]
