@@ -1218,6 +1218,68 @@ mod tests {
     }
 
     #[test]
+    fn on_finished_propagates_when_executor_settled_the_node() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let plan = plan(
+            mission.mission_id,
+            run.run_id,
+            vec![node(a, &[], 0), node(b, &[a], 0)],
+        );
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        // Simulate the threaded executor settling the node out-of-band:
+        // leased -> running -> succeeded, without the scheduler's phase moving.
+        let started = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeStarted,
+            mission_id: mission.mission_id,
+            run_id: Some(run.run_id),
+            node_id: Some(a),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({}),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(a, &guard, NodeState::Running, &started, 0)
+            .expect("executor start");
+        let succeeded = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeSucceeded,
+            mission_id: mission.mission_id,
+            run_id: Some(run.run_id),
+            node_id: Some(a),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({}),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(a, &guard, NodeState::Succeeded, &succeeded, 1)
+            .expect("executor settle");
+
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Succeeded {
+                    summary: "a".into(),
+                },
+            )
+            .expect("propagate");
+
+        assert_eq!(sched.node_state(a), NodeState::Succeeded);
+        assert_eq!(sched.next_actions(), vec![Action::Start(b)]);
+    }
+
+    #[test]
     fn events_sequence_matches_final_node_states() {
         let (mut store, mission, run) = make_store();
         let a = NodeId::new();
