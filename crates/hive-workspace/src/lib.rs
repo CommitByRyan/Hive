@@ -21,6 +21,8 @@ pub enum WorkspaceError {
     PathOutsideBaseDir { path: String },
     #[error("refusing to treat the project root `{0}` as a worktree")]
     ProjectRootAsWorktree(String),
+    #[error("project root `{0}` is dirty; merge refused")]
+    DirtyProjectRoot(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -36,6 +38,43 @@ pub struct WorktreeHandle {
     pub branch: String,
     pub path: PathBuf,
     pub node_id: Option<NodeId>,
+}
+
+/// Result of `git status --porcelain` for a checkout.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub dirty: bool,
+}
+
+/// Whether an integration merge would apply cleanly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergePreview {
+    /// The merge is clean and would produce this tree object id.
+    Clean { tree: String },
+    /// The merge would conflict on these paths.
+    Conflicts { paths: Vec<String> },
+}
+
+/// Result of attempting a real merge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The merge completed; `commit` is the new HEAD sha.
+    Merged { commit: String },
+    /// The merge was not attempted because it would conflict.
+    Conflicts { paths: Vec<String> },
+}
+
+/// Policy controlling what `recycle` does with a dirty worktree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecyclePolicy {
+    pub keep_dirty: bool,
+}
+
+/// Outcome of recycling a worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecycleOutcome {
+    KeptDirty,
+    Removed,
 }
 
 impl WorktreeManager {
@@ -130,6 +169,119 @@ impl WorktreeManager {
         }
     }
 
+    /// Resolve the current HEAD commit of a worktree to a 40/64 hex sha.
+    pub fn head_revision(&self, handle: &WorktreeHandle) -> Result<String, WorkspaceError> {
+        head_revision_at(&handle.path)
+    }
+
+    /// Read the dirty state of a worktree.
+    pub fn status(&self, handle: &WorktreeHandle) -> Result<WorktreeStatus, WorkspaceError> {
+        status_at(&handle.path)
+    }
+
+    /// Preview a merge of `branch` into `target_ref` without touching the
+    /// working tree or creating a merge commit.
+    pub fn preview_merge(
+        &self,
+        target_ref: &str,
+        branch: &str,
+    ) -> Result<MergePreview, WorkspaceError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.project_root)
+            .arg("merge-tree")
+            .arg("--write-tree")
+            .arg(target_ref)
+            .arg(branch)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        match output.status.code() {
+            Some(0) => {
+                let tree = stdout.lines().next().unwrap_or_default().trim().to_owned();
+                if tree.is_empty() {
+                    return Err(WorkspaceError::Git {
+                        message: "merge-tree returned no tree".to_owned(),
+                    });
+                }
+                Ok(MergePreview::Clean { tree })
+            }
+            Some(1) => {
+                let tree = stdout.lines().next().unwrap_or_default().trim().to_owned();
+                if !is_hex_sha(&tree) {
+                    return Err(WorkspaceError::Git {
+                        message: if stderr.is_empty() {
+                            "merge-tree failed".to_owned()
+                        } else {
+                            stderr
+                        },
+                    });
+                }
+                let paths = parse_conflict_paths(&stdout)?;
+                Ok(MergePreview::Conflicts { paths })
+            }
+            _ => Err(WorkspaceError::Git {
+                message: if stderr.is_empty() {
+                    format!("merge-tree exited with {}", output.status)
+                } else {
+                    stderr
+                },
+            }),
+        }
+    }
+
+    /// Merge `branch` into the checked-out branch of `project_root`.
+    ///
+    /// Refuses a dirty project root and returns without touching the target
+    /// when the preview detects conflicts. Never uses `--force`, `reset`, or
+    /// automatic conflict resolution.
+    pub fn merge(
+        &self,
+        target_ref: &str,
+        branch: &str,
+        message: &str,
+    ) -> Result<MergeOutcome, WorkspaceError> {
+        if status_at(&self.project_root)?.dirty {
+            return Err(WorkspaceError::DirtyProjectRoot(
+                self.project_root.display().to_string(),
+            ));
+        }
+        if let MergePreview::Conflicts { paths } = self.preview_merge(target_ref, branch)? {
+            return Ok(MergeOutcome::Conflicts { paths });
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.project_root)
+            .arg("merge")
+            .arg("--no-ff")
+            .arg("-m")
+            .arg(message)
+            .arg(branch)
+            .output()?;
+        if !output.status.success() {
+            return Err(WorkspaceError::Git {
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let commit = head_revision_at(&self.project_root)?;
+        Ok(MergeOutcome::Merged { commit })
+    }
+
+    /// Recycle a worktree. A dirty worktree is kept when the policy requests
+    /// it; otherwise it is removed (forcing removal of dirty content).
+    pub fn recycle(
+        &self,
+        handle: &WorktreeHandle,
+        policy: RecyclePolicy,
+    ) -> Result<RecycleOutcome, WorkspaceError> {
+        let status = self.status(handle)?;
+        if status.dirty && policy.keep_dirty {
+            return Ok(RecycleOutcome::KeptDirty);
+        }
+        self.remove(handle, status.dirty)?;
+        Ok(RecycleOutcome::Removed)
+    }
+
     fn ensure_safe_target(&self, path: &Path) -> Result<(), WorkspaceError> {
         if path == self.project_root {
             return Err(WorkspaceError::ProjectRootAsWorktree(
@@ -164,6 +316,78 @@ fn canonical_target(path: &Path) -> PathBuf {
             .join(file_name),
         None => path.to_path_buf(),
     }
+}
+
+/// Resolve `git -C <path> rev-parse HEAD` to a 40/64 hex sha.
+pub fn head_revision_at(path: &Path) -> Result<String, WorkspaceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()?;
+    if !output.status.success() {
+        return Err(WorkspaceError::Git {
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if is_hex_sha(&sha) {
+        Ok(sha)
+    } else {
+        Err(WorkspaceError::Git {
+            message: format!("rev-parse HEAD returned invalid sha `{sha}`"),
+        })
+    }
+}
+
+/// Parse `git status --porcelain` for a checkout into its dirty state.
+fn status_at(path: &Path) -> Result<WorktreeStatus, WorkspaceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("status")
+        .arg("--porcelain")
+        .output()?;
+    if !output.status.success() {
+        return Err(WorkspaceError::Git {
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dirty = stdout.lines().any(|line| !line.trim().is_empty());
+    Ok(WorktreeStatus { dirty })
+}
+
+/// Extract the conflicted paths from `git merge-tree --write-tree` output.
+///
+/// The first line is the resulting tree object id; conflicted file info
+/// follows as `<mode> <oid> <stage>\t<path>` lines until a blank line, after
+/// which informational messages may appear.
+fn parse_conflict_paths(stdout: &str) -> Result<Vec<String>, WorkspaceError> {
+    let mut paths = Vec::new();
+    for line in stdout.lines().skip(1) {
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((_, path)) = line.split_once('\t') {
+            let path = path.trim_end();
+            if !path.is_empty() && !paths.iter().any(|existing| existing == path) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Err(WorkspaceError::Git {
+            message: "merge-tree reported conflicts but produced no paths".to_owned(),
+        });
+    }
+    Ok(paths)
+}
+
+fn is_hex_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_worktree_list(
@@ -253,7 +477,8 @@ mod tests {
         run_git(dir, &["config", "user.email", "test@example.com"]);
         run_git(dir, &["config", "user.name", "Test"]);
         std::fs::write(dir.join("README.md"), b"base\n").expect("write");
-        run_git(dir, &["add", "README.md"]);
+        std::fs::write(dir.join(".gitignore"), b"/.hive/\n").expect("gitignore");
+        run_git(dir, &["add", "README.md", ".gitignore"]);
         run_git(dir, &["commit", "-q", "-m", "init"]);
     }
 
@@ -344,5 +569,113 @@ mod tests {
         };
         let error = manager.remove(&handle, false).expect_err("root");
         assert!(matches!(error, WorkspaceError::ProjectRootAsWorktree(_)));
+    }
+
+    #[test]
+    fn head_revision_returns_hex_sha() {
+        let dir = TempDir::new("head-sha");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+        let handle = manager.create(NodeId::new(), "HEAD").expect("create");
+
+        let sha = manager.head_revision(&handle).expect("head");
+        assert!(is_hex_sha(&sha), "expected 40/64 hex sha, got `{sha}`");
+    }
+
+    #[test]
+    fn two_worktrees_merge_cleanly_when_files_differ() {
+        let dir = TempDir::new("merge-clean");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+
+        let a = manager.create(NodeId::new(), "HEAD").expect("a");
+        let b = manager.create(NodeId::new(), "HEAD").expect("b");
+        std::fs::write(a.path.join("a.txt"), b"from a").expect("write a");
+        run_git(&a.path, &["add", "a.txt"]);
+        run_git(&a.path, &["commit", "-q", "-m", "a adds a.txt"]);
+        std::fs::write(b.path.join("b.txt"), b"from b").expect("write b");
+        run_git(&b.path, &["add", "b.txt"]);
+        run_git(&b.path, &["commit", "-q", "-m", "b adds b.txt"]);
+
+        let outcome_a = manager
+            .merge("HEAD", &a.branch, "merge a")
+            .expect("merge a");
+        assert!(matches!(outcome_a, MergeOutcome::Merged { .. }));
+        let outcome_b = manager
+            .merge("HEAD", &b.branch, "merge b")
+            .expect("merge b");
+        assert!(matches!(outcome_b, MergeOutcome::Merged { .. }));
+
+        assert!(dir.path().join("a.txt").exists());
+        assert!(dir.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn preview_merge_reports_conflict_and_does_not_touch_target() {
+        let dir = TempDir::new("preview-conflict");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+        let handle = manager.create(NodeId::new(), "HEAD").expect("create");
+
+        std::fs::write(dir.path().join("README.md"), b"main side\n").expect("main write");
+        run_git(dir.path(), &["add", "README.md"]);
+        run_git(dir.path(), &["commit", "-q", "-m", "main edits readme"]);
+        std::fs::write(handle.path.join("README.md"), b"feature side\n").expect("feat write");
+        run_git(&handle.path, &["add", "README.md"]);
+        run_git(
+            &handle.path,
+            &["commit", "-q", "-m", "feature edits readme"],
+        );
+
+        let before = head_revision_at(dir.path()).expect("before");
+        let preview = manager
+            .preview_merge("HEAD", &handle.branch)
+            .expect("preview");
+        assert!(matches!(preview, MergePreview::Conflicts { .. }));
+        if let MergePreview::Conflicts { paths } = preview {
+            assert!(paths.iter().any(|path| path.ends_with("README.md")));
+        }
+
+        assert_eq!(head_revision_at(dir.path()).expect("after"), before);
+        assert!(!status_at(dir.path()).expect("status").dirty);
+    }
+
+    #[test]
+    fn merge_refuses_dirty_project_root() {
+        let dir = TempDir::new("merge-dirty");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+        let handle = manager.create(NodeId::new(), "HEAD").expect("create");
+        std::fs::write(handle.path.join("x.txt"), b"x").expect("x");
+        run_git(&handle.path, &["add", "x.txt"]);
+        run_git(&handle.path, &["commit", "-q", "-m", "x"]);
+
+        std::fs::write(dir.path().join("dirty.txt"), b"untracked").expect("dirty");
+        let error = manager
+            .merge("HEAD", &handle.branch, "merge")
+            .expect_err("dirty");
+        assert!(matches!(error, WorkspaceError::DirtyProjectRoot(_)));
+        assert!(!dir.path().join("x.txt").exists());
+    }
+
+    #[test]
+    fn recycle_keeps_dirty_worktree_when_policy_says_so() {
+        let dir = TempDir::new("recycle-keep");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+        let handle = manager.create(NodeId::new(), "HEAD").expect("create");
+        std::fs::write(handle.path.join("dirty.txt"), b"untracked").expect("dirty");
+
+        let outcome = manager
+            .recycle(&handle, RecyclePolicy { keep_dirty: true })
+            .expect("recycle keep");
+        assert_eq!(outcome, RecycleOutcome::KeptDirty);
+        assert!(handle.path.exists(), "dirty worktree must be kept");
+
+        let outcome = manager
+            .recycle(&handle, RecyclePolicy { keep_dirty: false })
+            .expect("recycle remove");
+        assert_eq!(outcome, RecycleOutcome::Removed);
+        assert!(!handle.path.exists());
     }
 }
