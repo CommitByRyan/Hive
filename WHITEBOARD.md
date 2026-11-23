@@ -7,9 +7,9 @@
 
 ## 当前门
 
-**H06b + H08 — 租约接线与服务面（并行）**
+**H06c + H08 — 真实工作线程与服务面（并行）**
 
-目标：H06b 把调度器已领取的 `LeaseGuard` 注入 `NodeExecutor`，彻底消除实际执行路径的双重租约；H08 按设计实现 HTTP/SSE 与最小控制台。两者文件不重叠，允许并行。
+目标：H06c 让 `ThreadedExecutor` 真正跑 `AgentRunner` 工作节点，闭环租约、Handoff、失败重试与取消；H08 按设计实现 HTTP/SSE 与最小控制台。两者文件不重叠，允许并行。
 
 状态：`in_progress`
 
@@ -24,8 +24,9 @@
 | H04 | 单 Agent 垂直闭环 | done, verified | H02、H03、H07 |
 | H05 | 并行 DAG 调度（状态机） | done, verified | H04 |
 | H05b | 线程化执行器 + 语义收紧 | done, verified | H05 |
-| H06 | 多 Agent 协作与 worktree | done, merged；H06b 接线中 | H05b |
-| H06b | 调度器租约注入 NodeExecutor | in_progress | H06 |
+| H06 | 多 Agent 协作与 worktree | done, merged, verified | H05b |
+| H06b | 调度器租约注入 NodeExecutor | done, merged, verified | H06 |
+| H06c | 真实 Agent 工作线程与 ThreadedExecutor 联调 | in_progress | H06b |
 | H07 | 模型网关与路由 | done, verified（无真实 HTTP 适配器） | H01 |
 | H08 | 服务协议与 Web 控制台 | in_progress | H05、H06、H07 |
 | H09 | 定时、恢复、可观测性 | blocked | H02、H08 |
@@ -44,12 +45,13 @@
 | H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
 | H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | done, merged |
 | H05b | 可见对话 `01a207e0-8bd5-7ff1-8247-78c2156c82f3`（pro） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、语义收紧 | `.codex/worktrees/36e0/Hive` | done, merged |
-| H06 | 可见对话 `01a2080c-0533-7513-81c2-80f64f285384`（pro） | `crates/hive-workspace`、Handoff V4、租约复用 | `.codex/worktrees/3d26/Hive` | done, merged, verified |
-| H06b | 可见对话 `01a2084e-3999-7702-8969-bf62cade3a40`（pro high） | `NodeExecutor` 租约注入、`ThreadedExecutor` 传 guard | `.codex/worktrees/cff0/Hive` | implementing |
-| H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | implementing |
+| H06 | 可见对话 `01a2080c-0533-7513-81c2-80f64f285384`（pro → flash 收尾） | `crates/hive-workspace`、Handoff V4、租约复用 | `.codex/worktrees/3d26/Hive` | done, merged, verified; 对话已收尾未归档 |
+| H06b | 可见对话 `01a2084e-3999-7702-8969-bf62cade3a40`（pro high） | `NodeExecutor` 租约注入、`ThreadedExecutor` 传 guard、失败不二次结算 | `.codex/worktrees/cff0/Hive` | done, merged, verified（187/3） |
+| H06c | 可见对话 `01a20868-96e2-7791-9ccd-609a4d37eb7e`（pro high） | 自持有 `WorkerAgentExecutor`、真实 `ThreadedExecutor` 联调 | `.codex/worktrees/3f45/Hive` | implementing |
+| H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | implementing |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`a455175`（H06 合并后独立复验 `All checks passed`，180 passed / 3 ignored）。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突。
+合并基线：`4be9813`（H06b 合并后独立复验 `All checks passed`，187 passed / 3 ignored）。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突。
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
