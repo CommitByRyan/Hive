@@ -3,7 +3,7 @@ use std::path::Path;
 use hive_types::{
     AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, EventId, EventInput,
     EventKind, Handoff, HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState,
-    RoutineId, RunId, RunState, ToolCallId, TurnId, EVENT_SCHEMA_VERSION,
+    RoutineId, RunId, RunState, ToolCallId, TurnId, EVENT_SCHEMA_VERSION, SYSTEM_SCOPE_MISSION_ID,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
@@ -3468,8 +3468,7 @@ fn tool_call_id_from(event: &EventInput) -> StoreResult<String> {
 /// Mission owner. The `events` table requires a non-null `mission_id`, but
 /// these events must not be attributed to any real Mission.
 fn system_mission_id() -> MissionId {
-    MissionId::from_uuid(Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0000))
-        .expect("reserved system mission id is a valid v4 uuid")
+    MissionId::parse(SYSTEM_SCOPE_MISSION_ID).expect("system scope mission id is a valid v4 uuid")
 }
 
 fn query_routine(conn: &Connection, routine_id: RoutineId) -> StoreResult<Option<RoutineRecord>> {
@@ -5550,5 +5549,97 @@ mod tests {
             crate::time::rfc3339_from_ms(routine.next_run_ms),
             "2026-11-23T01:00:00Z"
         );
+    }
+
+    #[test]
+    fn system_scope_mission_is_reserved_and_not_listed() {
+        let system_id = MissionId::parse(hive_types::SYSTEM_SCOPE_MISSION_ID)
+            .expect("system scope mission id parses");
+        let store = Store::open_in_memory().expect("store");
+        assert!(store.get_mission(system_id).expect("get").is_none());
+        assert!(!store
+            .list_missions(100, 0)
+            .expect("missions")
+            .iter()
+            .any(|item| item.mission.mission_id == system_id));
+    }
+
+    #[test]
+    fn routine_lifecycle_events_use_system_scope() {
+        let system_id = MissionId::parse(hive_types::SYSTEM_SCOPE_MISSION_ID)
+            .expect("system scope mission id parses");
+        let mut store = Store::open_in_memory().expect("store");
+
+        let routine = store
+            .create_routine("n", "g", "every:5m", "Asia/Shanghai", 0)
+            .expect("routine");
+        let (_, updated) = store
+            .update_routine(routine.routine_id, Some(false), None, 1)
+            .expect("update");
+        assert_eq!(updated.kind, EventKind::RoutineUpdated);
+        assert_eq!(updated.mission_id, system_id);
+
+        let deleted = store.delete_routine(routine.routine_id, 2).expect("delete");
+        assert_eq!(deleted.kind, EventKind::RoutineDeleted);
+        assert_eq!(deleted.mission_id, system_id);
+
+        let bad = store
+            .create_routine("bad", "g", "every:5m", "Asia/Shanghai", 0)
+            .expect("bad");
+        store
+            .conn
+            .execute(
+                "UPDATE routines SET schedule = 'garbage' WHERE routine_id = ?1",
+                rusqlite::params![bad.routine_id.to_string()],
+            )
+            .expect("corrupt");
+        let outcome = store
+            .fire_routine(bad.routine_id, bad.next_run_ms)
+            .expect("fire");
+        assert!(matches!(outcome, RoutineFireOutcome::Disabled { .. }));
+        let error = store
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .find(|event| event.kind == EventKind::RoutineError)
+            .expect("routine error");
+        assert_eq!(error.mission_id, system_id);
+    }
+
+    #[test]
+    fn routine_triggered_uses_real_mission_and_lists_it() {
+        let system_id = MissionId::parse(hive_types::SYSTEM_SCOPE_MISSION_ID)
+            .expect("system scope mission id parses");
+        let mut store = Store::open_in_memory().expect("store");
+        let routine = store
+            .create_routine("n", "g", "every:5m", "Asia/Shanghai", 0)
+            .expect("routine");
+        let outcome = store
+            .fire_routine(routine.routine_id, routine.next_run_ms)
+            .expect("fire");
+        let mission_id = match outcome {
+            RoutineFireOutcome::Fired { mission, .. } => mission.mission_id,
+            other => panic!("expected fired, got {other:?}"),
+        };
+        assert_ne!(mission_id, system_id);
+
+        let triggered = store
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .find(|event| event.kind == EventKind::RoutineTriggered)
+            .expect("triggered");
+        assert_eq!(triggered.mission_id, mission_id);
+
+        assert!(store
+            .list_missions(100, 0)
+            .expect("missions")
+            .iter()
+            .any(|item| item.mission.mission_id == mission_id));
+        assert!(!store
+            .list_missions(100, 0)
+            .expect("missions")
+            .iter()
+            .any(|item| item.mission.mission_id == system_id));
     }
 }

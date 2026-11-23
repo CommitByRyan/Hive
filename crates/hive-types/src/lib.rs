@@ -19,6 +19,13 @@ pub const DEFAULT_RENEWAL_SECONDS: u64 = 20;
 pub const DEFAULT_RETRY_BUDGET: u32 = 3;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECONDS: u64 = 600;
 
+/// Reserved, well-formed v4 Mission identity used as the event scope for
+/// process-level events with no single Mission owner (currently
+/// `routine.updated` / `routine.deleted` / `routine.error`). It is not a
+/// `missions` row and must never be scheduled or queried as a normal Mission.
+/// See ADR 0006.
+pub const SYSTEM_SCOPE_MISSION_ID: &str = "m_00000000-0000-4000-8000-000000000000";
+
 pub const ID_PREFIXES: [&str; 13] = [
     "m_", "r_", "n_", "a_", "tn_", "e_", "tc_", "ap_", "f_", "prj_", "tr_", "hd_", "rt_",
 ];
@@ -1296,6 +1303,14 @@ mod tests {
 
         let error = RoutineId::parse(&format!("m_{UUID_V4}")).expect_err("wrong prefix");
         assert_eq!(error.code(), "invalid_id");
+    }
+
+    #[test]
+    fn system_scope_mission_id_is_valid_v4() {
+        let mission = MissionId::parse(SYSTEM_SCOPE_MISSION_ID).expect("valid system scope id");
+        assert_eq!(mission.to_string(), SYSTEM_SCOPE_MISSION_ID);
+        assert_eq!(mission.prefix(), IdPrefix::Mission);
+        assert_eq!(mission.as_uuid().get_version_num(), 4);
     }
 
     #[test]
