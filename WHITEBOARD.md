@@ -46,7 +46,7 @@
 | H03 | H03 实施对话（pro 429，改 `auto/deepseek-v4.1-flash`） | `crates/hive-policy`、`crates/hive-tools`、migration V2 | `work/wt-h03`，`codex/h03-tools` | done, merged |
 | H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，`codex/h07-gateway` | done, merged |
 | H03b-1 | 可见对话 `01a20875-6db0-7561-ad50-2053e7832da2`（pro high） | `crates/hive-tools` 的 `shell.run`、`hive-policy` 程序/参数策略、测试 | `.codex/worktrees/ed04/Hive`，基线 `e720968` | in_progress |
-| H09a | 可见对话（worktree 创建中，pro high） | V5 budgets、原子扣减、budget_exceeded、启动恢复扫描 | 新 worktree，基线 `46d381d` | in_progress |
+| H09a | 可见对话 `01a20877-15e5-7ad0-a650-eb3df9f9e3b3`（pro high） | V5 budgets、原子扣减、budget_exceeded、启动恢复扫描 | `.codex/worktrees/b2fb/Hive`，基线 `46d381d` | in_progress |
 | H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
 | H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | done, merged |
 | H05b | 可见对话 `01a207e0-8bd5-7ff1-8247-78c2156c82f3`（pro） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、语义收紧 | `.codex/worktrees/36e0/Hive` | done, merged |
