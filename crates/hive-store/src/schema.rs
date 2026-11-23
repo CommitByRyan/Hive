@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::{StoreError, StoreResult};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 pub const BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub fn apply_pragmas(conn: &Connection) -> StoreResult<()> {
@@ -36,6 +36,7 @@ fn apply_migration(conn: &Connection, target: i64) -> StoreResult<()> {
         2 => conn.execute_batch(V2_SCHEMA)?,
         3 => conn.execute_batch(V3_SCHEMA)?,
         4 => conn.execute_batch(V4_SCHEMA)?,
+        5 => conn.execute_batch(V5_SCHEMA)?,
         other => {
             return Err(StoreError::Conflict(format!(
                 "unknown migration version {other}"
@@ -251,4 +252,19 @@ CREATE TABLE handoffs (
     UNIQUE (node_id, attempt_no)
 );
 CREATE INDEX idx_handoffs_mission ON handoffs(mission_id, created_at_ms);
+"#;
+
+pub(crate) const V5_SCHEMA: &str = r#"
+CREATE TABLE budgets (
+    scope_kind    TEXT NOT NULL CHECK (scope_kind IN ('mission','run','node')),
+    scope_id      TEXT NOT NULL,
+    dimension     TEXT NOT NULL CHECK (dimension IN ('tokens','cost','requests','tool_calls','wall_ms')),
+    currency      TEXT,
+    hard_limit    INTEGER,
+    soft_limit    INTEGER,
+    consumed      INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (scope_kind, scope_id, dimension)
+);
+CREATE INDEX idx_budgets_scope ON budgets(scope_kind, scope_id);
 "#;

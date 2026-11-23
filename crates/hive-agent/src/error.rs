@@ -19,4 +19,6 @@ pub enum AgentError {
     },
     #[error("model returned no content and no tool calls")]
     EmptyResponse,
+    #[error("budget exceeded for {dimension}")]
+    BudgetExceeded { dimension: String },
 }

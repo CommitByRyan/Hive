@@ -668,7 +668,7 @@ impl NodeState {
                 )
                 | (
                     Self::WaitingApproval,
-                    Self::Running | Self::Failed | Self::Cancelled
+                    Self::Running | Self::NeedsRecovery | Self::Failed | Self::Cancelled
                 )
                 | (
                     Self::NeedsRecovery,
@@ -778,6 +778,7 @@ pub enum EventKind {
     NodeToolResult,
     NodeApprovalRequested,
     NodeApprovalDecided,
+    NodeNeedsRecovery,
     NodeSucceeded,
     NodeFailed,
     NodeBudgetExceeded,
@@ -816,6 +817,7 @@ impl EventKind {
             Self::NodeToolResult => "node.tool_result",
             Self::NodeApprovalRequested => "node.approval_requested",
             Self::NodeApprovalDecided => "node.approval_decided",
+            Self::NodeNeedsRecovery => "node.needs_recovery",
             Self::NodeSucceeded => "node.succeeded",
             Self::NodeFailed => "node.failed",
             Self::NodeBudgetExceeded => "node.budget_exceeded",
@@ -854,6 +856,7 @@ impl EventKind {
             "node.tool_result" => Ok(Self::NodeToolResult),
             "node.approval_requested" => Ok(Self::NodeApprovalRequested),
             "node.approval_decided" => Ok(Self::NodeApprovalDecided),
+            "node.needs_recovery" => Ok(Self::NodeNeedsRecovery),
             "node.succeeded" => Ok(Self::NodeSucceeded),
             "node.failed" => Ok(Self::NodeFailed),
             "node.budget_exceeded" => Ok(Self::NodeBudgetExceeded),
@@ -1142,6 +1145,12 @@ mod tests {
                 .expect("valid"),
             NodeState::FailedFinal
         );
+        assert_eq!(
+            NodeState::WaitingApproval
+                .transition(NodeState::NeedsRecovery)
+                .expect("valid"),
+            NodeState::NeedsRecovery
+        );
         assert!(NodeState::Succeeded.transition(NodeState::Running).is_err());
         assert!(NodeState::FailedFinal.is_terminal());
     }
@@ -1420,6 +1429,7 @@ mod tests {
         for (kind, value) in [
             (EventKind::NodeToolStarted, "node.tool_started"),
             (EventKind::NodeBudgetExceeded, "node.budget_exceeded"),
+            (EventKind::NodeNeedsRecovery, "node.needs_recovery"),
             (EventKind::ModelRetry, "model.retry"),
             (EventKind::ModelFallback, "model.fallback"),
         ] {

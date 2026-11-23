@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AgentSessionRecord, AgentSessionState, ApprovalDecision, ApprovalInput, ApprovalRecord,
-    ArtifactRecord, HandoffRecord, LeaseGuard, MissionAggregate, MissionListRecord, MissionRecord,
-    MissionSnapshotRecord, NewAgentSession, NewTurnUsage, NodeRecord, RunRecord, SnapshotInput,
+    ArtifactRecord, BudgetDimension, BudgetLimits, BudgetRecord, BudgetSummary, HandoffRecord,
+    LeaseGuard, MissionAggregate, MissionListRecord, MissionRecord, MissionSnapshotRecord,
+    NewAgentSession, NewTurnUsage, NodeRecord, RunRecord, SideEffectState, SnapshotInput,
     SnapshotRecord, StateSnapshotRecord, ToolAuditRecord, TurnRecord, TurnState, TurnUsageRecord,
     UsageSource,
 };
@@ -1096,7 +1097,10 @@ impl Store {
         if turn_index == 0 {
             return Err(StoreError::Conflict("turn index starts at 1".to_owned()));
         }
-        let session = query_agent_session(&self.conn, session_id)?
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = query_agent_session(&tx, session_id)?
             .ok_or_else(|| StoreError::NotFound(format!("session {session_id}")))?;
         if session.node_id != node_id {
             return Err(StoreError::Conflict(format!(
@@ -1104,6 +1108,14 @@ impl Store {
                 session.node_id
             )));
         }
+        deduct_budget_on(
+            &tx,
+            "node",
+            &node_id.to_string(),
+            BudgetDimension::Requests,
+            1,
+            now_ms,
+        )?;
         let record = TurnRecord {
             turn_id: TurnId::new(),
             session_id,
@@ -1118,7 +1130,7 @@ impl Store {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO turns (turn_id, session_id, node_id, attempt_no, turn_index, request_model, finish_reason, state, output_preview, tool_call_count, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, '', 0, ?8, ?8)",
             params![
                 record.turn_id.to_string(),
@@ -1131,6 +1143,7 @@ impl Store {
                 now_ms,
             ],
         )?;
+        tx.commit()?;
         Ok(record)
     }
 
@@ -1172,12 +1185,15 @@ impl Store {
         usage: &NewTurnUsage,
         now_ms: i64,
     ) -> StoreResult<TurnUsageRecord> {
-        let turn = query_turn(&self.conn, turn_id)?
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let turn = query_turn(&tx, turn_id)?
             .ok_or_else(|| StoreError::NotFound(format!("turn {turn_id}")))?;
         let prompt_tokens = to_sql_integer(usage.prompt_tokens)?;
         let completion_tokens = to_sql_integer(usage.completion_tokens)?;
         let total_tokens = to_sql_integer(usage.total_tokens)?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO turn_usage (turn_id, session_id, prompt_tokens, completion_tokens, total_tokens, source, request_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 turn_id.to_string(),
@@ -1190,6 +1206,39 @@ impl Store {
                 now_ms,
             ],
         )?;
+        // Gateway-internal retries reuse the same `request_id`, so the budget
+        // counters must be idempotent: a repeated request_id still records the
+        // usage fact but does not re-consume tokens/cost.
+        let already_counted = match usage.request_id.as_deref() {
+            Some(request_id) if !request_id.is_empty() => tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM turn_usage WHERE request_id = ?1 AND turn_id != ?2)",
+                params![request_id, turn_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )?,
+            _ => false,
+        };
+        if !already_counted {
+            deduct_budget_on(
+                &tx,
+                "node",
+                &turn.node_id.to_string(),
+                BudgetDimension::Tokens,
+                total_tokens,
+                now_ms,
+            )?;
+            // Minimal placeholder: no per-model unit price is configured yet,
+            // so cost is settled as 1 currency unit per token when a cost
+            // budget row exists. Documented in the H09a handoff.
+            deduct_budget_on(
+                &tx,
+                "node",
+                &turn.node_id.to_string(),
+                BudgetDimension::Cost,
+                total_tokens,
+                now_ms,
+            )?;
+        }
+        tx.commit()?;
         Ok(TurnUsageRecord {
             turn_id,
             session_id: turn.session_id,
@@ -1258,6 +1307,596 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             out.push(parse_turn(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Create or update a budget allocation row without touching `consumed`.
+    pub fn set_budget(
+        &mut self,
+        scope_kind: &str,
+        scope_id: &str,
+        dimension: BudgetDimension,
+        currency: Option<&str>,
+        limits: BudgetLimits,
+        now_ms: i64,
+    ) -> StoreResult<BudgetRecord> {
+        if limits.hard_limit.is_some_and(|limit| limit < 0)
+            || limits.soft_limit.is_some_and(|limit| limit < 0)
+        {
+            return Err(StoreError::Conflict(
+                "budget limits must be non-negative".to_owned(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO budgets (scope_kind, scope_id, dimension, currency, hard_limit, soft_limit, consumed, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+             ON CONFLICT(scope_kind, scope_id, dimension) DO UPDATE SET currency = excluded.currency, hard_limit = excluded.hard_limit, soft_limit = excluded.soft_limit, updated_at_ms = excluded.updated_at_ms",
+            params![
+                scope_kind,
+                scope_id,
+                dimension.as_str(),
+                currency,
+                limits.hard_limit,
+                limits.soft_limit,
+                now_ms
+            ],
+        )?;
+        self.get_budget(scope_kind, scope_id, dimension)?
+            .ok_or_else(|| StoreError::Conflict("budget insert failed".to_owned()))
+    }
+
+    pub fn get_budget(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        dimension: BudgetDimension,
+    ) -> StoreResult<Option<BudgetRecord>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT scope_kind, scope_id, dimension, currency, hard_limit, soft_limit, consumed, updated_at_ms FROM budgets WHERE scope_kind = ?1 AND scope_id = ?2 AND dimension = ?3",
+                params![scope_kind, scope_id, dimension.as_str()],
+                |row| {
+                    Ok(BudgetRecord {
+                        scope_kind: row.get(0)?,
+                        scope_id: row.get(1)?,
+                        dimension: row.get(2)?,
+                        currency: row.get(3)?,
+                        hard_limit: row.get(4)?,
+                        soft_limit: row.get(5)?,
+                        consumed: row.get(6)?,
+                        updated_at_ms: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Remaining hard budget for a node dimension. `None` means unlimited
+    /// (either no row or no hard limit); `Some(0)` means exhausted.
+    pub fn budget_remaining(
+        &self,
+        node_id: NodeId,
+        dimension: BudgetDimension,
+    ) -> StoreResult<Option<i64>> {
+        let row: Option<(Option<i64>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT hard_limit, consumed FROM budgets WHERE scope_kind = 'node' AND scope_id = ?1 AND dimension = ?2",
+                params![node_id.to_string(), dimension.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(limit, consumed)| limit.map(|limit| limit - consumed)))
+    }
+
+    /// Append a tool lifecycle event and, in the same transaction, maintain
+    /// the `tool_calls` fact row and the `tool_calls` budget counter.
+    ///
+    /// The first `node.tool_call` (intent) deducts one `tool_calls` unit and
+    /// inserts the fact row; `node.tool_started` and `node.tool_result` only
+    /// advance the fact row state. A budget overrun rolls the whole
+    /// transaction back and returns [`StoreError::BudgetExceeded`].
+    pub fn append_tool_event(
+        &mut self,
+        node_id: NodeId,
+        guard: &LeaseGuard,
+        event: &EventInput,
+        now_ms: i64,
+    ) -> StoreResult<EventEnvelope> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.attempt_no != guard.attempt_no
+            || current.lease_token.as_ref() != Some(&guard.lease_token)
+        {
+            return Err(StoreError::StaleExecution);
+        }
+        if current.state.is_terminal() {
+            return Err(StoreError::StaleExecution);
+        }
+        if let Some(event_node) = event.node_id {
+            if event_node != node_id {
+                return Err(StoreError::Conflict(format!(
+                    "event node {event_node} does not match {node_id}"
+                )));
+            }
+        }
+        if let Some(event_attempt) = event.attempt_no {
+            if event_attempt != guard.attempt_no {
+                return Err(StoreError::Conflict(
+                    "event attempt_no does not match lease guard".to_owned(),
+                ));
+            }
+        }
+
+        match event.kind {
+            EventKind::NodeToolCall => {
+                let (tool_call_id, tool_name, tool_version, request_hash) =
+                    tool_event_fields(event)?;
+                deduct_budget_on(
+                    &tx,
+                    "node",
+                    &node_id.to_string(),
+                    BudgetDimension::ToolCalls,
+                    1,
+                    now_ms,
+                )?;
+                tx.execute(
+                    "INSERT INTO tool_calls (tool_call_id, mission_id, run_id, node_id, session_id, tool_name, tool_version, request_hash, attempt_no, lease_token, state, summary, truncated, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'intent', '', 0, ?11, ?11)",
+                    params![
+                        tool_call_id,
+                        event.mission_id.to_string(),
+                        event.run_id.map(|id| id.to_string()),
+                        node_id.to_string(),
+                        event.session_id.map(|id| id.to_string()),
+                        tool_name,
+                        tool_version,
+                        request_hash,
+                        guard.attempt_no.get(),
+                        guard.lease_token.as_str(),
+                        now_ms,
+                    ],
+                )?;
+            }
+            EventKind::NodeToolStarted => {
+                let tool_call_id = tool_call_id_from(event)?;
+                tx.execute(
+                    "UPDATE tool_calls SET state = 'started', updated_at_ms = ?1 WHERE tool_call_id = ?2 AND node_id = ?3",
+                    params![now_ms, tool_call_id, node_id.to_string()],
+                )?;
+            }
+            EventKind::NodeToolResult => {
+                let tool_call_id = tool_call_id_from(event)?;
+                let status = event
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("ok");
+                let state = if status == "ok" {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let summary = event
+                    .payload
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let truncated = event
+                    .payload
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                tx.execute(
+                    "UPDATE tool_calls SET state = ?1, summary = ?2, truncated = ?3, updated_at_ms = ?4 WHERE tool_call_id = ?5 AND node_id = ?6",
+                    params![state, summary, truncated as i64, now_ms, tool_call_id, node_id.to_string()],
+                )?;
+            }
+            _ => {}
+        }
+
+        let envelope = insert_event(&tx, event)?;
+        tx.commit()?;
+        Ok(envelope)
+    }
+
+    /// Side-effect states of one attempt, read from the `tool_calls` facts.
+    pub fn side_effect_states(
+        &self,
+        node_id: NodeId,
+        attempt_no: AttemptNo,
+    ) -> StoreResult<Vec<SideEffectState>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state FROM tool_calls WHERE node_id = ?1 AND attempt_no = ?2")?;
+        let rows = stmt.query_map(params![node_id.to_string(), attempt_no.get()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            match row?.as_str() {
+                "intent" => out.push(SideEffectState::Intent),
+                "started" => out.push(SideEffectState::Started),
+                "completed" => out.push(SideEffectState::Completed),
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn find_active_leases(&self) -> StoreResult<Vec<NodeRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {NODE_COLUMNS} FROM nodes WHERE state IN ('leased', 'running') ORDER BY node_id"
+        ))?;
+        let rows = stmt.query_map([], raw_node_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(parse_node(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Unconditionally revoke every surviving lease on startup: `leased ->
+    /// ready` (attempt unchanged, emits `node.ready`) and `running ->
+    /// needs_recovery` (emits `node.needs_recovery`). Idempotent: re-running
+    /// finds no active leases.
+    pub fn revoke_all_active_leases(&mut self, now_ms: i64) -> StoreResult<Vec<NodeRecord>> {
+        let active = self.find_active_leases()?;
+        let mut out = Vec::with_capacity(active.len());
+        for node in active {
+            let (next_state, kind, reason) = match node.state {
+                NodeState::Leased => (NodeState::Ready, EventKind::NodeReady, None),
+                NodeState::Running => (
+                    NodeState::NeedsRecovery,
+                    EventKind::NodeNeedsRecovery,
+                    Some("lease_revoked_on_startup"),
+                ),
+                _ => continue,
+            };
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let validated = node.state.transition(next_state)?;
+            tx.execute(
+                "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+                params![validated.as_str(), now_ms, node.node_id.to_string()],
+            )?;
+            let payload = match reason {
+                Some(reason) => serde_json::json!({
+                    "reason": reason,
+                    "last_state": node.state.as_str(),
+                }),
+                None => serde_json::json!({}),
+            };
+            let event = EventInput {
+                event_id: EventId::new(),
+                kind,
+                mission_id: node.mission_id,
+                run_id: Some(node.run_id),
+                node_id: Some(node.node_id),
+                session_id: None,
+                attempt_no: Some(node.attempt_no),
+                trace_id: None,
+                payload,
+            };
+            insert_event(&tx, &event)?;
+            tx.commit()?;
+            out.push(query_node(&self.conn, node.node_id)?.expect("node exists"));
+        }
+        Ok(out)
+    }
+
+    pub fn find_waiting_approval_nodes(&self) -> StoreResult<Vec<NodeRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {NODE_COLUMNS} FROM nodes WHERE state = 'waiting_approval' ORDER BY node_id"
+        ))?;
+        let rows = stmt.query_map([], raw_node_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(parse_node(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Fail-closed orphan approval handling: pending or approved-but-unconsumed
+    /// approvals for a node are expired (`decided_by=recovery`,
+    /// `decision_note=owner_lost`) and each emits `node.approval_decided`.
+    pub fn expire_node_approvals(
+        &mut self,
+        node_id: NodeId,
+        now_ms: i64,
+    ) -> StoreResult<Vec<ApprovalRecord>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidates: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT approval_id FROM approvals WHERE node_id = ?1 AND (state = 'pending' OR (state = 'approved' AND consumed_at_ms IS NULL)) ORDER BY created_at_ms ASC",
+            )?;
+            let rows =
+                stmt.query_map(params![node_id.to_string()], |row| row.get::<_, String>(0))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?);
+            }
+            ids
+        };
+        let mut out = Vec::new();
+        for id in candidates {
+            let affected = tx.execute(
+                "UPDATE approvals SET state = 'expired', decided_at_ms = ?1, decided_by = 'recovery', decision_note = 'owner_lost' WHERE approval_id = ?2 AND (state = 'pending' OR (state = 'approved' AND consumed_at_ms IS NULL))",
+                params![now_ms, &id],
+            )?;
+            if affected == 1 {
+                let approval =
+                    query_approval(&tx, ApprovalId::parse(&id)?)?.expect("approval exists");
+                let event = EventInput {
+                    event_id: EventId::new(),
+                    kind: EventKind::NodeApprovalDecided,
+                    mission_id: approval.mission_id,
+                    run_id: approval.run_id,
+                    node_id: Some(approval.node_id),
+                    session_id: approval.session_id,
+                    attempt_no: Some(approval.attempt_no),
+                    trace_id: None,
+                    payload: serde_json::json!({
+                        "decision": "expired",
+                        "reason": "owner_lost",
+                        "approval_id": approval.approval_id.to_string(),
+                        "tool_name": approval.tool_name,
+                    }),
+                };
+                insert_event(&tx, &event)?;
+                out.push(approval);
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// `waiting_approval -> failed` with reason `approval_orphaned`, emitting
+    /// `node.failed` in the same transaction.
+    pub fn fail_waiting_approval_orphaned(
+        &mut self,
+        node_id: NodeId,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, EventEnvelope)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let node = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if node.state != NodeState::WaitingApproval {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is {}, expected waiting_approval",
+                node.state
+            )));
+        }
+        let next = node.state.transition(NodeState::Failed)?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+            params![next.as_str(), now_ms, node_id.to_string()],
+        )?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeFailed,
+            mission_id: node.mission_id,
+            run_id: Some(node.run_id),
+            node_id: Some(node.node_id),
+            session_id: None,
+            attempt_no: Some(node.attempt_no),
+            trace_id: None,
+            payload: serde_json::json!({ "reason": "approval_orphaned" }),
+        };
+        let envelope = insert_event(&tx, &event)?;
+        tx.commit()?;
+        let node = query_node(&self.conn, node_id)?.expect("node was just updated");
+        Ok((node, envelope))
+    }
+
+    /// `waiting_approval -> needs_recovery`, emitting `node.needs_recovery`.
+    pub fn transition_waiting_approval_to_needs_recovery(
+        &mut self,
+        node_id: NodeId,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, EventEnvelope)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let node = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if node.state != NodeState::WaitingApproval {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is {}, expected waiting_approval",
+                node.state
+            )));
+        }
+        let next = node.state.transition(NodeState::NeedsRecovery)?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+            params![next.as_str(), now_ms, node_id.to_string()],
+        )?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeNeedsRecovery,
+            mission_id: node.mission_id,
+            run_id: Some(node.run_id),
+            node_id: Some(node.node_id),
+            session_id: None,
+            attempt_no: Some(node.attempt_no),
+            trace_id: None,
+            payload: serde_json::json!({
+                "reason": "approval_orphaned",
+                "last_state": "waiting_approval",
+            }),
+        };
+        let envelope = insert_event(&tx, &event)?;
+        tx.commit()?;
+        let node = query_node(&self.conn, node_id)?.expect("node was just updated");
+        Ok((node, envelope))
+    }
+
+    /// `needs_recovery -> ready` (attempt + 1) with a `node.ready` event, for
+    /// the automatic safe-retry arm of startup recovery.
+    pub fn retry_needs_recovery_and_emit(
+        &mut self,
+        node_id: NodeId,
+        now_ms: i64,
+    ) -> StoreResult<(NodeRecord, EventEnvelope)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_node(&tx, node_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+        if current.state != NodeState::NeedsRecovery {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is {}, expected needs_recovery",
+                current.state
+            )));
+        }
+        let next_state = NodeState::NeedsRecovery.transition(NodeState::Ready)?;
+        let next_attempt = current
+            .attempt_no
+            .checked_next()
+            .ok_or_else(|| StoreError::Conflict("attempt number exhausted".to_owned()))?;
+        tx.execute(
+            "UPDATE nodes SET state = ?1, attempt_no = ?2, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3 WHERE node_id = ?4",
+            params![next_state.as_str(), next_attempt.get(), now_ms, node_id.to_string()],
+        )?;
+        let event = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeReady,
+            mission_id: current.mission_id,
+            run_id: Some(current.run_id),
+            node_id: Some(current.node_id),
+            session_id: None,
+            attempt_no: Some(next_attempt),
+            trace_id: None,
+            payload: serde_json::json!({}),
+        };
+        let envelope = insert_event(&tx, &event)?;
+        tx.commit()?;
+        let node = query_node(&self.conn, node_id)?.expect("node was just updated");
+        Ok((node, envelope))
+    }
+
+    /// Defensive `retry_ready -> ready` normalization. `retry_ready` is a
+    /// transient mid-transaction state and should never persist; if it does,
+    /// re-emit `node.ready` and return the node to the runnable pool.
+    pub fn normalize_retry_ready(&mut self, now_ms: i64) -> StoreResult<Vec<NodeRecord>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidates: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT node_id FROM nodes WHERE state = 'retry_ready'")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?);
+            }
+            ids
+        };
+        let mut out = Vec::new();
+        for id in candidates {
+            let node_id = NodeId::parse(&id)?;
+            let node = query_node(&tx, node_id)?.expect("node exists");
+            let next = node.state.transition(NodeState::Ready)?;
+            tx.execute(
+                "UPDATE nodes SET state = ?1, lease_token = NULL, lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2 WHERE node_id = ?3",
+                params![next.as_str(), now_ms, id],
+            )?;
+            let event = EventInput {
+                event_id: EventId::new(),
+                kind: EventKind::NodeReady,
+                mission_id: node.mission_id,
+                run_id: Some(node.run_id),
+                node_id: Some(node.node_id),
+                session_id: None,
+                attempt_no: Some(node.attempt_no),
+                trace_id: None,
+                payload: serde_json::json!({}),
+            };
+            insert_event(&tx, &event)?;
+            out.push(query_node(&tx, node_id)?.expect("node exists"));
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Rebuild every node-level `consumed` counter from the fact tables.
+    /// Idempotent and never touches node states, so a historical
+    /// `budget_exceeded` node keeps its terminal state.
+    pub fn rebuild_budget_counters(&mut self, now_ms: i64) -> StoreResult<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT scope_id, dimension FROM budgets WHERE scope_kind = 'node' ORDER BY scope_id, dimension",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            out
+        };
+        for (scope_id, dimension) in rows {
+            let consumed: i64 = match dimension.as_str() {
+                "tokens" | "cost" => tx.query_row(
+                    "SELECT COALESCE(SUM(tu.total_tokens), 0) FROM turn_usage tu JOIN turns t ON tu.turn_id = t.turn_id WHERE t.node_id = ?1",
+                    params![&scope_id],
+                    |row| row.get(0),
+                )?,
+                "requests" => tx.query_row(
+                    "SELECT COUNT(*) FROM turns WHERE node_id = ?1",
+                    params![&scope_id],
+                    |row| row.get(0),
+                )?,
+                "tool_calls" => tx.query_row(
+                    "SELECT COUNT(*) FROM tool_calls WHERE node_id = ?1",
+                    params![&scope_id],
+                    |row| row.get(0),
+                )?,
+                _ => continue,
+            };
+            tx.execute(
+                "UPDATE budgets SET consumed = ?1, updated_at_ms = ?2 WHERE scope_kind = 'node' AND scope_id = ?3 AND dimension = ?4",
+                params![consumed, now_ms, &scope_id, &dimension],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read-only budget summaries for one node (no keys, base URLs or prices).
+    pub fn node_budget_summaries(&self, node_id: NodeId) -> StoreResult<Vec<BudgetSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dimension, consumed, hard_limit FROM budgets WHERE scope_kind = 'node' AND scope_id = ?1 ORDER BY dimension",
+        )?;
+        let rows = stmt.query_map(params![node_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (dimension, consumed, hard_limit) = row?;
+            out.push(BudgetSummary {
+                node_id,
+                dimension,
+                consumed,
+                hard_limit,
+                remaining: hard_limit.map(|limit| limit - consumed),
+            });
         }
         Ok(out)
     }
@@ -2352,6 +2991,70 @@ fn update_node_state_on(
     query_node(conn, node_id).map(|record| record.expect("node was just updated"))
 }
 
+/// Atomic budget deduction. A missing row means "no allocation" (unlimited, no
+/// tracking) and succeeds; an existing row applies the CAS guard
+/// `consumed + delta <= hard_limit` and returns [`StoreError::BudgetExceeded`]
+/// when the hard limit would be crossed.
+fn deduct_budget_on(
+    conn: &Connection,
+    scope_kind: &str,
+    scope_id: &str,
+    dimension: BudgetDimension,
+    delta: i64,
+    now_ms: i64,
+) -> StoreResult<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM budgets WHERE scope_kind = ?1 AND scope_id = ?2 AND dimension = ?3)",
+        params![scope_kind, scope_id, dimension.as_str()],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    let affected = conn.execute(
+        "UPDATE budgets SET consumed = consumed + ?1, updated_at_ms = ?2 WHERE scope_kind = ?3 AND scope_id = ?4 AND dimension = ?5 AND (hard_limit IS NULL OR consumed + ?1 <= hard_limit)",
+        params![delta, now_ms, scope_kind, scope_id, dimension.as_str()],
+    )?;
+    if affected == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::BudgetExceeded {
+            dimension: dimension.as_str().to_owned(),
+        })
+    }
+}
+
+fn tool_event_fields(event: &EventInput) -> StoreResult<(String, String, u32, String)> {
+    let tool_call_id = tool_call_id_from(event)?;
+    let tool_name = event
+        .payload
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| StoreError::Conflict("tool event missing tool_name".to_owned()))?
+        .to_owned();
+    let tool_version = event
+        .payload
+        .get("tool_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as u32;
+    let request_hash = event
+        .payload
+        .get("request_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Ok((tool_call_id, tool_name, tool_version, request_hash))
+}
+
+fn tool_call_id_from(event: &EventInput) -> StoreResult<String> {
+    event
+        .payload
+        .get("tool_call_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| StoreError::Conflict("tool event missing tool_call_id".to_owned()))
+}
+
 fn insert_event(conn: &Connection, input: &EventInput) -> StoreResult<EventEnvelope> {
     let created_at = now_rfc3339();
     let created_at_ms = now_ms();
@@ -2491,8 +3194,9 @@ mod tests {
     use super::Store;
     use crate::error::StoreError;
     use crate::records::{
-        can_retry, AgentSessionState, ApprovalDecision, ApprovalInput, LeaseGuard, MissionRecord,
-        NewTurnUsage, NodeRecord, RunRecord, SnapshotInput, TurnState, UsageSource,
+        can_retry, AgentSessionState, ApprovalDecision, ApprovalInput, BudgetDimension,
+        BudgetLimits, LeaseGuard, MissionRecord, NewAgentSession, NewTurnUsage, NodeRecord,
+        RunRecord, SnapshotInput, TurnState, UsageSource,
     };
     use crate::schema::{BUSY_TIMEOUT_MS, SCHEMA_VERSION, V1_SCHEMA};
     use crate::{MAX_SEQ, SNAPSHOT_SCHEMA_VERSION};
@@ -3191,23 +3895,23 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_v4_tables() {
+    fn fresh_database_has_v5_tables() {
         let store = Store::open_in_memory().expect("store");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs','budgets')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 7);
+        assert_eq!(tables, 8);
     }
 
     #[test]
-    fn v1_database_migrates_to_v4_and_preserves_rows() {
-        let dir = TempDir::new("v1-to-v4");
+    fn v1_database_migrates_to_v5_and_preserves_rows() {
+        let dir = TempDir::new("v1-to-v5");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
 
@@ -3223,7 +3927,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         let mission = store
             .get_mission(mission_id)
             .expect("mission")
@@ -3232,19 +3936,19 @@ mod tests {
         let tables: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tool_calls','artifacts','tool_audit','agent_sessions','turns','turn_usage','handoffs','budgets')",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(tables, 7);
+        assert_eq!(tables, 8);
     }
 
     #[test]
-    fn v2_database_migrates_to_v4_and_preserves_rows() {
+    fn v2_database_migrates_to_v5_and_preserves_rows() {
         use crate::schema::V2_SCHEMA;
 
-        let dir = TempDir::new("v2-to-v4");
+        let dir = TempDir::new("v2-to-v5");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
         let run_id = RunId::new();
@@ -3284,7 +3988,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         assert_eq!(
             store
                 .get_mission(mission_id)
@@ -3310,10 +4014,10 @@ mod tests {
     }
 
     #[test]
-    fn v3_database_migrates_to_v4_and_preserves_rows() {
+    fn v3_database_migrates_to_v5_and_preserves_rows() {
         use crate::schema::{V2_SCHEMA, V3_SCHEMA};
 
-        let dir = TempDir::new("v3-to-v4");
+        let dir = TempDir::new("v3-to-v5");
         let path = dir.path().join("hive.db");
         let mission_id = MissionId::new();
         let run_id = RunId::new();
@@ -3354,7 +4058,7 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("migrate");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         assert_eq!(
             store
                 .get_mission(mission_id)
@@ -3373,6 +4077,57 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM handoffs", [], |row| row.get(0))
             .expect("handoffs");
         assert_eq!(handoffs, 0);
+    }
+
+    #[test]
+    fn v4_database_migrates_to_v5_and_preserves_rows() {
+        use crate::schema::{V2_SCHEMA, V3_SCHEMA, V4_SCHEMA};
+
+        let dir = TempDir::new("v4-to-v5");
+        let path = dir.path().join("hive.db");
+        let mission_id = MissionId::new();
+        let run_id = RunId::new();
+        let node_id = NodeId::new();
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw conn");
+            conn.execute_batch(V1_SCHEMA).expect("v1");
+            conn.execute_batch(V2_SCHEMA).expect("v2");
+            conn.execute_batch(V3_SCHEMA).expect("v3");
+            conn.execute_batch(V4_SCHEMA).expect("v4");
+            conn.execute(
+                "INSERT INTO missions (mission_id, state, title, goal, created_at_ms, updated_at_ms) VALUES (?1, 'running', 'kept', 'goal', 1, 1)",
+                rusqlite::params![mission_id.to_string()],
+            )
+            .expect("mission");
+            conn.execute(
+                "INSERT INTO runs (run_id, mission_id, state, created_at_ms, updated_at_ms) VALUES (?1, ?2, 'running', 1, 1)",
+                rusqlite::params![run_id.to_string(), mission_id.to_string()],
+            )
+            .expect("run");
+            conn.execute(
+                "INSERT INTO nodes (node_id, mission_id, run_id, state, attempt_no, retry_budget, lease_token, lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, 'running', 1, 3, NULL, NULL, NULL, 1, 1)",
+                rusqlite::params![node_id.to_string(), mission_id.to_string(), run_id.to_string()],
+            )
+            .expect("node");
+            conn.pragma_update(None, "user_version", 4).expect("set v4");
+        }
+
+        let store = Store::open(&path).expect("migrate");
+        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(
+            store
+                .get_mission(mission_id)
+                .expect("mission")
+                .expect("preserved")
+                .title,
+            "kept"
+        );
+        let budgets: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM budgets", [], |row| row.get(0))
+            .expect("budgets");
+        assert_eq!(budgets, 0);
     }
 
     #[test]
@@ -3656,5 +4411,425 @@ mod tests {
             )
             .expect("tamper");
         assert!(!store.verify_tool_audit_chain().expect("verify tampered"));
+    }
+
+    #[test]
+    fn budget_request_id_is_idempotent() {
+        let (mut store, mission, run, node) = setup();
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let session = store
+            .create_agent_session(&NewAgentSession {
+                mission_id: mission.mission_id,
+                run_id: Some(run.run_id),
+                node_id: node.node_id,
+                role: "worker",
+                model: "auto/auto",
+                system_prompt: "",
+                now_ms: 0,
+            })
+            .expect("session");
+        store
+            .set_budget(
+                "node",
+                &node.node_id.to_string(),
+                BudgetDimension::Tokens,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(100),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("budget");
+        let usage = NewTurnUsage {
+            prompt_tokens: 5,
+            completion_tokens: 5,
+            total_tokens: 10,
+            source: UsageSource::Authoritative,
+            request_id: Some("req-1".to_owned()),
+        };
+        let turn1 = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                1,
+                "auto/auto",
+                0,
+            )
+            .expect("turn1");
+        store
+            .record_turn_usage(turn1.turn_id, &usage, 0)
+            .expect("usage1");
+        let turn2 = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                2,
+                "auto/auto",
+                0,
+            )
+            .expect("turn2");
+        store
+            .record_turn_usage(turn2.turn_id, &usage, 0)
+            .expect("usage2");
+        let budget = store
+            .get_budget("node", &node.node_id.to_string(), BudgetDimension::Tokens)
+            .expect("get")
+            .expect("present");
+        assert_eq!(budget.consumed, 10);
+    }
+
+    #[test]
+    fn budget_deduct_rejects_over_limit_without_modifying_row() {
+        let (mut store, mission, run, node) = setup();
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let session = store
+            .create_agent_session(&NewAgentSession {
+                mission_id: mission.mission_id,
+                run_id: Some(run.run_id),
+                node_id: node.node_id,
+                role: "worker",
+                model: "auto/auto",
+                system_prompt: "",
+                now_ms: 0,
+            })
+            .expect("session");
+        store
+            .set_budget(
+                "node",
+                &node.node_id.to_string(),
+                BudgetDimension::Tokens,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(15),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("budget");
+        let first = NewTurnUsage {
+            prompt_tokens: 5,
+            completion_tokens: 5,
+            total_tokens: 10,
+            source: UsageSource::Authoritative,
+            request_id: Some("req-a".to_owned()),
+        };
+        let second = NewTurnUsage {
+            prompt_tokens: 5,
+            completion_tokens: 5,
+            total_tokens: 10,
+            source: UsageSource::Authoritative,
+            request_id: Some("req-b".to_owned()),
+        };
+        let turn1 = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                1,
+                "auto/auto",
+                0,
+            )
+            .expect("turn1");
+        store
+            .record_turn_usage(turn1.turn_id, &first, 0)
+            .expect("first usage");
+        let turn2 = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                2,
+                "auto/auto",
+                0,
+            )
+            .expect("turn2");
+        let error = store
+            .record_turn_usage(turn2.turn_id, &second, 0)
+            .expect_err("over limit");
+        assert!(matches!(
+            error,
+            StoreError::BudgetExceeded { ref dimension } if dimension == "tokens"
+        ));
+        let budget = store
+            .get_budget("node", &node.node_id.to_string(), BudgetDimension::Tokens)
+            .expect("get")
+            .expect("present");
+        assert_eq!(budget.consumed, 10);
+    }
+
+    #[test]
+    fn rebuild_budget_counters_is_idempotent() {
+        let (mut store, mission, run, node) = setup();
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        store
+            .set_budget(
+                "node",
+                &node.node_id.to_string(),
+                BudgetDimension::Tokens,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(1000),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("tokens");
+        store
+            .set_budget(
+                "node",
+                &node.node_id.to_string(),
+                BudgetDimension::Requests,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(1000),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("requests");
+        store
+            .set_budget(
+                "node",
+                &node.node_id.to_string(),
+                BudgetDimension::ToolCalls,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(1000),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("tool calls");
+        let session = store
+            .create_agent_session(&NewAgentSession {
+                mission_id: mission.mission_id,
+                run_id: Some(run.run_id),
+                node_id: node.node_id,
+                role: "worker",
+                model: "auto/auto",
+                system_prompt: "",
+                now_ms: 0,
+            })
+            .expect("session");
+        let turn1 = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                1,
+                "auto/auto",
+                0,
+            )
+            .expect("turn1");
+        store
+            .record_turn_usage(
+                turn1.turn_id,
+                &NewTurnUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 4,
+                    total_tokens: 7,
+                    source: UsageSource::Authoritative,
+                    request_id: Some("r1".to_owned()),
+                },
+                0,
+            )
+            .expect("usage1");
+        let turn2 = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                2,
+                "auto/auto",
+                0,
+            )
+            .expect("turn2");
+        store
+            .record_turn_usage(
+                turn2.turn_id,
+                &NewTurnUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 6,
+                    total_tokens: 11,
+                    source: UsageSource::Authoritative,
+                    request_id: Some("r2".to_owned()),
+                },
+                0,
+            )
+            .expect("usage2");
+
+        let token = LeaseToken::generate();
+        store
+            .lease_node(node.node_id, &token, "exec", 1000, 0)
+            .expect("lease");
+        let leased = store.get_node(node.node_id).expect("get").expect("node");
+        let guard = LeaseGuard {
+            attempt_no: leased.attempt_no,
+            lease_token: token,
+        };
+        let tool = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeToolCall,
+            mission_id: mission.mission_id,
+            run_id: Some(run.run_id),
+            node_id: Some(node.node_id),
+            session_id: Some(session.session_id),
+            attempt_no: Some(AttemptNo::FIRST),
+            trace_id: None,
+            payload: serde_json::json!({
+                "tool_call_id": "tc_fact",
+                "tool_name": "fs.read",
+                "tool_version": 1,
+                "request_hash": "hash",
+            }),
+        };
+        store
+            .append_tool_event(node.node_id, &guard, &tool, 0)
+            .expect("tool");
+
+        store.rebuild_budget_counters(1).expect("rebuild 1");
+        store.rebuild_budget_counters(2).expect("rebuild 2");
+
+        assert_eq!(
+            store
+                .get_budget("node", &node.node_id.to_string(), BudgetDimension::Tokens)
+                .expect("get")
+                .expect("present")
+                .consumed,
+            18
+        );
+        assert_eq!(
+            store
+                .get_budget("node", &node.node_id.to_string(), BudgetDimension::Requests)
+                .expect("get")
+                .expect("present")
+                .consumed,
+            2
+        );
+        assert_eq!(
+            store
+                .get_budget(
+                    "node",
+                    &node.node_id.to_string(),
+                    BudgetDimension::ToolCalls
+                )
+                .expect("get")
+                .expect("present")
+                .consumed,
+            1
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_budget_exceeded_node_failed_final() {
+        let (mut store, mission, run, node) = setup();
+        store
+            .update_node_state(node.node_id, NodeState::Ready, 0)
+            .expect("ready");
+        let session = store
+            .create_agent_session(&NewAgentSession {
+                mission_id: mission.mission_id,
+                run_id: Some(run.run_id),
+                node_id: node.node_id,
+                role: "worker",
+                model: "auto/auto",
+                system_prompt: "",
+                now_ms: 0,
+            })
+            .expect("session");
+        let turn = store
+            .start_turn(
+                session.session_id,
+                node.node_id,
+                AttemptNo::FIRST,
+                1,
+                "auto/auto",
+                0,
+            )
+            .expect("turn");
+        store
+            .record_turn_usage(
+                turn.turn_id,
+                &NewTurnUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 5,
+                    total_tokens: 10,
+                    source: UsageSource::Authoritative,
+                    request_id: Some("req-final".to_owned()),
+                },
+                0,
+            )
+            .expect("usage");
+        store
+            .set_budget(
+                "node",
+                &node.node_id.to_string(),
+                BudgetDimension::Tokens,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(100),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("budget");
+        for next in [
+            NodeState::Leased,
+            NodeState::Running,
+            NodeState::Failed,
+            NodeState::FailedFinal,
+        ] {
+            store
+                .update_node_state(node.node_id, next, 0)
+                .expect("advance");
+        }
+        store.rebuild_budget_counters(1).expect("rebuild");
+        assert_eq!(
+            store
+                .get_node(node.node_id)
+                .expect("get")
+                .expect("present")
+                .state,
+            NodeState::FailedFinal
+        );
+    }
+
+    #[test]
+    fn budget_summary_omits_sensitive_fields() {
+        let (mut store, _mission, _run, node) = setup();
+        store
+            .set_budget(
+                "node",
+                &node.node_id.to_string(),
+                BudgetDimension::Tokens,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(100),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("budget");
+        let summaries = store
+            .node_budget_summaries(node.node_id)
+            .expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].dimension, "tokens");
+        assert_eq!(summaries[0].consumed, 0);
+        assert_eq!(summaries[0].hard_limit, Some(100));
+        assert_eq!(summaries[0].remaining, Some(100));
+        let debug = format!("{:?}", summaries);
+        for banned in ["api_key", "base_url", "price", "unit_price"] {
+            assert!(!debug.contains(banned), "leaked {banned} in {debug}");
+        }
     }
 }

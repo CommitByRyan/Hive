@@ -3,7 +3,8 @@ use std::time::Duration;
 use hive_llm::{ChatRequest, ChatResponse, ChatTransport, Gateway, Message, Role, Tool, Usage};
 use hive_policy::RiskLevel;
 use hive_store::{
-    now_rfc3339, AgentSessionState, LeaseGuard, NewTurnUsage, Store, TurnState, UsageSource,
+    now_rfc3339, AgentSessionState, BudgetDimension, LeaseGuard, NewTurnUsage, Store, TurnState,
+    UsageSource,
 };
 use hive_tools::{
     AllowAllApprovals, ApprovalGate, AuditSink, DenyApprovals, ToolCall, ToolContext,
@@ -225,14 +226,33 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                 }),
             );
             self.store.append_event_guarded(node, &guard, &turn_event)?;
-            let turn = self.store.start_turn(
+            let turn = match self.store.start_turn(
                 session,
                 node,
                 guard.attempt_no,
                 turn_index,
                 &spec.model,
                 turn_now,
-            )?;
+            ) {
+                Ok(turn) => turn,
+                Err(hive_store::StoreError::BudgetExceeded { dimension }) => {
+                    return self.fail_budget(scope, &guard, &dimension, turn_index);
+                }
+                Err(error) => return Err(error.into()),
+            };
+
+            // Hard token pre-check: refuse to issue a model request when the
+            // node-level token budget is already exhausted. The authoritative
+            // settlement still happens when usage is recorded below.
+            if self
+                .store
+                .budget_remaining(node, BudgetDimension::Tokens)?
+                .is_some_and(|remaining| remaining <= 0)
+            {
+                self.store
+                    .finish_turn(turn.turn_id, TurnState::Failed, None, "", 0, now_ms())?;
+                return self.fail_budget(scope, &guard, "tokens", turn_index);
+            }
 
             let mut request = ChatRequest::new(spec.model.clone(), messages.clone())
                 .with_max_tokens(spec.max_tokens);
@@ -272,8 +292,20 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                 .map(|reason| reason.as_str().to_owned());
             let preview = preview(&output_text);
             let usage = build_usage(&response, &request, &output_text, &tool_calls);
-            self.store
-                .record_turn_usage(turn.turn_id, &usage, now_ms())?;
+            if let Err(error) = self.store.record_turn_usage(turn.turn_id, &usage, now_ms()) {
+                if let hive_store::StoreError::BudgetExceeded { dimension } = error {
+                    self.store.finish_turn(
+                        turn.turn_id,
+                        TurnState::Failed,
+                        finish_reason.as_deref(),
+                        &preview,
+                        tool_calls.len() as u32,
+                        now_ms(),
+                    )?;
+                    return self.fail_budget(scope, &guard, &dimension, turn_index);
+                }
+                return Err(error.into());
+            }
 
             if cancel.is_cancelled() {
                 self.store.finish_turn(
@@ -402,23 +434,33 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                         lease_token: guard.lease_token.clone(),
                         policy_version: "v1".to_owned(),
                     };
-                    let outcome = {
-                        let mut audit = GuardedAuditSink {
-                            store: &mut *self.store,
-                            node_id: node,
-                            guard: guard.clone(),
-                        };
-                        let mut approvals: Box<dyn ApprovalGate> = match self.approval_policy {
-                            ApprovalPolicy::Request => Box::new(AllowAllApprovals),
-                            ApprovalPolicy::Deny => Box::new(DenyApprovals),
-                        };
-                        self.tools.dispatch(
-                            &context,
-                            ToolCall::new(tool_name, arguments),
-                            &mut audit,
-                            &mut *approvals,
-                        )
+                    let mut audit = GuardedAuditSink {
+                        store: &mut *self.store,
+                        node_id: node,
+                        guard: guard.clone(),
+                        budget_exceeded: None,
                     };
+                    let mut approvals: Box<dyn ApprovalGate> = match self.approval_policy {
+                        ApprovalPolicy::Request => Box::new(AllowAllApprovals),
+                        ApprovalPolicy::Deny => Box::new(DenyApprovals),
+                    };
+                    let outcome = self.tools.dispatch(
+                        &context,
+                        ToolCall::new(tool_name, arguments),
+                        &mut audit,
+                        &mut *approvals,
+                    );
+                    if let Some(dimension) = audit.budget_exceeded.take() {
+                        self.store.finish_turn(
+                            turn.turn_id,
+                            TurnState::Failed,
+                            finish_reason.as_deref(),
+                            &preview,
+                            tool_calls.len() as u32,
+                            now_ms(),
+                        )?;
+                        return self.fail_budget(scope, &guard, &dimension, turn_index);
+                    }
                     match outcome {
                         Ok(outcome) => {
                             results.push(Message::tool_result(call_id, outcome.output.content));
@@ -598,6 +640,47 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
         Ok(())
     }
 
+    /// Structured budget failure: emit `node.budget_exceeded`, move the node
+    /// to `failed` in the same transaction, then surface a non-retryable
+    /// budget error. The scheduler finalizes `failed -> failed_final` without
+    /// retrying or emitting `node.ready`.
+    fn fail_budget(
+        &mut self,
+        scope: NodeScope,
+        guard: &LeaseGuard,
+        dimension: &str,
+        turns: u32,
+    ) -> Result<AgentOutcome, AgentError> {
+        let budget = BudgetDimension::parse(dimension).unwrap_or(BudgetDimension::Tokens);
+        let record = self
+            .store
+            .get_budget("node", &scope.node.to_string(), budget)?;
+        let consumed = record.as_ref().map(|record| record.consumed);
+        let hard_limit = record.as_ref().and_then(|record| record.hard_limit);
+        let event = node_event(
+            scope.mission_id,
+            Some(scope.run_id),
+            scope.node,
+            scope.session,
+            guard.attempt_no,
+            EventKind::NodeBudgetExceeded,
+            json!({
+                "dimension": dimension,
+                "consumed": consumed,
+                "hard_limit": hard_limit,
+                "estimated": false,
+                "turns": turns,
+            }),
+        );
+        self.store
+            .transition_node_cas(scope.node, guard, NodeState::Failed, &event, now_ms())?;
+        self.store
+            .set_agent_session_state(scope.session, AgentSessionState::Failed, now_ms())?;
+        Err(AgentError::BudgetExceeded {
+            dimension: dimension.to_owned(),
+        })
+    }
+
     fn cancel_node(
         &mut self,
         scope: NodeScope,
@@ -646,14 +729,24 @@ struct GuardedAuditSink<'a> {
     store: &'a mut Store,
     node_id: NodeId,
     guard: LeaseGuard,
+    budget_exceeded: Option<String>,
 }
 
 impl AuditSink for GuardedAuditSink<'_> {
     fn append(&mut self, event: &EventInput) -> ToolResult<()> {
-        self.store
-            .append_event_guarded(self.node_id, &self.guard, event)
-            .map(|_| ())
-            .map_err(ToolError::from)
+        match self
+            .store
+            .append_tool_event(self.node_id, &self.guard, event, now_ms())
+        {
+            Ok(_) => Ok(()),
+            Err(hive_store::StoreError::BudgetExceeded { dimension }) => {
+                self.budget_exceeded = Some(dimension.clone());
+                Err(ToolError::from(hive_store::StoreError::BudgetExceeded {
+                    dimension,
+                }))
+            }
+            Err(error) => Err(ToolError::from(error)),
+        }
     }
 }
 
@@ -789,7 +882,10 @@ mod tests {
     use hive_llm::{
         ChatTransport, HttpResponse, LlmError, MockResponse, MockTransport, RetryPolicy,
     };
-    use hive_store::{AgentSessionRecord, MissionRecord, NewAgentSession, NodeRecord, RunRecord};
+    use hive_store::{
+        AgentSessionRecord, BudgetDimension, BudgetLimits, MissionRecord, NewAgentSession,
+        NodeRecord, RunRecord, SideEffectState,
+    };
     use hive_types::{ApprovalState, AttemptNo, MissionId};
     use serde_json::json;
 
@@ -1504,6 +1600,7 @@ mod tests {
                 store: &mut f.store,
                 node_id: f.node.node_id,
                 guard: guard.clone(),
+                budget_exceeded: None,
             };
             let mut approvals = AllowAllApprovals;
             dispatcher
@@ -1629,5 +1726,141 @@ mod tests {
                 .state,
             NodeState::Leased
         );
+    }
+
+    #[test]
+    fn token_budget_exceeded_fails_node_without_retry() {
+        let mut f = fixture("budget-tokens");
+        f.store
+            .set_budget(
+                "node",
+                &f.node.node_id.to_string(),
+                BudgetDimension::Tokens,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(10),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("budget");
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion(
+                "way too long",
+                Some(json!({"prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20})),
+            ),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let error = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect_err("budget")
+        };
+        assert!(matches!(
+            error,
+            AgentError::BudgetExceeded { dimension } if dimension == "tokens"
+        ));
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Failed
+        );
+        assert_eq!(
+            f.store
+                .get_agent_session(f.session.session_id)
+                .expect("session")
+                .expect("present")
+                .state,
+            AgentSessionState::Failed
+        );
+        let events = f.store.read_all_events().expect("events");
+        let exceeded = events
+            .iter()
+            .find(|event| event.kind == EventKind::NodeBudgetExceeded)
+            .expect("budget_exceeded event");
+        assert_eq!(exceeded.payload["dimension"], "tokens");
+        assert_eq!(exceeded.payload["hard_limit"], 10);
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == EventKind::NodeReady));
+    }
+
+    #[test]
+    fn tool_call_budget_exceeded_fails_before_side_effect_replay() {
+        let mut f = fixture("budget-tools");
+        f.store
+            .set_budget(
+                "node",
+                &f.node.node_id.to_string(),
+                BudgetDimension::ToolCalls,
+                None,
+                BudgetLimits {
+                    hard_limit: Some(1),
+                    soft_limit: None,
+                },
+                0,
+            )
+            .expect("budget");
+        std::fs::write(f.dir.path().join("note.txt"), b"x").expect("note");
+        let transport = MockTransport::new(vec![
+            MockResponse::json(
+                200,
+                &tool_completion("fs.read", json!({"path": "note.txt"})),
+            ),
+            MockResponse::json(
+                200,
+                &tool_completion("fs.read", json!({"path": "note.txt"})),
+            ),
+        ]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+
+        let error = {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect_err("budget")
+        };
+        assert!(matches!(
+            error,
+            AgentError::BudgetExceeded { dimension } if dimension == "tool_calls"
+        ));
+        assert_eq!(
+            f.store
+                .get_node(f.node.node_id)
+                .expect("node")
+                .expect("present")
+                .state,
+            NodeState::Failed
+        );
+        let events = f.store.read_all_events().expect("events");
+        let exceeded = events
+            .iter()
+            .find(|event| event.kind == EventKind::NodeBudgetExceeded)
+            .expect("budget_exceeded event");
+        assert_eq!(exceeded.payload["dimension"], "tool_calls");
+        assert_eq!(exceeded.payload["hard_limit"], 1);
+        let started = events
+            .iter()
+            .filter(|event| event.kind == EventKind::NodeToolStarted)
+            .count();
+        assert_eq!(
+            started, 1,
+            "second tool intent must not start a side effect"
+        );
+        let states = f
+            .store
+            .side_effect_states(f.node.node_id, AttemptNo::FIRST)
+            .expect("side effects");
+        assert_eq!(states, vec![SideEffectState::Completed]);
     }
 }
