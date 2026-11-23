@@ -12,6 +12,8 @@ pub enum ErrorCode {
     NetworkEndpointDenied,
     ShellDisabled,
     ShellProgramDenied,
+    ShellTimeout,
+    ShellCleanupFailed,
     ToolArgumentsDenied,
     ToolNotFound,
     ToolDuplicate,
@@ -34,6 +36,8 @@ impl ErrorCode {
             Self::NetworkEndpointDenied => "network.endpoint_denied",
             Self::ShellDisabled => "shell.disabled",
             Self::ShellProgramDenied => "shell.program_denied",
+            Self::ShellTimeout => "shell.timeout",
+            Self::ShellCleanupFailed => "shell.cleanup_failed",
             Self::ToolArgumentsDenied => "tool.arguments_denied",
             Self::ToolNotFound => "tool.not_found",
             Self::ToolDuplicate => "tool.duplicate",
@@ -71,6 +75,10 @@ pub enum PolicyError {
     ShellDisabled,
     #[error("shell program is denied: {0}")]
     ShellProgramDenied(String),
+    #[error("shell execution timed out: {0}")]
+    ShellTimeout(String),
+    #[error("shell cleanup failed: {0}")]
+    ShellCleanupFailed(String),
     #[error("tool arguments are denied: {0}")]
     ToolArgumentsDenied(String),
     #[error("tool is not registered: {0}")]
@@ -106,6 +114,8 @@ impl PolicyError {
             Self::NetworkEndpointDenied(_) => ErrorCode::NetworkEndpointDenied,
             Self::ShellDisabled => ErrorCode::ShellDisabled,
             Self::ShellProgramDenied(_) => ErrorCode::ShellProgramDenied,
+            Self::ShellTimeout(_) => ErrorCode::ShellTimeout,
+            Self::ShellCleanupFailed(_) => ErrorCode::ShellCleanupFailed,
             Self::ToolArgumentsDenied(_) => ErrorCode::ToolArgumentsDenied,
             Self::ToolNotFound(_) => ErrorCode::ToolNotFound,
             Self::ToolDuplicate(_) => ErrorCode::ToolDuplicate,
@@ -144,6 +154,8 @@ mod tests {
         );
         assert_eq!(ErrorCode::ShellDisabled.code(), "shell.disabled");
         assert_eq!(ErrorCode::ShellProgramDenied.code(), "shell.program_denied");
+        assert_eq!(ErrorCode::ShellTimeout.code(), "shell.timeout");
+        assert_eq!(ErrorCode::ShellCleanupFailed.code(), "shell.cleanup_failed");
         assert_eq!(
             ErrorCode::ToolArgumentsDenied.code(),
             "tool.arguments_denied"

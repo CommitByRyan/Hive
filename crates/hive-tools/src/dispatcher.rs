@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hive_policy::{
     request_hash, ApprovalMode, HashRequest, NetworkPolicy, PathAccess, PathPolicy, PolicyError,
-    RiskLevel, ToolRegistry,
+    RiskLevel, ShellPolicy, ToolRegistry,
 };
 use hive_types::{EventId, EventInput, EventKind, ToolCallId};
 use serde_json::{json, Value};
@@ -54,7 +54,7 @@ pub fn default_registry() -> Result<ToolRegistry, ToolError> {
             RiskLevel::Execute,
             ApprovalMode::Always,
             64 * 1024,
-            &[],
+            &["program"],
             &["program", "args", "cwd"],
             64 * 1024,
         )
@@ -67,12 +67,21 @@ pub struct ToolDispatcher {
     registry: ToolRegistry,
     paths: PathPolicy,
     network: NetworkPolicy,
+    shell: ShellPolicy,
 }
 
 enum PreparedAction {
     Read(PathBuf),
-    Write { path: PathBuf, content: Vec<u8> },
+    Write {
+        path: PathBuf,
+        content: Vec<u8>,
+    },
     List(PathBuf),
+    Shell {
+        program: PathBuf,
+        args: Vec<String>,
+        cwd: PathBuf,
+    },
 }
 
 impl ToolDispatcher {
@@ -81,6 +90,7 @@ impl ToolDispatcher {
             registry,
             paths,
             network,
+            shell: ShellPolicy::disabled(),
         }
     }
 
@@ -88,6 +98,13 @@ impl ToolDispatcher {
         let registry = default_registry()?;
         let paths = PathPolicy::new([root])?;
         Ok(Self::new(registry, paths, NetworkPolicy::deny_all()))
+    }
+
+    /// Attach a shell policy. Production callers should build the policy from
+    /// the configured allow-list; `with_default_root` keeps shell disabled.
+    pub fn with_shell(mut self, shell: ShellPolicy) -> Self {
+        self.shell = shell;
+        self
     }
 
     pub fn registry(&self) -> &ToolRegistry {
@@ -100,6 +117,10 @@ impl ToolDispatcher {
 
     pub fn network(&self) -> &NetworkPolicy {
         &self.network
+    }
+
+    pub fn shell(&self) -> &ShellPolicy {
+        &self.shell
     }
 
     pub fn dispatch(
@@ -227,7 +248,29 @@ impl ToolDispatcher {
                     content: content.as_bytes().to_vec(),
                 })
             }
-            "shell.run" => Err(PolicyError::ShellDisabled.into()),
+            "shell.run" => {
+                let program = string_arg(&request.arguments, "program")?;
+                let authorized_program = self.shell.authorize_program(program)?;
+                let args = string_list_arg(&request.arguments, "args")?;
+                let cwd = match request.arguments.get("cwd") {
+                    Some(Value::String(cwd)) => {
+                        let authorized = self.paths.authorize(0, cwd, PathAccess::List)?;
+                        authorized.final_path().to_path_buf()
+                    }
+                    None => self.paths.authorize_root(0)?.final_path().to_path_buf(),
+                    Some(_) => {
+                        return Err(PolicyError::ToolArgumentsDenied(
+                            "argument `cwd` must be a string".to_owned(),
+                        )
+                        .into());
+                    }
+                };
+                Ok(PreparedAction::Shell {
+                    program: authorized_program,
+                    args,
+                    cwd,
+                })
+            }
             other => Err(PolicyError::ToolNotFound(other.to_owned()).into()),
         }
     }
@@ -242,6 +285,9 @@ impl ToolDispatcher {
             PreparedAction::Read(path) => read_bounded(&path, spec.max_output),
             PreparedAction::List(path) => list_bounded(&path, spec.max_output),
             PreparedAction::Write { path, content } => write_atomic(&path, &content),
+            PreparedAction::Shell { program, args, cwd } => {
+                crate::shell::run(&program, &args, &cwd, spec.timeout, spec.max_output)
+            }
         }
         .map_err(|error| {
             ToolError::new(
@@ -337,6 +383,27 @@ fn string_arg<'a>(arguments: &'a Value, name: &str) -> ToolResult<&'a str> {
             "argument `{name}` must be a string"
         )))
     })
+}
+
+fn string_list_arg(arguments: &Value, name: &str) -> ToolResult<Vec<String>> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(ToolError::from(PolicyError::ToolArgumentsDenied(format!(
+            "argument `{name}` must be an array of strings"
+        ))));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(text) = item.as_str() else {
+            return Err(ToolError::from(PolicyError::ToolArgumentsDenied(format!(
+                "argument `{name}`[{index}] must be a string"
+            ))));
+        };
+        out.push(text.to_owned());
+    }
+    Ok(out)
 }
 
 fn read_bounded(path: &Path, max_output: usize) -> ToolResult<ToolOutput> {
