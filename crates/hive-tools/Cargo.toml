@@ -1,0 +1,12 @@
+[package]
+name = "hive-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-types = { path = "../hive-types" }
+hive-policy = { path = "../hive-policy" }
+hive-store = { path = "../hive-store" }
+serde_json.workspace = true

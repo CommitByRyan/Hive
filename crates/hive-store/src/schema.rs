@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::error::{StoreError, StoreResult};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 pub const BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub fn apply_pragmas(conn: &Connection) -> StoreResult<()> {
@@ -33,6 +33,7 @@ pub fn migrate(conn: &mut Connection) -> StoreResult<()> {
 fn apply_migration(conn: &Connection, target: i64) -> StoreResult<()> {
     match target {
         1 => conn.execute_batch(V1_SCHEMA)?,
+        2 => conn.execute_batch(V2_SCHEMA)?,
         other => {
             return Err(StoreError::Conflict(format!(
                 "unknown migration version {other}"
@@ -42,7 +43,7 @@ fn apply_migration(conn: &Connection, target: i64) -> StoreResult<()> {
     Ok(())
 }
 
-const V1_SCHEMA: &str = r#"
+pub(crate) const V1_SCHEMA: &str = r#"
 CREATE TABLE missions (
     mission_id    TEXT PRIMARY KEY,
     state         TEXT NOT NULL,
@@ -128,4 +129,50 @@ CREATE TABLE snapshots (
 );
 CREATE INDEX idx_snapshots_mission ON snapshots(mission_id);
 CREATE INDEX idx_snapshots_lookup ON snapshots(mission_id, kind, node_id, last_seq);
+"#;
+
+const V2_SCHEMA: &str = r#"
+CREATE TABLE tool_calls (
+    tool_call_id   TEXT PRIMARY KEY,
+    mission_id     TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
+    run_id         TEXT,
+    node_id        TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+    session_id     TEXT,
+    tool_name      TEXT NOT NULL,
+    tool_version   INTEGER NOT NULL,
+    request_hash   TEXT NOT NULL,
+    attempt_no     INTEGER NOT NULL,
+    lease_token    TEXT NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN ('intent','started','completed','failed')),
+    summary        TEXT NOT NULL DEFAULT '',
+    truncated      INTEGER NOT NULL DEFAULT 0,
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX idx_tool_calls_node ON tool_calls(node_id, created_at_ms);
+CREATE INDEX idx_tool_calls_mission ON tool_calls(mission_id, created_at_ms);
+
+CREATE TABLE artifacts (
+    artifact_id    TEXT PRIMARY KEY,
+    mission_id     TEXT NOT NULL REFERENCES missions(mission_id) ON DELETE CASCADE,
+    node_id        TEXT,
+    tool_call_id   TEXT,
+    path           TEXT NOT NULL,
+    sha256         TEXT NOT NULL,
+    size_bytes     INTEGER NOT NULL,
+    created_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX idx_artifacts_mission ON artifacts(mission_id, created_at_ms);
+
+CREATE TABLE tool_audit (
+    audit_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id     TEXT NOT NULL,
+    tool_call_id   TEXT NOT NULL,
+    event_kind     TEXT NOT NULL,
+    record_json    TEXT NOT NULL,
+    prev_hash      TEXT NOT NULL,
+    entry_hash     TEXT NOT NULL,
+    created_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX idx_tool_audit_mission ON tool_audit(mission_id, audit_id);
 "#;

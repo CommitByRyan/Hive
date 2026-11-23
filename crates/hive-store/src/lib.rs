@@ -14,6 +14,6 @@ pub use error::{StoreError, StoreResult};
 pub use records::{
     can_retry, classify_recovery, ApprovalDecision, ApprovalInput, ApprovalRecord, LeaseGuard,
     MissionAggregate, MissionRecord, NodeRecord, RecoveryDecision, RunRecord, SideEffectState,
-    SnapshotInput, SnapshotRecord,
+    SnapshotInput, SnapshotRecord, ToolAuditRecord,
 };
 pub use store::Store;
