@@ -12,6 +12,9 @@ use tokio::sync::broadcast;
 use crate::error::ApiError;
 use crate::SSE_QUEUE_CAPACITY;
 
+/// Default interval for the background routine/lease tick.
+pub const TICK_PERIOD: Duration = Duration::from_secs(1);
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
@@ -93,6 +96,29 @@ impl AppState {
             while !shutdown.load(Ordering::Relaxed) {
                 if let Some(envelope) = subscriber.recv_timeout(Duration::from_millis(100)) {
                     let _ = events_tx.send(envelope);
+                }
+            }
+        });
+    }
+
+    /// Start a stoppable background tick that fires due routines and reclaims
+    /// expired leases once per `period`. The loop exits when this state is
+    /// dropped (via the shared `shutdown` flag) and uses only async waits, so
+    /// it leaves no blocking thread behind.
+    pub fn start_tick_loop(&self, period: Duration) {
+        let store = self.store.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now_ms = hive_store::now_ms();
+                if let Ok(mut guard) = store.lock() {
+                    let _ = hive_runtime::tick_once(&mut guard, now_ms);
                 }
             }
         });

@@ -17,6 +17,7 @@ hive-store = { path = "../hive-store" }
 hive-events = { path = "../hive-events" }
 hive-types = { path = "../hive-types" }
 hive-llm = { path = "../hive-llm" }
+hive-runtime = { path = "../hive-runtime" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -401,6 +401,7 @@ dependencies = [
  "hive-config",
  "hive-events",
  "hive-llm",
+ "hive-runtime",
  "hive-store",
  "hive-types",
  "http-body-util",
