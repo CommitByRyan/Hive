@@ -3,13 +3,13 @@
 > 唯一操作看板。所有对话先读本文件及自己的 runbook。
 > 只有 H00 总控可以修改本文件；其他阶段通过 handoff 汇报，不直接改白板。
 > 约定：完成的对话**不归档**，保留在侧栏供回看；归档记录当前为空。
-> 最近更新：2026-11-23
+> 最近更新：2026-11-24
 
 ## 当前门
 
-**H09c 可观测与保留 + H03b-4 fs 句柄级（并行）**
+**H09c 可观测与保留**
 
-目标：H09c 落结构化日志、trace、指标、健康分级与终态 Mission 归档；H03b-4 把 `fs.read/write/list` 切到句柄级并保持原子替换。H09d 与 H03b-3 已合并。当前基线 `0303089`（主仓 297 passed / 1 ignored）。
+目标：H09c 落结构化日志、trace、指标、健康分级与终态 Mission 归档。H09d、H03b-3、H03b-4 已合并。当前基线 `6dd9dbc`（主仓 304 passed / 1 ignored）。
 
 状态：`in_progress`
 
@@ -32,7 +32,7 @@
 | H03b-1 | 真实 Shell：argv 直启、进程树、有界输出 | done, merged, verified（207/3） | H03 |
 | H03b-2 | Win32 句柄路径与连接级 IP | done, merged, verified（236/1） | H03b-1 |
 | H03b-3 | 出网固定与 Shell 退出语义 | done, merged, verified（297/1） | H03b-2 |
-| H03b-4 | fs.* 句柄级读写与安全原子替换 | in_progress | H03b-3 |
+| H03b-4 | fs.* 句柄级读写与安全原子替换 | done, merged, verified（304/1） | H03b-3 |
 | H09a | 预算账本 + 启动恢复 | done, merged, verified（217/3 + 主仓全绿） | H02、H08、H06c |
 | H09b | Routine 定时与 API | done, merged, verified（286/1） | H09a |
 | H09c | 可观测与保留 | in_progress | H09b |
@@ -56,7 +56,7 @@
 | H09b | 可见对话 `01a2089f-87cc-7281-8cfb-1a9c348b865b`（flash high） | V6 routines、表达式、幂等触发、tick、`/api/routines` | `.codex/worktrees/2b99/Hive`，基线 `5f3769c` | done, merged `5bcee31`, verified 286/1 |
 | H09d | 可见对话 `01a208fb-add5-7ce1-8792-dc2079d9bc55`（`auto/deepseek-v4-pro` high） | 启动恢复接线、reclaim 同事务事件、可停止生命周期 tick | `.codex/worktrees/dec6/Hive`，基线 `5bcee31` | done, merged `da60c17`, verified 291/1 |
 | H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（pro high → 429，切 `auto/glm-5.3` max） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | in_progress |
-| H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | in_progress |
+| H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | done, merged `6dd9dbc`, verified 304/1 |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
 | H10 | 可见对话 `01a20878-248d-73f3-8924-0dc64342445a`（flash high） | `crates/hive-eval`、s5 预算场景、故障注入 | `.codex/worktrees/ca7e/Hive` | done, merged `f9708e3`, 249/3 + s5 |
@@ -72,11 +72,11 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`0303089`（H09d + H03b-3 合并后；主仓独立复验 `All checks passed`，297 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结。
+合并基线：`6dd9dbc`（H03b-4 合并后；主仓独立复验 `All checks passed`，304 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结。
 
-平台安全现状：`hive-llm` 的 ureq 已接 `NetworkPolicy` 单次解析 + 显式 `TcpConnector + RustlsConnector`，并禁用环境代理与重定向；通用网络工具仍关闭。`fs.*` 仍走应用层 `PathPolicy::authorize`，H03b-4 未合并前不得声称 fs 句柄级已完成。Shell 非零退出已改为结构化 `status:"error"` + `exit_code`。
+平台安全现状：`hive-llm` 的 ureq 已接 `NetworkPolicy` 单次解析 + 显式 `TcpConnector + RustlsConnector`，并禁用环境代理与重定向；通用网络工具仍关闭。`fs.read/write/list` 已走授权父目录句柄相对 IO，原子替换用 `ReplaceFileW`/`MoveFileEx` 并复核父目录身份，但 `atomic_replace_handle_relative=false`，仍有已记录的路径级残余窗口；非 Windows 回退不是句柄级隔离。Shell 非零退出已改为结构化 `status:"error"` + `exit_code`。
 
-R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、reclaim 同事务事件）；P1-3/P1-4 已由 H03b-3 修复（pinned egress、Shell 非零退出）。P2-2（fs.* 句柄）由 H03b-4 收口中；P2-1（预算预估下限）、P2-4（approval_expired 与 owner_lost 合并）与 P3 项仍待排期。P2-3 已被 H10 s5 覆盖。
+R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、reclaim 同事务事件）；P1-3/P1-4 已由 H03b-3 修复（pinned egress、Shell 非零退出）；P2-2 已由 H03b-4 关闭（fs.* 句柄级，残余窗口已记录）。P2-1（预算预估下限）、P2-4（approval_expired 与 owner_lost 合并）与 P3 项仍待排期。P2-3 已被 H10 s5 覆盖。
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
@@ -206,4 +206,5 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | 2026-11-23 | H09b | V6 `routines`/`routine_fires`、`rt_` ID、表达式与时区、幂等 fire、tick、`/api/routines`、ADR 0006 系统作用域收口 | 分支与主仓均 `All checks passed`，286 passed / 1 ignored；迁移 fresh/V1–V5→V6 |
 | 2026-11-23 | H09d | `run_startup`（恢复→预算重建）、`tick_once`（routine→lease 回收）、server 启动门与可停止 tick、reclaim 同事务事件 | 分支与主仓均 `All checks passed`，291 passed / 1 ignored；新增 5 条测试 |
 | 2026-11-23 | H03b-3 | ureq 自定义 `PinnedResolver` + 显式 connector、精确 endpoint、禁代理/重定向、Shell 非零退出结构化 | 分支 270/1；主仓合并后 `All checks passed`，297 passed / 1 ignored |
+| 2026-11-24 | H03b-4 | `hive-platform::PathHandle` 句柄持有/相对读写/目录枚举/原子替换，`fs.read/list/write` 接线，junction 父目录拒绝，能力声明 | 分支 304 passed / 1 ignored（NTFS junction 用例真跑）；主仓合并后 `All checks passed`；残余替换窗口已记录 |
 
