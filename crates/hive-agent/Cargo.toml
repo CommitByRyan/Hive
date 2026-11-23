@@ -11,5 +11,6 @@ hive-store = { path = "../hive-store" }
 hive-tools = { path = "../hive-tools" }
 hive-llm = { path = "../hive-llm" }
 hive-policy = { path = "../hive-policy" }
+hive-runtime = { path = "../hive-runtime" }
 serde_json.workspace = true
 thiserror.workspace = true

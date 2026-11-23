@@ -7,12 +7,16 @@
 //! so the concurrency semantics can be exercised deterministically in tests.
 //! The threaded executor is H05b.
 
+mod clock;
 mod error;
 mod executor;
 mod plan;
 mod scheduler;
+mod threaded;
 
+pub use clock::{Clock, SystemClock, TestClock};
 pub use error::RuntimeError;
 pub use executor::{ExecOutcome, NodeExecutor};
 pub use plan::{validate_plan, NodeSpec, Plan, PlanError, PlanNode, Topology};
 pub use scheduler::{install_plan, Action, Scheduler, StoreLike};
+pub use threaded::{RunSummary, ThreadedExecutor};

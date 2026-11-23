@@ -6,6 +6,7 @@
 
 mod approval;
 mod error;
+mod node_executor;
 mod runner;
 mod spec;
 

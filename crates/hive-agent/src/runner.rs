@@ -69,6 +69,12 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
         }
     }
 
+    /// Private-in-crate access for the runtime [`NodeExecutor`] adapter, which
+    /// creates the agent session before handing off to [`Self::run_node`].
+    pub(crate) fn store_mut(&mut self) -> &mut Store {
+        self.store
+    }
+
     pub fn with_lease(mut self, owner: impl Into<String>, ttl: Duration) -> Self {
         self.lease_owner = owner.into();
         self.lease_ttl = ttl;
