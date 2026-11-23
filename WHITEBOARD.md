@@ -7,9 +7,9 @@
 
 ## 当前门
 
-**H03b-3 出网固定 + H09d 恢复入口（并行）**
+**H09c 可观测与保留 + H03b-4 fs 句柄级（并行）**
 
-目标：H03b-3 把 pinned egress 接进 `hive-llm` 并修正 Shell 非零退出；H09d 接线启动恢复、租约回收事件与生命周期 tick。H09b 已按 ADR 0006 收口并合并。当前基线 `5bcee31`（H09b 合并后）。
+目标：H09c 落结构化日志、trace、指标、健康分级与终态 Mission 归档；H03b-4 把 `fs.read/write/list` 切到句柄级并保持原子替换。H09d 与 H03b-3 已合并。当前基线 `0303089`（主仓 297 passed / 1 ignored）。
 
 状态：`in_progress`
 
@@ -31,12 +31,12 @@
 | H08 | 服务协议与 Web 控制台 | done, merged, verified | H05、H06、H07 |
 | H03b-1 | 真实 Shell：argv 直启、进程树、有界输出 | done, merged, verified（207/3） | H03 |
 | H03b-2 | Win32 句柄路径与连接级 IP | done, merged, verified（236/1） | H03b-1 |
-| H03b-3 | 出网固定与 Shell 退出语义 | in_progress | H03b-2 |
-| H03b-4 | fs.* 句柄级读写与安全原子替换 | pending | H03b-3 |
+| H03b-3 | 出网固定与 Shell 退出语义 | done, merged, verified（297/1） | H03b-2 |
+| H03b-4 | fs.* 句柄级读写与安全原子替换 | in_progress | H03b-3 |
 | H09a | 预算账本 + 启动恢复 | done, merged, verified（217/3 + 主仓全绿） | H02、H08、H06c |
 | H09b | Routine 定时与 API | done, merged, verified（286/1） | H09a |
-| H09c | 可观测与保留 | blocked | H09b |
-| H09d | 恢复入口、租约事件与生命周期 tick | in_progress | H09b、R08 |
+| H09c | 可观测与保留 | in_progress | H09b |
+| H09d | 恢复入口、租约事件与生命周期 tick | done, merged, verified（291/1） | H09b、R08 |
 | H06d-1 | worktree 集成器与回收 | done, merged, verified（232/3） | H06 |
 | H06d-2 | Handoff 真实基线 | done, merged, verified（264/1） | H09a、H06d-1 |
 | R08 | 安全与并发独立审计 | done, merged（no P0 / 4 P1） | H09a、H03b-2 |
@@ -54,10 +54,11 @@
 | H03b-1 | 可见对话 `01a20875-6db0-7561-ad50-2053e7832da2`（pro high） | `crates/hive-tools` 的 `shell.run`、`hive-policy` 程序/参数策略、测试 | `.codex/worktrees/ed04/Hive`，基线 `e720968` | done, merged `d116166`, verified 207/3 |
 | H09a | 可见对话 `01a20877-15e5-7ad0-a650-eb3df9f9e3b3`（pro high） | V5 budgets、原子扣减、budget_exceeded、启动恢复扫描 | `.codex/worktrees/b2fb/Hive`，基线 `46d381d` | done, merged `5f3769c`, verified 217/3 |
 | H09b | 可见对话 `01a2089f-87cc-7281-8cfb-1a9c348b865b`（flash high） | V6 routines、表达式、幂等触发、tick、`/api/routines` | `.codex/worktrees/2b99/Hive`，基线 `5f3769c` | done, merged `5bcee31`, verified 286/1 |
-| H09d | 可见对话 `01a208fb-add5-7ce1-8792-dc2079d9bc55`（`auto/deepseek-v4-pro` high） | 启动恢复接线、reclaim 同事务事件、可停止生命周期 tick | `.codex/worktrees/dec6/Hive`，基线 `5bcee31` | in_progress |
-| H03b-4 | 待 H03b-3 合并后派发 | `PathHandle` IO、fs.write 原子替换、fs.list 能力声明 | 待创建 worktree，runbook `docs/runbooks/H03b4.md` | pending |
+| H09d | 可见对话 `01a208fb-add5-7ce1-8792-dc2079d9bc55`（`auto/deepseek-v4-pro` high） | 启动恢复接线、reclaim 同事务事件、可停止生命周期 tick | `.codex/worktrees/dec6/Hive`，基线 `5bcee31` | done, merged `da60c17`, verified 291/1 |
+| H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（`auto/deepseek-v4-pro` high） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | in_progress |
+| H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（`auto/deepseek-v4-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | in_progress |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
-| H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | in_progress |
+| H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
 | H10 | 可见对话 `01a20878-248d-73f3-8924-0dc64342445a`（flash high） | `crates/hive-eval`、s5 预算场景、故障注入 | `.codex/worktrees/ca7e/Hive` | done, merged `f9708e3`, 249/3 + s5 |
 | H06d-2 | 可见对话 `01a208ad-955d-7d31-a49a-035e146ec718`（pro high） | `AgentSpec.workspace_root`、`NodeSpec` 可选字段、handoff `base_revision` | `.codex/worktrees/c1ee/Hive`，基线 `f9708e3` | done, merged `b7ee6b6`, verified 264/1 |
 | H06d-1 | 可见对话 `01a20896-12bf-70c2-af65-97624eb3eb49`（flash high） | `crates/hive-workspace`、merge preview/merge、recycle | `.codex/worktrees/9744/Hive`，基线 `d116166` | done, merged `b1a108c`, verified 232/3 |
@@ -71,11 +72,11 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`5bcee31`（H09b 合并后；主仓独立复验 `All checks passed`，286 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结。
+合并基线：`0303089`（H09d + H03b-3 合并后；主仓独立复验 `All checks passed`，297 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结。
 
-平台安全现状：`hive-platform` 已提供句柄级路径与 pinned connect，但 `hive-tools` 的 fs.* 仍走应用层 `PathPolicy::authorize`，`hive-llm` 的 ureq 也未接 `connect_validated`。H03b-2 明确声明为“策略层就绪、未完成端到端防 DNS rebinding”，不得对外声称平台级安全已完成。
+平台安全现状：`hive-llm` 的 ureq 已接 `NetworkPolicy` 单次解析 + 显式 `TcpConnector + RustlsConnector`，并禁用环境代理与重定向；通用网络工具仍关闭。`fs.*` 仍走应用层 `PathPolicy::authorize`，H03b-4 未合并前不得声称 fs 句柄级已完成。Shell 非零退出已改为结构化 `status:"error"` + `exit_code`。
 
-R08 审计结论：无 P0。4 条 P1 为启动恢复未接生产入口、`reclaim_expired_leases` 不写事件、出网策略未接 `hive-llm`、Shell 非零退出被折叠为成功；P1-1/P1-2 归 H09d，P1-3/P1-4 归 H03b-3，P2-2（fs.* 句柄）归 H03b-4。审计中的 P2-3 已被 H10 s5 合并覆盖，不再作为待办。
+R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、reclaim 同事务事件）；P1-3/P1-4 已由 H03b-3 修复（pinned egress、Shell 非零退出）。P2-2（fs.* 句柄）由 H03b-4 收口中；P2-1（预算预估下限）、P2-4（approval_expired 与 owner_lost 合并）与 P3 项仍待排期。P2-3 已被 H10 s5 覆盖。
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
@@ -202,4 +203,6 @@ R08 审计结论：无 P0。4 条 P1 为启动恢复未接生产入口、`reclai
 | 2026-11-23 | H06d-2 | `AgentSpec.workspace_root`、`NodeSpec` 可选字段、handoff 真实 `base_revision`，失败 fail-open 记风险 | rebase 后分支与主仓均 `All checks passed`，264 passed / 1 ignored；新增 6 条测试 |
 | 2026-11-23 | R08 | 安全与并发只读审计：no P0、4 P1、4 P2、5 P3 | 审计档 `docs/audits/R08-security-concurrency.md` 已并入 `944e961` |
 | 2026-11-23 | H09b | V6 `routines`/`routine_fires`、`rt_` ID、表达式与时区、幂等 fire、tick、`/api/routines`、ADR 0006 系统作用域收口 | 分支与主仓均 `All checks passed`，286 passed / 1 ignored；迁移 fresh/V1–V5→V6 |
+| 2026-11-23 | H09d | `run_startup`（恢复→预算重建）、`tick_once`（routine→lease 回收）、server 启动门与可停止 tick、reclaim 同事务事件 | 分支与主仓均 `All checks passed`，291 passed / 1 ignored；新增 5 条测试 |
+| 2026-11-23 | H03b-3 | ureq 自定义 `PinnedResolver` + 显式 connector、精确 endpoint、禁代理/重定向、Shell 非零退出结构化 | 分支 270/1；主仓合并后 `All checks passed`，297 passed / 1 ignored |
 
