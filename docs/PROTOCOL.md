@@ -288,6 +288,21 @@ ID 已存在不代表表已存在。需要当前状态、原子 CAS、重启查�
 | V5 | H06 | Handoff |
 | V6 | H09 | Routine 与保留策略 |
 
+### V3 列契约（H04 冻结）
+
+`agent_sessions`：`session_id` 主键，`mission_id`/`run_id`/`node_id` 外键，`role`、`model`、`system_prompt`，`state ∈ {active, completed, failed, cancelled}`，`created_at_ms`/`updated_at_ms`/`closed_at_ms`。
+
+`turns`：`turn_id` 主键，`session_id`/`node_id` 外键，`attempt_no`、`turn_index`、`request_model`、`finish_reason`（可空）、`state ∈ {started, completed, failed, cancelled}`、`output_preview`、`tool_call_count`、时间戳；`UNIQUE(session_id, turn_index)`。
+
+`turn_usage`：`turn_id` 主键并 1:1 关联 `turns`，`session_id` 外键，`prompt_tokens`/`completion_tokens`/`total_tokens`，`source ∈ {estimated, authoritative}`，`request_id`（可空），`created_at_ms`。
+
+规则：
+
+- `agent_sessions` 进入终态后必须写 `closed_at_ms`，同一 session 不得复活；续跑要新建 session。
+- `turns` 的 `output_preview` 只放有界摘要，完整输出走 artifact 或工具结果引用。
+- `turn_usage` 与 `turns` 一一对应；usage 缺失时写 `estimated`，不得写 0 冒充权威值。
+- 行是当前状态，`node.turn` / `node.thought` 等事件是通知；两者在同一事务提交。
+
 迁移规则：
 
 - 数据库 schema 版本的唯一来源是 `hive-store` 的 `SCHEMA_VERSION`，与 `EVENT_SCHEMA_VERSION`、`HANDOFF_SCHEMA_VERSION` 无关；`hive-types` 不再导出通用 `SCHEMA_VERSION`。

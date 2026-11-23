@@ -6,11 +6,11 @@
 
 ## 当前门
 
-**H04 — 单 Agent 垂直闭环（W3）**
+**H05 — 并行 DAG 调度（W4）**
 
-目标：把 H02 存储、H03 工具流水线、H07 网关串成一次完整运行：prompt → 模型 → 工具 → 结果 → 事件落库，可回放、可取消。
+目标：依赖解析、就绪队列、租约续期、并发上限、取消传播、重试退避，把单节点闭环扩展成可并行 DAG。
 
-状态：`in_progress`
+状态：`ready to dispatch`
 
 ## 阶段状态
 
@@ -20,8 +20,8 @@
 | H01 | 契约与工程骨架 | done, verified | H00 |
 | H02 | 持久化、事件日志、恢复 | done, verified | H01 |
 | H03 | 工具、审批、工作区安全 | done, verified（shell/Win32 留 H03b） | H02 |
-| H04 | 单 Agent 垂直闭环 | in_progress | H02、H03、H07 |
-| H05 | 并行 DAG 调度 | blocked | H04 |
+| H04 | 单 Agent 垂直闭环 | done, verified | H02、H03、H07 |
+| H05 | 并行 DAG 调度 | in_progress | H04 |
 | H06 | 多 Agent 协作与 worktree | blocked | H05 |
 | H07 | 模型网关与路由 | done, verified（无真实 HTTP 适配器） | H01 |
 | H08 | 服务协议与 Web 控制台 | blocked | H05、H07 |
@@ -38,7 +38,7 @@
 | H03 | H03 实施对话（pro 429，改 `auto/deepseek-v4.1-flash`） | `crates/hive-policy`、`crates/hive-tools`、migration V2 | `work/wt-h03`，`codex/h03-tools` | done, merged |
 | H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，`codex/h07-gateway` | done, merged |
 | H03b | 待派发 | 真实 Shell（argv/超时/进程树）、Win32 句柄级路径、连接级 IP 固定 | 新 worktree | pending |
-| H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-agent`、`hive-llm` 真实 transport、migration V3 | `work/wt-h04`，`codex/h04-agent` | implementing |
+| H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
 
 合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
 
@@ -145,4 +145,5 @@
 | 2026-11-23 | H03 | `hive-policy`（路径/网络/注册表/hash）+ `hive-tools`（dispatcher、fs.*、shell 拒绝）+ migration V2 + 审批消费 CAS | 分支自验 90 passed / 2 ignored；合并后复验通过 |
 | 2026-11-23 | H07 | `hive-llm`：wire 类型、SSE 增量解析、tool_call 累积、模型目录、重试策略、MockTransport | 35 条测试；合并后全量 125 passed |
 | 2026-11-23 | H00 | W2 合并：`Cargo.toml`/`Cargo.lock` 冲突已解，main 全绿 | `scripts/verify.ps1`、`cargo test --workspace` |
+| 2026-11-23 | H04 | V3 迁移（sessions/turns/usage）、`UreqTransport`、`AgentRunner` 闭环、取消、`StoreApprovalGate` | 独立复验 138 passed / 3 ignored；V3 列已冻结进 PROTOCOL §10 |
 
