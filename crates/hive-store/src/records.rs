@@ -1,7 +1,7 @@
 use hive_types::{
-    AgentSessionId, ApprovalId, ApprovalState, AttemptNo, HandoffArtifact, HandoffDecision,
-    HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState, RunId, RunState, ToolCallId,
-    TurnId,
+    AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, HandoffArtifact,
+    HandoffDecision, HandoffId, LeaseToken, MissionId, MissionState, NodeId, NodeState, RunId,
+    RunState, ToolCallId, TurnId,
 };
 use serde_json::Value;
 
@@ -69,6 +69,53 @@ pub struct MissionAggregate {
     pub runs: Vec<RunRecord>,
     pub nodes: Vec<NodeRecord>,
     pub last_seq: Option<u64>,
+}
+
+/// A list projection of a Mission: the persisted row plus the derived cursor
+/// and pending-approval count the HTTP console needs for its list view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionListRecord {
+    pub mission: MissionRecord,
+    pub last_seq: Option<u64>,
+    pub pending_approvals: u64,
+}
+
+/// A single read-only transaction snapshot of the global console state.
+#[derive(Clone, Debug)]
+pub struct StateSnapshotRecord {
+    pub missions: Vec<MissionListRecord>,
+    pub approvals: Vec<ApprovalRecord>,
+    pub last_seq: Option<u64>,
+    pub mission_count: u64,
+    pub run_count: u64,
+    pub node_count: u64,
+    pub event_count: u64,
+    pub pending_approval_count: u64,
+}
+
+/// A single read-only transaction snapshot of one Mission detail view.
+#[derive(Clone, Debug)]
+pub struct MissionSnapshotRecord {
+    pub mission: MissionRecord,
+    pub runs: Vec<RunRecord>,
+    pub nodes: Vec<NodeRecord>,
+    pub approvals: Vec<ApprovalRecord>,
+    pub artifacts: Vec<ArtifactRecord>,
+    pub messages: Vec<EventEnvelope>,
+    pub events: Vec<EventEnvelope>,
+    pub last_seq: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactRecord {
+    pub artifact_id: hive_types::ArtifactId,
+    pub mission_id: MissionId,
+    pub node_id: Option<NodeId>,
+    pub tool_call_id: Option<ToolCallId>,
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub created_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
