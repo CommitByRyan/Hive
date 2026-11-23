@@ -19,6 +19,8 @@ pub enum RuntimeError {
     NodeNotInFlight(NodeId),
     #[error("node {0} has already settled")]
     NodeAlreadyTerminal(NodeId),
+    #[error("node {0} is already failed but the reported outcome is not a failure")]
+    NodeOutcomeMismatch(NodeId),
     #[error("threaded executor error: {0}")]
     Executor(String),
 }

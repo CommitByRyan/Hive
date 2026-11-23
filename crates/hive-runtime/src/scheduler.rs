@@ -438,6 +438,16 @@ impl<S: StoreLike> Scheduler<S> {
             return self.propagate_terminal(node_id, outcome);
         }
 
+        if persisted.state == NodeState::Failed {
+            self.guards.remove(&node_id);
+            return match outcome {
+                ExecOutcome::Failed { retryable, .. } => {
+                    self.handle_failure(node_id, attempt, retryable)
+                }
+                _ => Err(RuntimeError::NodeOutcomeMismatch(node_id)),
+            };
+        }
+
         if persisted.state == NodeState::Leased {
             self.start_running(node_id)?;
         }
@@ -1277,6 +1287,139 @@ mod tests {
 
         assert_eq!(sched.node_state(a), NodeState::Succeeded);
         assert_eq!(sched.next_actions(), vec![Action::Start(b)]);
+    }
+
+    fn executor_marks_failed(
+        sched: &mut Scheduler<Store>,
+        node_id: NodeId,
+        guard: &LeaseGuard,
+        mission_id: MissionId,
+        run_id: RunId,
+    ) {
+        let started = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeStarted,
+            mission_id,
+            run_id: Some(run_id),
+            node_id: Some(node_id),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({}),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(node_id, guard, NodeState::Running, &started, 0)
+            .expect("executor start");
+        let failed = EventInput {
+            event_id: EventId::new(),
+            kind: EventKind::NodeFailed,
+            mission_id,
+            run_id: Some(run_id),
+            node_id: Some(node_id),
+            session_id: None,
+            attempt_no: Some(guard.attempt_no),
+            trace_id: None,
+            payload: json!({ "reason": "boom" }),
+        };
+        sched
+            .store_mut()
+            .transition_node_cas(node_id, guard, NodeState::Failed, &failed, 1)
+            .expect("executor fail");
+    }
+
+    #[test]
+    fn failed_node_retries_without_a_second_node_failed() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 3)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        executor_marks_failed(&mut sched, a, &guard, mission.mission_id, run.run_id);
+
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Failed {
+                    reason: "boom".into(),
+                    retryable: true,
+                },
+            )
+            .expect("retry");
+
+        let failed = sched
+            .store()
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeFailed)
+            .count();
+        assert_eq!(failed, 1, "exactly one node.failed");
+        assert_eq!(sched.node_state(a), NodeState::Ready);
+        assert_eq!(sched.next_actions(), vec![Action::Start(a)]);
+    }
+
+    #[test]
+    fn failed_node_finalizes_without_a_second_node_failed() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 0)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        executor_marks_failed(&mut sched, a, &guard, mission.mission_id, run.run_id);
+
+        sched
+            .on_finished(
+                a,
+                ExecOutcome::Failed {
+                    reason: "boom".into(),
+                    retryable: false,
+                },
+            )
+            .expect("finalize");
+
+        let failed = sched
+            .store()
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == EventKind::NodeFailed)
+            .count();
+        assert_eq!(failed, 1, "exactly one node.failed");
+        assert_eq!(sched.node_state(a), NodeState::FailedFinal);
+        assert_eq!(sched.next_actions(), vec![Action::Halt]);
+    }
+
+    #[test]
+    fn failed_node_with_non_failed_outcome_is_rejected() {
+        let (mut store, mission, run) = make_store();
+        let a = NodeId::new();
+        let plan = plan(mission.mission_id, run.run_id, vec![node(a, &[], 3)]);
+        let topology = crate::plan::validate_plan(&plan).expect("valid");
+        install_plan(&mut store, &plan, 0).expect("install");
+        let mut sched =
+            Scheduler::new(topology, 1, CancellationToken::new(), store).expect("scheduler");
+
+        let guard = sched.on_started(a).expect("claim");
+        executor_marks_failed(&mut sched, a, &guard, mission.mission_id, run.run_id);
+
+        let error = sched
+            .on_finished(
+                a,
+                ExecOutcome::Succeeded {
+                    summary: "unexpected".into(),
+                },
+            )
+            .expect_err("outcome/state mismatch must be rejected");
+        assert!(matches!(error, RuntimeError::NodeOutcomeMismatch(_)));
     }
 
     #[test]
