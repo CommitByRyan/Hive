@@ -1,4 +1,5 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use crate::PolicyError;
 
@@ -103,6 +104,24 @@ impl NetworkPolicy {
     }
 
     pub fn check(&self, host: &str, port: u16, resolved: &[IpAddr]) -> Result<(), PolicyError> {
+        let host = self.check_host_and_port(host, port)?;
+        if resolved.is_empty() {
+            return Err(PolicyError::NetworkAddressDenied(format!(
+                "host {host} resolved to no addresses"
+            )));
+        }
+        for ip in resolved {
+            let class = classify_ip(*ip);
+            if class != IpClass::Public {
+                return Err(PolicyError::NetworkAddressDenied(format!(
+                    "host {host} resolved to denied {class:?} address {ip}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_host_and_port(&self, host: &str, port: u16) -> Result<String, PolicyError> {
         if !self.enabled {
             return Err(PolicyError::NetworkAddressDenied(
                 "network egress is denied by default".to_owned(),
@@ -132,20 +151,106 @@ impl NetworkPolicy {
                 "host {host} is not allowed"
             )));
         }
-        if resolved.is_empty() {
+        Ok(host)
+    }
+
+    /// Resolve once and validate every A/AAAA address, pinning the validated
+    /// set so a caller never lets its HTTP client resolve again.
+    pub fn resolve_and_validate(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<PinnedEndpoint, PolicyError> {
+        let host = self.check_host_and_port(host, port)?;
+        let addresses = hive_platform::resolve_all(&host, port).map_err(|error| {
+            PolicyError::NetworkAddressDenied(format!("cannot resolve {host}: {error}"))
+        })?;
+        if addresses.is_empty() {
             return Err(PolicyError::NetworkAddressDenied(format!(
                 "host {host} resolved to no addresses"
             )));
         }
-        for ip in resolved {
-            let class = classify_ip(*ip);
+        for address in &addresses {
+            let class = classify_ip(address.ip());
             if class != IpClass::Public {
                 return Err(PolicyError::NetworkAddressDenied(format!(
-                    "host {host} resolved to denied {class:?} address {ip}"
+                    "host {host} resolved to denied {class:?} address {}",
+                    address.ip()
                 )));
             }
         }
-        Ok(())
+        Ok(PinnedEndpoint {
+            host,
+            port,
+            addresses,
+        })
+    }
+
+    /// Connect to a validated address and verify the peer, trying each pinned
+    /// address in order. The original host is kept for TLS SNI / Host.
+    pub fn connect_validated(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<hive_platform::PinnedSocket, PolicyError> {
+        let endpoint = self.resolve_and_validate(host, port)?;
+        let mut last_error = None;
+        for address in &endpoint.addresses {
+            match hive_platform::connect_pinned(host, address.ip(), port, Some(timeout)) {
+                Ok(socket) => return Ok(socket),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(PolicyError::NetworkEndpointDenied(format!(
+            "cannot connect to any validated address for {host}: {}",
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no addresses".to_owned())
+        )))
+    }
+
+    /// Connect to an already-validated address without re-resolving or
+    /// re-classifying. This is the pin primitive used after
+    /// [`Self::resolve_and_validate`].
+    pub fn connect_pinned_address(
+        &self,
+        host: &str,
+        address: SocketAddr,
+        timeout: Duration,
+    ) -> Result<hive_platform::PinnedSocket, PolicyError> {
+        hive_platform::connect_pinned(host, address.ip(), address.port(), Some(timeout)).map_err(
+            |error| {
+                PolicyError::NetworkEndpointDenied(format!("connect to {address} failed: {error}"))
+            },
+        )
+    }
+
+    /// Report the platform's connection-level pinning capability.
+    pub fn net_capabilities(&self) -> hive_platform::NetCapabilities {
+        hive_platform::net_capabilities()
+    }
+}
+
+/// A host:port whose addresses have all been resolved once and validated.
+#[derive(Clone, Debug)]
+pub struct PinnedEndpoint {
+    host: String,
+    port: u16,
+    addresses: Vec<SocketAddr>,
+}
+
+impl PinnedEndpoint {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
     }
 }
 
@@ -242,5 +347,84 @@ mod tests {
                 .code(),
             "network.address_denied"
         );
+    }
+
+    #[test]
+    fn network_blocks_private_metadata_and_bad_ports() {
+        let policy = NetworkPolicy::allow(["example.com".to_owned()], [443]);
+
+        assert_eq!(
+            policy
+                .check("example.com", 80, &[v4("93.184.216.34")])
+                .expect_err("port")
+                .code(),
+            "network.endpoint_denied"
+        );
+        assert_eq!(
+            policy
+                .check("example.com", 443, &[v4("169.254.169.254")])
+                .expect_err("metadata")
+                .code(),
+            "network.address_denied"
+        );
+        assert_eq!(
+            policy
+                .check("example.com", 443, &[v4("127.0.0.1")])
+                .expect_err("loopback")
+                .code(),
+            "network.address_denied"
+        );
+        assert_eq!(
+            policy
+                .check("example.com", 443, &[v4("10.0.0.1")])
+                .expect_err("private")
+                .code(),
+            "network.address_denied"
+        );
+        assert_eq!(
+            policy
+                .check("example.com", 443, &[v4("169.254.10.10")])
+                .expect_err("link local")
+                .code(),
+            "network.address_denied"
+        );
+
+        let mapped: Ipv6Addr = "::ffff:127.0.0.1".parse().expect("mapped");
+        assert_eq!(
+            policy
+                .check("example.com", 443, &[IpAddr::V6(mapped)])
+                .expect_err("mapped")
+                .code(),
+            "network.address_denied"
+        );
+    }
+
+    #[test]
+    fn network_pins_validated_ip() {
+        let policy = NetworkPolicy::allow(["8.8.8.8".to_owned()], [53]);
+
+        let endpoint = policy
+            .resolve_and_validate("8.8.8.8", 53)
+            .expect("resolve literal");
+        assert_eq!(endpoint.host(), "8.8.8.8");
+        assert_eq!(endpoint.port(), 53);
+        assert_eq!(
+            endpoint.addresses(),
+            &[SocketAddr::from(([8, 8, 8, 8], 53))]
+        );
+
+        // The pin primitive connects to exactly the validated address and
+        // verifies the peer, without a second DNS resolution.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("addr");
+        let pinned = policy
+            .connect_pinned_address("localhost", address, Duration::from_secs(2))
+            .expect("pinned");
+        assert_eq!(pinned.peer(), address);
+        assert_eq!(pinned.host(), "localhost");
+
+        let capabilities = policy.net_capabilities();
+        assert!(capabilities.connection_pinning);
+        assert!(!capabilities.dns_rebinding_resistant);
     }
 }

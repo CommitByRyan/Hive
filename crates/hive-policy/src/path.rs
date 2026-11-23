@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
+use hive_platform::PathPlatform;
+
 use crate::PolicyError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +30,51 @@ impl AuthorizedPath {
 
     pub fn final_path(&self) -> &Path {
         &self.final_path
+    }
+}
+
+/// A handle-level authorized path. On Windows this wraps the exact handle the
+/// platform traversal opened; callers must not re-open the path by string.
+#[derive(Debug)]
+pub struct HandleAuthorizedPath {
+    root: PathBuf,
+    relative: PathBuf,
+    handle: hive_platform::PathHandle,
+}
+
+impl HandleAuthorizedPath {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn relative(&self) -> &Path {
+        &self.relative
+    }
+
+    pub fn final_path(&self) -> &Path {
+        self.handle.final_path()
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.handle.is_dir()
+    }
+
+    pub fn into_platform_handle(self) -> hive_platform::PathHandle {
+        self.handle
+    }
+}
+
+fn map_platform_error(error: hive_platform::PlatformError) -> PolicyError {
+    use hive_platform::PlatformError;
+    match error {
+        PlatformError::ReparsePoint(message) => PolicyError::PathReparseEscape(message),
+        PlatformError::OutsideRoot(message) => PolicyError::PathOutsideWorkspace(message),
+        PlatformError::CrossVolume(message) => PolicyError::PathOutsideWorkspace(message),
+        PlatformError::NotFound(message) => PolicyError::PathNotFound(message),
+        PlatformError::Unsupported(message) => PolicyError::PathUnsupportedForm(message),
+        PlatformError::Io { context, source } => {
+            PolicyError::PathUnsupportedForm(format!("{context}: {source}"))
+        }
     }
 }
 
@@ -128,6 +175,53 @@ impl PathPolicy {
             root: root.to_path_buf(),
             relative: PathBuf::new(),
             final_path: root.to_path_buf(),
+        })
+    }
+
+    /// Report the platform's handle-level path capability without asserting
+    /// guarantees the underlying OS does not provide.
+    pub fn path_capabilities(&self) -> hive_platform::PathCapabilities {
+        hive_platform::path_capabilities()
+    }
+
+    /// Authorize a relative path through the platform's handle traversal.
+    ///
+    /// On Windows this opens every component with
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`, rejects reparse points, verifies the
+    /// final path with `GetFinalPathNameByHandleW` and rejects cross-volume or
+    /// short-name aliases. On other platforms it falls back to canonicalization
+    /// and reports the reduced capability.
+    pub fn authorize_handle(
+        &self,
+        root_index: usize,
+        input: &str,
+        access: PathAccess,
+    ) -> Result<HandleAuthorizedPath, PolicyError> {
+        let relative = validate_relative(input)?;
+        let root = self.root(root_index)?;
+        let platform = hive_platform::default_path_platform();
+        let root_handle = platform.open_root(root).map_err(map_platform_error)?;
+
+        let handle = match access {
+            PathAccess::Write => {
+                match platform.open_checked(&root_handle, &relative, hive_platform::OpenMode::Write)
+                {
+                    Ok(handle) => handle,
+                    Err(hive_platform::PlatformError::NotFound(_)) => platform
+                        .create_file(&root_handle, &relative)
+                        .map_err(map_platform_error)?,
+                    Err(error) => return Err(map_platform_error(error)),
+                }
+            }
+            PathAccess::Read | PathAccess::List => platform
+                .open_checked(&root_handle, &relative, hive_platform::OpenMode::Read)
+                .map_err(map_platform_error)?,
+        };
+
+        Ok(HandleAuthorizedPath {
+            root: root.to_path_buf(),
+            relative,
+            handle,
         })
     }
 }
@@ -463,28 +557,77 @@ mod tests {
         assert!(is_within(authorized.root(), authorized.final_path()));
     }
 
-    #[test]
-    #[ignore = "symlink creation needs Windows developer mode or elevation"]
-    fn policy_rejects_symlink_escape() {
-        let temp = TempDir::new("symlink");
-        let outside = TempDir::new("symlink-outside");
-        std::fs::write(outside.path().join("secret.txt"), b"secret").expect("secret");
-        let link = temp.path().join("link");
-        std::os::windows::fs::symlink_dir(outside.path(), &link).expect("symlink");
-
-        let policy = policy(temp.path());
-        assert_eq!(
-            policy
-                .authorize(0, "link/secret.txt", PathAccess::Read)
-                .expect_err("escape")
-                .code(),
-            "path.outside_workspace"
-        );
+    #[cfg(windows)]
+    fn try_create_junction(link: &Path, target: &Path) -> bool {
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
     }
 
     #[test]
-    #[ignore = "H03 uses canonicalize + recheck; handle-level TOCTOU defense is not implemented"]
-    fn open_handle_detects_toctou_swap() {}
+    #[cfg(windows)]
+    fn policy_rejects_symlink_escape() {
+        let outside = TempDir::new("symlink-outside");
+        std::fs::write(outside.path().join("secret.txt"), b"secret").expect("secret");
+        let temp = TempDir::new("symlink");
+        let link = temp.path().join("link");
+        if !try_create_junction(&link, outside.path()) {
+            eprintln!(
+                "SKIP: junction creation unavailable (needs NTFS); platform handle defense not exercised"
+            );
+            return;
+        }
+
+        let policy = policy(temp.path());
+        let error = policy
+            .authorize_handle(0, "link/secret.txt", PathAccess::Read)
+            .expect_err("escape");
+        assert_eq!(error.code(), "path.reparse_escape");
+
+        let _ = std::fs::remove_dir(&link);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn open_handle_detects_toctou_swap() {
+        let outside = TempDir::new("toctou-outside");
+        std::fs::write(outside.path().join("secret.txt"), b"secret").expect("secret");
+        let temp = TempDir::new("toctou");
+        std::fs::create_dir(temp.path().join("dir")).expect("dir");
+        std::fs::write(temp.path().join("dir").join("file.txt"), b"original").expect("file");
+        let policy = policy(temp.path());
+
+        let authorized = policy
+            .authorize_handle(0, "dir/file.txt", PathAccess::Read)
+            .expect("open");
+        assert!(authorized
+            .final_path()
+            .to_string_lossy()
+            .to_lowercase()
+            .ends_with("file.txt"));
+
+        // End the validation window, then let a concurrent actor swap the
+        // directory: move the real one aside and drop a junction in its place.
+        drop(authorized);
+        std::fs::rename(temp.path().join("dir"), temp.path().join("dir_old")).expect("rename");
+        if !try_create_junction(&temp.path().join("dir"), outside.path()) {
+            eprintln!(
+                "SKIP: junction creation unavailable (needs NTFS); platform handle defense not exercised"
+            );
+            return;
+        }
+        let error = policy
+            .authorize_handle(0, "dir/file.txt", PathAccess::Read)
+            .expect_err("swap");
+        assert_eq!(error.code(), "path.reparse_escape");
+
+        let _ = std::fs::remove_dir(temp.path().join("dir"));
+    }
 
     #[test]
     fn error_codes_for_path_families_are_stable() {

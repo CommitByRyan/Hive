@@ -7,6 +7,7 @@ members = [
     "crates/hive-store",
     "crates/hive-events",
     "crates/hive-policy",
+    "crates/hive-platform",
     "crates/hive-tools",
     "crates/hive-llm",
     "crates/hive-agent",
