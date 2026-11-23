@@ -21,6 +21,7 @@ f_<uuid>    Artifact
 prj_<uuid>  Project
 tr_<uuid>   Trace
 hd_<uuid>   Handoff
+rt_<uuid>   Routine
 ```
 
 外部请求不得自行拼造内部 ID。
@@ -51,7 +52,7 @@ Node：
 ```text
 pending -> ready -> leased -> running -> succeeded
                               |  |
-                              |  +-> waiting_approval -> running
+                              |  +-> waiting_approval -> running | needs_recovery
                               |  +-> failed -> retry_ready
                               |                 |  |
                               |                 |  +-> ready (attempt_no + 1)
@@ -69,6 +70,7 @@ pending -> skipped
 - 终态是 `succeeded`、`failed_final`、`cancelled`、`skipped`。
 - `failed` 是当前 attempt 的瞬时失败态；是否重试由重试预算决定，重试必须进入 `retry_ready -> ready` 并产生新的 `attempt_no`。
 - `needs_recovery` 表示副作用是否完成无法确认，必须人工选择重试或最终失败，不能自动重放。
+- `waiting_approval` 在审批归属执行者丢失时必须 fail-closed：当前 attempt 无 `started/completed` 副作用时可转 `failed` 并按重试预算处理；已有副作用必须转 `needs_recovery`，不得重装 session 续跑或自动重放（ADR 0005 D4）。
 - `attempt_no` 是逻辑执行次数，从 1 开始，非零；租约所有权使用独立的 `lease_token`，不得混用。数据类型为 `u32`，SQLite 存非负 `i64` 并做有检查转换，禁止溢出回绕。
 - Node 级事件的 `attempt_no` 必填且非零；Mission 级事件没有 Node attempt，序列化为 `null`，**禁止用 0 冒充**。
 - 父 Mission 或 Run 的取消必须在同一事务级联到所有未终态 Node，并取消其 pending 审批；Node 进入 `cancelled` 且撤销当前租约。
@@ -182,8 +184,13 @@ Run 是 Mission 的一次规划/执行生命周期；追加要求或恢复可以
 | `node.succeeded` | 节点成功 |
 | `node.failed` | 节点失败 |
 | `node.budget_exceeded` | 节点预算超限导致的失败 |
+| `node.needs_recovery` | 节点进入副作用不确定态，必须人工裁决 |
 | `node.cancelled` | 节点取消 |
 | `node.skipped` | 节点跳过 |
+| `routine.triggered` | Routine 到点并创建 Mission |
+| `routine.error` | Routine 解析或触发失败，可能停用 |
+| `routine.updated` | Routine 配置更新 |
+| `routine.deleted` | Routine 删除 |
 | `mission.summary` | 最终总结 |
 | `mission.done` | Mission 成功 |
 | `mission.failed` | Mission 失败 |
