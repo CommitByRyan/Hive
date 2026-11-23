@@ -10,7 +10,7 @@
 
 目标：把 H02 存储、H03 工具流水线、H07 网关串成一次完整运行：prompt → 模型 → 工具 → 结果 → 事件落库，可回放、可取消。
 
-状态：`ready to dispatch`
+状态：`in_progress`
 
 ## 阶段状态
 
@@ -38,6 +38,7 @@
 | H03 | H03 实施对话（pro 429，改 `auto/deepseek-v4.1-flash`） | `crates/hive-policy`、`crates/hive-tools`、migration V2 | `work/wt-h03`，`codex/h03-tools` | done, merged |
 | H07 | H07 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-llm` | `work/wt-h07`，`codex/h07-gateway` | done, merged |
 | H03b | 待派发 | 真实 Shell（argv/超时/进程树）、Win32 句柄级路径、连接级 IP 固定 | 新 worktree | pending |
+| H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | 新建 `crates/hive-agent`、`hive-llm` 真实 transport、migration V3 | `work/wt-h04`，`codex/h04-agent` | implementing |
 
 合并基线：`2e6582a`。H00 已解决 `Cargo.toml` member 与 `Cargo.lock` 冲突，合并后全量复验 125 passed / 2 ignored。
 
