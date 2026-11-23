@@ -7,9 +7,9 @@
 
 ## 当前门
 
-**H09b Routine + H03b-2 平台安全 + H10 s5 预算（并行）**
+**H09b Routine + H10 s5 预算 + R08 独立审计（并行）**
 
-目标：H09b 落 V6 Routine 定时触发与 API；H03b-2 补 Win32 句柄路径与连接级 IP；H10 接 s5 预算场景。H09a 与 H06d-1 已合并，基线推进到 `b1a108c`。
+目标：H09b 落 V6 Routine 定时触发与 API；H10 接 s5 预算场景；R08 只读审计预算/恢复/Shell/平台安全。H09a、H06d-1、H03b-2 已合并，基线推进到 `8f3e5f6`。
 
 状态：`in_progress`
 
@@ -30,7 +30,8 @@
 | H07 | 模型网关与路由 | done, verified（无真实 HTTP 适配器） | H01 |
 | H08 | 服务协议与 Web 控制台 | done, merged, verified | H05、H06、H07 |
 | H03b-1 | 真实 Shell：argv 直启、进程树、有界输出 | done, merged, verified（207/3） | H03 |
-| H03b-2 | Win32 句柄路径与连接级 IP | in_progress | H03b-1 |
+| H03b-2 | Win32 句柄路径与连接级 IP | done, merged, verified（236/1） | H03b-1 |
+| H03b-3 | 平台层接入生产路径（fs.* 句柄、网络工具 pinned connect） | pending | H03b-2 |
 | H09a | 预算账本 + 启动恢复 | done, merged, verified（217/3 + 主仓全绿） | H02、H08、H06c |
 | H09b | Routine 定时与 API | in_progress | H09a |
 | H09c | 可观测与保留 | blocked | H09b |
@@ -50,9 +51,10 @@
 | H03b-1 | 可见对话 `01a20875-6db0-7561-ad50-2053e7832da2`（pro high） | `crates/hive-tools` 的 `shell.run`、`hive-policy` 程序/参数策略、测试 | `.codex/worktrees/ed04/Hive`，基线 `e720968` | done, merged `d116166`, verified 207/3 |
 | H09a | 可见对话 `01a20877-15e5-7ad0-a650-eb3df9f9e3b3`（pro high） | V5 budgets、原子扣减、budget_exceeded、启动恢复扫描 | `.codex/worktrees/b2fb/Hive`，基线 `46d381d` | done, merged `5f3769c`, verified 217/3 |
 | H09b | 可见对话 `01a2089f-87cc-7281-8cfb-1a9c348b865b`（flash high） | V6 routines、表达式、幂等触发、tick、`/api/routines` | `.codex/worktrees/2b99/Hive`，基线 `5f3769c` | in_progress |
-| H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | in_progress |
+| H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H10 | 可见对话 `01a20878-248d-73f3-8924-0dc64342445a`（flash high） | `crates/hive-eval`、s5 预算场景、故障注入 | `.codex/worktrees/ca7e/Hive` | done harness, merged `096edb1`; s5 turn in progress |
 | H06d-1 | 可见对话 `01a20896-12bf-70c2-af65-97624eb3eb49`（flash high） | `crates/hive-workspace`、merge preview/merge、recycle | `.codex/worktrees/9744/Hive`，基线 `d116166` | done, merged `b1a108c`, verified 232/3 |
+| R08 | 可见对话 `01a208a9-6475-7ce1-997c-5b7fedcd7d36`（kimi high） | 只读审计预算/恢复/Shell/平台安全，只写 `docs/audits/R08-security-concurrency.md` | `.codex/worktrees/d707/Hive`，基线 `8f3e5f6` | in_progress |
 | H04 | H04 实施对话（`auto/deepseek-v4.1-flash`） | `crates/hive-agent`、`hive-llm` ureq transport、migration V3、审批门 | `work/wt-h04`，`codex/h04-agent` | done, merged |
 | H05 | H05 实施对话（`auto/deepseek-v4-pro`） | 新建 `crates/hive-runtime`、`CancellationToken` 上移 `hive-types` | `work/wt-h05`，`codex/h05-scheduler` | done, merged |
 | H05b | 可见对话 `01a207e0-8bd5-7ff1-8247-78c2156c82f3`（pro） | `ThreadedExecutor`、`AgentRunner: NodeExecutor`、语义收紧 | `.codex/worktrees/36e0/Hive` | done, merged |
@@ -62,7 +64,9 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`b1a108c`（H06d-1 合并后 H00 独立复验 `All checks passed`）。H08、H06b、H06c、H10、H03b-1、H09a 的测试均作为不退化门槛；V5 已冻结，V6 由 H09b 追加。
+合并基线：`8f3e5f6`（H03b-2 合并后 H00 独立复验 `All checks passed`；H03b-2 分支 236 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a 的测试均作为不退化门槛；V5 已冻结，V6 由 H09b 追加。
+
+平台安全现状：`hive-platform` 已提供句柄级路径与 pinned connect，但 `hive-tools` 的 fs.* 仍走应用层 `PathPolicy::authorize`，`hive-llm` 的 ureq 也未接 `connect_validated`。H03b-2 明确声明为“策略层就绪、未完成端到端防 DNS rebinding”，不得对外声称平台级安全已完成。
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
@@ -184,4 +188,5 @@
 | 2026-11-23 | H03b-1 | `ShellPolicy`、argv 直启、Job Object/进程组、有界输出、assign 失败清理 | 分支 207 passed / 3 ignored；合并后 `All checks passed` |
 | 2026-11-23 | H09a | V5 budgets、原子扣减、`node.budget_exceeded`、启动恢复五步、孤儿审批 fail-closed、AgentRunner 双路径接线 | 分支 217 passed / 3 ignored；合并后 `All checks passed`，迁移 fresh/V1–V4→V5 全绿 |
 | 2026-11-23 | H06d-1 | `head_revision`/`status`/`preview_merge`/`merge`/`recycle`，5 条真实 Git 仓库测试 | 分支与合并后均 `All checks passed`，hive-workspace 10 passed |
+| 2026-11-23 | H03b-2 | 新建 `hive-platform`：Win32 句柄遍历、junction 拒绝、`PinnedEndpoint`/`resolve_and_validate`/`connect_validated` | 分支 236 passed / 1 ignored；合并后 `All checks passed`；网络未接 ureq，已声明 |
 
