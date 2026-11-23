@@ -9,9 +9,11 @@ mod error;
 mod node_executor;
 mod runner;
 mod spec;
+mod worker_executor;
 
 pub use approval::{ApprovalPolicy, ApprovalRequest, StoreApprovalGate};
 pub use error::AgentError;
 pub use hive_types::CancellationToken;
 pub use runner::{AgentOutcome, AgentRunner};
 pub use spec::AgentSpec;
+pub use worker_executor::WorkerAgentExecutor;
