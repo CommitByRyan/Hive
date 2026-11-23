@@ -290,10 +290,17 @@ impl ToolDispatcher {
             }
         }
         .map_err(|error| {
-            ToolError::new(
+            let mut wrapped = ToolError::new(
                 error.error_code(),
                 format!("{}: {}", request.tool_name, error.message()),
-            )
+            );
+            if let Some(exit_code) = error.exit_code() {
+                wrapped = wrapped.with_exit_code(exit_code);
+            }
+            if let Some(output) = error.output() {
+                wrapped = wrapped.with_output(output.clone());
+            }
+            wrapped
         })
     }
 
@@ -362,18 +369,25 @@ impl ToolDispatcher {
         error: &ToolError,
         audit: &mut dyn AuditSink,
     ) -> ToolResult<()> {
-        self.audit_event(
-            context,
-            request,
-            EventKind::NodeToolResult,
-            json!({
-                "status": "error",
-                "code": error.code(),
-                "message": error.message(),
-                "truncated": false,
-            }),
-            audit,
-        )
+        let truncated = error
+            .output()
+            .map(|output| output.truncated)
+            .unwrap_or(false);
+        let summary = error
+            .output()
+            .map(|output| output.summary.clone())
+            .unwrap_or_default();
+        let mut payload = json!({
+            "status": "error",
+            "code": error.code(),
+            "message": error.message(),
+            "truncated": truncated,
+            "summary": summary,
+        });
+        if let Some(exit_code) = error.exit_code() {
+            payload["exit_code"] = json!(exit_code);
+        }
+        self.audit_event(context, request, EventKind::NodeToolResult, payload, audit)
     }
 }
 

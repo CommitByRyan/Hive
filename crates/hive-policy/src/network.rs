@@ -84,7 +84,25 @@ fn classify_v6(ip: Ipv6Addr) -> IpClass {
 pub struct NetworkPolicy {
     allowed_hosts: Vec<String>,
     allowed_ports: Vec<u16>,
+    exact_endpoints: Vec<ExactEndpoint>,
     enabled: bool,
+}
+
+/// A precise host:port rule for a configured gateway. Loopback is permitted
+/// only when the configured host itself is a loopback address (for example
+/// Magpie at `127.0.0.1:3425`); a non-loopback endpoint still requires every
+/// resolved address to be public.
+#[derive(Clone, Debug)]
+struct ExactEndpoint {
+    host: String,
+    port: u16,
+    loopback_permitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AddressExpectation {
+    PublicOnly,
+    LoopbackOnly,
 }
 
 impl NetworkPolicy {
@@ -99,20 +117,42 @@ impl NetworkPolicy {
         Self {
             allowed_hosts: hosts.into_iter().map(|host| host.to_lowercase()).collect(),
             allowed_ports: ports.into_iter().collect(),
+            exact_endpoints: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    /// Allow exactly one configured `host:port`, with no suffix or port-range
+    /// expansion. Loopback is admitted only when `host` itself is a loopback IP
+    /// literal; every other address class is still rejected.
+    pub fn allow_exact_endpoint(host: impl Into<String>, port: u16) -> Self {
+        let host = host.into().trim().trim_end_matches('.').to_lowercase();
+        let loopback_permitted = host
+            .parse::<IpAddr>()
+            .map(|ip| classify_ip(ip) == IpClass::Loopback)
+            .unwrap_or(false);
+        Self {
+            allowed_hosts: Vec::new(),
+            allowed_ports: Vec::new(),
+            exact_endpoints: vec![ExactEndpoint {
+                host,
+                port,
+                loopback_permitted,
+            }],
             enabled: true,
         }
     }
 
     pub fn check(&self, host: &str, port: u16, resolved: &[IpAddr]) -> Result<(), PolicyError> {
-        let host = self.check_host_and_port(host, port)?;
+        let (host, expectation) = self.match_host_port(host, port)?;
         if resolved.is_empty() {
             return Err(PolicyError::NetworkAddressDenied(format!(
                 "host {host} resolved to no addresses"
             )));
         }
         for ip in resolved {
-            let class = classify_ip(*ip);
-            if class != IpClass::Public {
+            if !self.address_allowed(*ip, expectation) {
+                let class = classify_ip(*ip);
                 return Err(PolicyError::NetworkAddressDenied(format!(
                     "host {host} resolved to denied {class:?} address {ip}"
                 )));
@@ -121,7 +161,11 @@ impl NetworkPolicy {
         Ok(())
     }
 
-    fn check_host_and_port(&self, host: &str, port: u16) -> Result<String, PolicyError> {
+    fn match_host_port(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<(String, AddressExpectation), PolicyError> {
         if !self.enabled {
             return Err(PolicyError::NetworkAddressDenied(
                 "network egress is denied by default".to_owned(),
@@ -137,6 +181,16 @@ impl NetworkPolicy {
                 "invalid host: {host}"
             )));
         }
+        for endpoint in &self.exact_endpoints {
+            if endpoint.host == host && endpoint.port == port {
+                let expectation = if endpoint.loopback_permitted {
+                    AddressExpectation::LoopbackOnly
+                } else {
+                    AddressExpectation::PublicOnly
+                };
+                return Ok((host, expectation));
+            }
+        }
         if !self.allowed_ports.contains(&port) {
             return Err(PolicyError::NetworkEndpointDenied(format!(
                 "port {port} is not allowed"
@@ -151,7 +205,14 @@ impl NetworkPolicy {
                 "host {host} is not allowed"
             )));
         }
-        Ok(host)
+        Ok((host, AddressExpectation::PublicOnly))
+    }
+
+    fn address_allowed(&self, ip: IpAddr, expectation: AddressExpectation) -> bool {
+        match expectation {
+            AddressExpectation::PublicOnly => classify_ip(ip) == IpClass::Public,
+            AddressExpectation::LoopbackOnly => classify_ip(ip) == IpClass::Loopback,
+        }
     }
 
     /// Resolve once and validate every A/AAAA address, pinning the validated
@@ -161,7 +222,7 @@ impl NetworkPolicy {
         host: &str,
         port: u16,
     ) -> Result<PinnedEndpoint, PolicyError> {
-        let host = self.check_host_and_port(host, port)?;
+        let (host, expectation) = self.match_host_port(host, port)?;
         let addresses = hive_platform::resolve_all(&host, port).map_err(|error| {
             PolicyError::NetworkAddressDenied(format!("cannot resolve {host}: {error}"))
         })?;
@@ -171,8 +232,8 @@ impl NetworkPolicy {
             )));
         }
         for address in &addresses {
-            let class = classify_ip(address.ip());
-            if class != IpClass::Public {
+            if !self.address_allowed(address.ip(), expectation) {
+                let class = classify_ip(address.ip());
                 return Err(PolicyError::NetworkAddressDenied(format!(
                     "host {host} resolved to denied {class:?} address {}",
                     address.ip()
@@ -425,6 +486,76 @@ mod tests {
 
         let capabilities = policy.net_capabilities();
         assert!(capabilities.connection_pinning);
-        assert!(!capabilities.dns_rebinding_resistant);
+        assert!(capabilities.dns_rebinding_resistant);
+    }
+
+    #[test]
+    fn exact_endpoint_permits_loopback_only_for_loopback_host() {
+        let loopback = NetworkPolicy::allow_exact_endpoint("127.0.0.1", 3425);
+
+        let endpoint = loopback
+            .resolve_and_validate("127.0.0.1", 3425)
+            .expect("loopback endpoint");
+        assert_eq!(endpoint.host(), "127.0.0.1");
+        assert_eq!(endpoint.port(), 3425);
+        assert_eq!(
+            endpoint.addresses(),
+            &[SocketAddr::from(([127, 0, 0, 1], 3425))]
+        );
+
+        assert_eq!(
+            loopback
+                .resolve_and_validate("127.0.0.1", 9999)
+                .expect_err("wrong port")
+                .code(),
+            "network.endpoint_denied"
+        );
+        assert_eq!(
+            loopback
+                .resolve_and_validate("127.0.0.2", 3425)
+                .expect_err("wrong host")
+                .code(),
+            "network.endpoint_denied"
+        );
+        assert_eq!(
+            loopback
+                .resolve_and_validate("localhost", 3425)
+                .expect_err("hostname is not the exact endpoint")
+                .code(),
+            "network.endpoint_denied"
+        );
+
+        // A loopback endpoint admits loopback but still rejects public addresses.
+        assert!(loopback
+            .check("127.0.0.1", 3425, &[v4("127.0.0.1")])
+            .is_ok());
+        assert_eq!(
+            loopback
+                .check("127.0.0.1", 3425, &[v4("8.8.8.8")])
+                .expect_err("public not loopback")
+                .code(),
+            "network.address_denied"
+        );
+
+        // A non-loopback endpoint keeps the default public-only rule and does
+        // not match suffixes or sibling hosts.
+        let public = NetworkPolicy::allow_exact_endpoint("example.com", 443);
+        assert!(public
+            .check("example.com", 443, &[v4("93.184.216.34")])
+            .is_ok());
+        assert_eq!(
+            public
+                .check("api.example.com", 443, &[v4("93.184.216.34")])
+                .expect_err("exact match only")
+                .code(),
+            "network.endpoint_denied"
+        );
+        assert_eq!(
+            public
+                .check("example.com", 443, &[v4("127.0.0.1")])
+                .expect_err("rebinding")
+                .code(),
+            "network.address_denied"
+        );
     }
 }

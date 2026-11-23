@@ -148,6 +148,52 @@ fn shell_program_denied_before_spawn() {
 }
 
 #[test]
+fn shell_nonzero_exit_reports_error_with_exit_code() {
+    let temp = TempDir::new("nonzero");
+    let helper = helper_path();
+    let dispatcher = enabled_dispatcher(temp.path(), &helper, Duration::from_secs(10), 4096);
+    let mut audit = RecordingAuditSink::default();
+
+    let error = dispatcher
+        .dispatch(
+            &context(),
+            ToolCall::new(
+                "shell.run",
+                json!({
+                    "program": helper.to_string_lossy(),
+                    "args": ["exit", "7"],
+                }),
+            ),
+            &mut audit,
+            &mut AllowAllApprovals,
+        )
+        .expect_err("nonzero exit");
+    assert_eq!(error.code(), "tool.execution_failed");
+    assert_eq!(error.exit_code(), Some(7));
+    let output = error.output().expect("bounded output summary");
+    assert!(!output.truncated);
+    assert_eq!(output.summary, "exit_code=7 truncated=false");
+
+    let result = audit
+        .events()
+        .iter()
+        .find(|event| event.kind == EventKind::NodeToolResult)
+        .expect("result event");
+    assert_eq!(result.payload["status"], "error");
+    assert_eq!(result.payload["code"], "tool.execution_failed");
+    assert_eq!(result.payload["exit_code"], 7);
+    assert_eq!(result.payload["summary"], "exit_code=7 truncated=false");
+    assert!(audit.events().iter().all(|event| {
+        event.kind != EventKind::NodeToolResult
+            || event
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                != Some("ok")
+    }));
+}
+
+#[test]
 fn shell_timeout_kills_descendants_and_truncates() {
     let temp = TempDir::new("timeout");
     let helper = helper_path();

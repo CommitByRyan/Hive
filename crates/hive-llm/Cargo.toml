@@ -10,3 +10,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq = "3.5"
+hive-policy = { path = "../hive-policy" }
