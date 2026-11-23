@@ -8,6 +8,7 @@ pub enum ErrorCode {
     PathUnsupportedForm,
     PathAdsForbidden,
     PathNotFound,
+    PathReparseEscape,
     NetworkAddressDenied,
     NetworkEndpointDenied,
     ShellDisabled,
@@ -32,6 +33,7 @@ impl ErrorCode {
             Self::PathUnsupportedForm => "path.unsupported_form",
             Self::PathAdsForbidden => "path.ads_forbidden",
             Self::PathNotFound => "path.not_found",
+            Self::PathReparseEscape => "path.reparse_escape",
             Self::NetworkAddressDenied => "network.address_denied",
             Self::NetworkEndpointDenied => "network.endpoint_denied",
             Self::ShellDisabled => "shell.disabled",
@@ -67,6 +69,8 @@ pub enum PolicyError {
     PathAdsForbidden(String),
     #[error("path does not exist or cannot be resolved: {0}")]
     PathNotFound(String),
+    #[error("reparse point escape is forbidden: {0}")]
+    PathReparseEscape(String),
     #[error("network address is denied: {0}")]
     NetworkAddressDenied(String),
     #[error("network endpoint is denied: {0}")]
@@ -110,6 +114,7 @@ impl PolicyError {
             Self::PathUnsupportedForm(_) => ErrorCode::PathUnsupportedForm,
             Self::PathAdsForbidden(_) => ErrorCode::PathAdsForbidden,
             Self::PathNotFound(_) => ErrorCode::PathNotFound,
+            Self::PathReparseEscape(_) => ErrorCode::PathReparseEscape,
             Self::NetworkAddressDenied(_) => ErrorCode::NetworkAddressDenied,
             Self::NetworkEndpointDenied(_) => ErrorCode::NetworkEndpointDenied,
             Self::ShellDisabled => ErrorCode::ShellDisabled,
@@ -144,6 +149,8 @@ mod tests {
             "path.unsupported_form"
         );
         assert_eq!(ErrorCode::PathAdsForbidden.code(), "path.ads_forbidden");
+        assert_eq!(ErrorCode::PathNotFound.code(), "path.not_found");
+        assert_eq!(ErrorCode::PathReparseEscape.code(), "path.reparse_escape");
         assert_eq!(
             ErrorCode::NetworkAddressDenied.code(),
             "network.address_denied"

@@ -15,7 +15,7 @@ mod shell;
 
 pub use error::{ErrorCode, PolicyError};
 pub use hash::{canonical_json, request_hash, HashRequest};
-pub use network::{classify_ip, IpClass, NetworkPolicy};
-pub use path::{is_within, AuthorizedPath, PathAccess, PathPolicy};
+pub use network::{classify_ip, IpClass, NetworkPolicy, PinnedEndpoint};
+pub use path::{is_within, AuthorizedPath, HandleAuthorizedPath, PathAccess, PathPolicy};
 pub use registry::{ApprovalMode, RiskLevel, ToolRegistry, ToolSpec};
 pub use shell::ShellPolicy;
