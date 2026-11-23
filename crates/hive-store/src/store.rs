@@ -12,9 +12,10 @@ use uuid::Uuid;
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AgentSessionRecord, AgentSessionState, ApprovalDecision, ApprovalInput, ApprovalRecord,
-    HandoffRecord, LeaseGuard, MissionAggregate, MissionRecord, NewAgentSession, NewTurnUsage,
-    NodeRecord, RunRecord, SnapshotInput, SnapshotRecord, ToolAuditRecord, TurnRecord, TurnState,
-    TurnUsageRecord, UsageSource,
+    ArtifactRecord, HandoffRecord, LeaseGuard, MissionAggregate, MissionListRecord, MissionRecord,
+    MissionSnapshotRecord, NewAgentSession, NewTurnUsage, NodeRecord, RunRecord, SnapshotInput,
+    SnapshotRecord, StateSnapshotRecord, ToolAuditRecord, TurnRecord, TurnState, TurnUsageRecord,
+    UsageSource,
 };
 use crate::schema;
 use crate::time::{now_ms, now_rfc3339};
@@ -1308,6 +1309,379 @@ impl Store {
         }
         Ok(out)
     }
+
+    pub fn list_missions(&self, limit: u64, offset: u64) -> StoreResult<Vec<MissionListRecord>> {
+        let limit =
+            i64::try_from(limit).map_err(|_| StoreError::Conflict("limit too large".to_owned()))?;
+        let offset = i64::try_from(offset)
+            .map_err(|_| StoreError::Conflict("offset too large".to_owned()))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT m.mission_id, m.state, m.title, m.goal, m.created_at_ms, m.updated_at_ms, \
+             (SELECT MAX(seq) FROM events e WHERE e.mission_id = m.mission_id), \
+             (SELECT COUNT(*) FROM approvals a WHERE a.mission_id = m.mission_id AND a.state = 'pending') \
+             FROM missions m \
+             ORDER BY m.updated_at_ms DESC, m.created_at_ms DESC, m.mission_id \
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit, offset], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, state, title, goal, created_at_ms, updated_at_ms, last_seq, pending) = row?;
+            out.push(MissionListRecord {
+                mission: MissionRecord {
+                    mission_id: MissionId::parse(&id)?,
+                    state: MissionState::parse(&state)?,
+                    title,
+                    goal,
+                    created_at_ms,
+                    updated_at_ms,
+                },
+                last_seq: last_seq.map(|seq| seq as u64),
+                pending_approvals: pending as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn state_snapshot(&self) -> StoreResult<StateSnapshotRecord> {
+        let tx = self.conn.unchecked_transaction()?;
+        let missions = list_missions_on(&tx, 60, 0)?;
+        let approvals = list_pending_approvals_on(&tx, now_ms())?;
+        let last_seq = latest_seq_on(&tx)?;
+        let (mission_count, run_count, node_count, event_count) = counts_on(&tx)?;
+        let pending_approval_count = approvals.len() as u64;
+        tx.commit()?;
+        Ok(StateSnapshotRecord {
+            missions,
+            approvals,
+            last_seq,
+            mission_count,
+            run_count,
+            node_count,
+            event_count,
+            pending_approval_count,
+        })
+    }
+
+    pub fn mission_snapshot(
+        &self,
+        mission_id: MissionId,
+        after_seq: u64,
+        event_limit: u64,
+        runs_limit: u64,
+        nodes_limit: u64,
+    ) -> StoreResult<Option<MissionSnapshotRecord>> {
+        let after_seq = http_cursor(after_seq)?;
+        let event_limit = i64::try_from(event_limit)
+            .map_err(|_| StoreError::Conflict("event_limit too large".to_owned()))?;
+        let runs_limit = i64::try_from(runs_limit)
+            .map_err(|_| StoreError::Conflict("runs_limit too large".to_owned()))?;
+        let nodes_limit = i64::try_from(nodes_limit)
+            .map_err(|_| StoreError::Conflict("nodes_limit too large".to_owned()))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(mission) = query_mission(&tx, mission_id)? else {
+            return Ok(None);
+        };
+        let runs = query_runs_limited(&tx, mission_id, runs_limit)?;
+        let nodes = query_nodes_limited(&tx, mission_id, nodes_limit)?;
+        let approvals = query_approvals_by_mission(&tx, mission_id)?;
+        let artifacts = query_artifacts(&tx, mission_id)?;
+        let messages = query_messages(&tx, mission_id)?;
+        let events = query_events_page(&tx, Some(mission_id), after_seq, event_limit)?;
+        let last_seq = mission_latest_seq_on(&tx, mission_id)?;
+        tx.commit()?;
+        Ok(Some(MissionSnapshotRecord {
+            mission,
+            runs,
+            nodes,
+            approvals,
+            artifacts,
+            messages,
+            events,
+            last_seq,
+        }))
+    }
+
+    pub fn read_events_for_sse(
+        &self,
+        mission_id: Option<MissionId>,
+        after_seq: u64,
+    ) -> StoreResult<(Vec<EventEnvelope>, Option<u64>)> {
+        let after_seq = http_cursor(after_seq)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let events = query_events_page(&tx, mission_id, after_seq, i64::MAX)?;
+        let last_seq = latest_seq_on(&tx)?;
+        tx.commit()?;
+        Ok((events, last_seq))
+    }
+
+    pub fn get_artifact(
+        &self,
+        artifact_id: hive_types::ArtifactId,
+    ) -> StoreResult<Option<ArtifactRecord>> {
+        query_artifact(&self.conn, artifact_id)
+    }
+
+    pub fn list_artifacts(&self, mission_id: MissionId) -> StoreResult<Vec<ArtifactRecord>> {
+        query_artifacts(&self.conn, mission_id)
+    }
+}
+
+fn http_cursor(seq: u64) -> StoreResult<i64> {
+    if seq > MAX_SEQ {
+        return Err(StoreError::SequenceExhausted);
+    }
+    i64::try_from(seq).map_err(|_| StoreError::SequenceExhausted)
+}
+
+fn list_missions_on(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> StoreResult<Vec<MissionListRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.mission_id, m.state, m.title, m.goal, m.created_at_ms, m.updated_at_ms, \
+         (SELECT MAX(seq) FROM events e WHERE e.mission_id = m.mission_id), \
+         (SELECT COUNT(*) FROM approvals a WHERE a.mission_id = m.mission_id AND a.state = 'pending') \
+         FROM missions m \
+         ORDER BY m.updated_at_ms DESC, m.created_at_ms DESC, m.mission_id \
+         LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![limit, offset], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, i64>(7)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, state, title, goal, created_at_ms, updated_at_ms, last_seq, pending) = row?;
+        out.push(MissionListRecord {
+            mission: MissionRecord {
+                mission_id: MissionId::parse(&id)?,
+                state: MissionState::parse(&state)?,
+                title,
+                goal,
+                created_at_ms,
+                updated_at_ms,
+            },
+            last_seq: last_seq.map(|seq| seq as u64),
+            pending_approvals: pending as u64,
+        });
+    }
+    Ok(out)
+}
+
+fn latest_seq_on(conn: &Connection) -> StoreResult<Option<u64>> {
+    let value: Option<i64> = conn.query_row("SELECT MAX(seq) FROM events", [], |row| row.get(0))?;
+    Ok(value.map(|seq| seq as u64))
+}
+
+fn mission_latest_seq_on(conn: &Connection, mission_id: MissionId) -> StoreResult<Option<u64>> {
+    let value: Option<i64> = conn.query_row(
+        "SELECT MAX(seq) FROM events WHERE mission_id = ?1",
+        params![mission_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(value.map(|seq| seq as u64))
+}
+
+fn counts_on(conn: &Connection) -> StoreResult<(u64, u64, u64, u64)> {
+    let missions: i64 = conn.query_row("SELECT COUNT(*) FROM missions", [], |row| row.get(0))?;
+    let runs: i64 = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+    let nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
+    let events: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+    Ok((missions as u64, runs as u64, nodes as u64, events as u64))
+}
+
+fn list_pending_approvals_on(conn: &Connection, now_ms: i64) -> StoreResult<Vec<ApprovalRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM approvals WHERE state = 'pending' AND expires_at_ms > ?1 ORDER BY expires_at_ms ASC"
+    ))?;
+    let rows = stmt.query_map(params![now_ms], raw_approval_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(parse_approval(row?)?);
+    }
+    Ok(out)
+}
+
+fn query_runs_limited(
+    conn: &Connection,
+    mission_id: MissionId,
+    limit: i64,
+) -> StoreResult<Vec<RunRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT run_id, mission_id, state, created_at_ms, updated_at_ms FROM runs WHERE mission_id = ?1 ORDER BY run_id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![mission_id.to_string(), limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, mission_id, state, created_at_ms, updated_at_ms) = row?;
+        out.push(RunRecord {
+            run_id: RunId::parse(&id)?,
+            mission_id: MissionId::parse(&mission_id)?,
+            state: RunState::parse(&state)?,
+            created_at_ms,
+            updated_at_ms,
+        });
+    }
+    Ok(out)
+}
+
+fn query_nodes_limited(
+    conn: &Connection,
+    mission_id: MissionId,
+    limit: i64,
+) -> StoreResult<Vec<NodeRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLUMNS} FROM nodes WHERE mission_id = ?1 ORDER BY node_id LIMIT ?2"
+    ))?;
+    let rows = stmt.query_map(params![mission_id.to_string(), limit], raw_node_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(parse_node(row?)?);
+    }
+    Ok(out)
+}
+
+fn query_approvals_by_mission(
+    conn: &Connection,
+    mission_id: MissionId,
+) -> StoreResult<Vec<ApprovalRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM approvals WHERE mission_id = ?1 ORDER BY created_at_ms ASC"
+    ))?;
+    let rows = stmt.query_map(params![mission_id.to_string()], raw_approval_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(parse_approval(row?)?);
+    }
+    Ok(out)
+}
+
+fn query_artifact(
+    conn: &Connection,
+    artifact_id: hive_types::ArtifactId,
+) -> StoreResult<Option<ArtifactRecord>> {
+    let row = conn
+        .query_row(
+            "SELECT artifact_id, mission_id, node_id, tool_call_id, path, sha256, size_bytes, created_at_ms FROM artifacts WHERE artifact_id = ?1",
+            params![artifact_id.to_string()],
+            raw_artifact_row,
+        )
+        .optional()?;
+    row.map(parse_artifact).transpose()
+}
+
+fn query_artifacts(conn: &Connection, mission_id: MissionId) -> StoreResult<Vec<ArtifactRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT artifact_id, mission_id, node_id, tool_call_id, path, sha256, size_bytes, created_at_ms FROM artifacts WHERE mission_id = ?1 ORDER BY created_at_ms ASC",
+    )?;
+    let rows = stmt.query_map(params![mission_id.to_string()], raw_artifact_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(parse_artifact(row?)?);
+    }
+    Ok(out)
+}
+
+type ArtifactRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+    i64,
+);
+
+fn raw_artifact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn parse_artifact(raw: ArtifactRow) -> StoreResult<ArtifactRecord> {
+    let (artifact_id, mission_id, node_id, tool_call_id, path, sha256, size_bytes, created_at_ms) =
+        raw;
+    Ok(ArtifactRecord {
+        artifact_id: hive_types::ArtifactId::parse(&artifact_id)?,
+        mission_id: MissionId::parse(&mission_id)?,
+        node_id: node_id.map(|id| NodeId::parse(&id)).transpose()?,
+        tool_call_id: tool_call_id.map(|id| ToolCallId::parse(&id)).transpose()?,
+        path,
+        sha256,
+        size_bytes,
+        created_at_ms,
+    })
+}
+
+fn query_messages(conn: &Connection, mission_id: MissionId) -> StoreResult<Vec<EventEnvelope>> {
+    let mut stmt = conn.prepare(
+        "SELECT envelope_json FROM events WHERE mission_id = ?1 AND kind = 'message.user' ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map(params![mission_id.to_string()], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
+    }
+    Ok(out)
+}
+
+fn query_events_page(
+    conn: &Connection,
+    mission_id: Option<MissionId>,
+    after_seq: i64,
+    limit: i64,
+) -> StoreResult<Vec<EventEnvelope>> {
+    let mut stmt = conn.prepare(
+        "SELECT envelope_json FROM events WHERE (?1 IS NULL OR mission_id = ?1) AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![mission_id.map(|id| id.to_string()), after_seq, limit],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str(&row?)?);
+    }
+    Ok(out)
 }
 
 const NODE_COLUMNS: &str = "node_id, mission_id, run_id, state, attempt_no, retry_budget, lease_token, lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms";

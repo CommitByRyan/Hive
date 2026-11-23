@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hive Console</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 0; display: grid;
+           grid-template-columns: 280px 1fr 320px; height: 100vh; }
+    aside, section, nav { padding: 12px; overflow: auto; border-right: 1px solid #8882; }
+    nav { border-right: 0; }
+    h1, h2 { font-size: 15px; margin: 0 0 8px; }
+    button, input, textarea { font: inherit; }
+    ul { list-style: none; margin: 0; padding: 0; }
+    li { padding: 8px; border-bottom: 1px solid #8882; cursor: pointer; }
+    li.active { background: #36f2; }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+    .muted { opacity: .6; }
+    code { font-family: ui-monospace, monospace; }
+    .status { position: fixed; right: 12px; top: 12px; }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>Missions</h1>
+    <form id="create">
+      <input name="title" placeholder="标题（可选）" />
+      <textarea name="goal" placeholder="目标" required></textarea>
+      <button>创建</button>
+    </form>
+    <ul id="missions"></ul>
+  </aside>
+  <section id="detail"><h2>选择或创建 Mission</h2></section>
+  <nav>
+    <h2>审批面板</h2>
+    <ul id="approvals"></ul>
+    <h2>产物列表</h2>
+    <ul id="artifacts"></ul>
+    <h2>事件流</h2>
+    <div id="events" class="mono"></div>
+  </nav>
+  <div id="conn" class="status muted">disconnected</div>
+  <script>
+    const store = { snapshot: null, events: new Map(), localLastSeq: 0, selection: null };
+    const $ = (id) => document.getElementById(id);
+
+    async function api(path, options = {}) {
+      const init = { ...options };
+      if (init.body && typeof init.body === 'object') {
+        init.body = JSON.stringify(init.body);
+        init.headers = { 'content-type': 'application/json', ...(init.headers || {}) };
+      }
+      const res = await fetch('/api' + path, init);
+      if (res.status === 204) return null;
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : null;
+      if (!res.ok) throw new Error((data && data.error && data.error.code) || res.status);
+      return data;
+    }
+
+    function esc(text) {
+      return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    function observationClass(obs) { return obs === 'waiting_approval' ? 'active' : ''; }
+
+    async function refreshMissions() {
+      const data = await api('/missions');
+      store.localLastSeq = Math.max(store.localLastSeq, data.last_seq || 0);
+      $('missions').innerHTML = data.missions.map((m) =>
+        `<li data-id="${esc(m.id)}" class="${m.id === store.selection ? 'active' : ''}">
+          <div>${esc(m.title || m.id)} <span class="muted">(${esc(m.observation)})</span></div>
+          <div class="muted">${esc(m.goal)}</div>
+        </li>`).join('');
+      document.querySelectorAll('#missions li').forEach((el) =>
+        el.addEventListener('click', () => select(el.dataset.id)));
+    }
+
+    async function select(id) {
+      store.selection = id;
+      const data = await api(`/missions/${id}`);
+      store.localLastSeq = Math.max(store.localLastSeq, data.last_seq || 0);
+      renderDetail(data);
+      refreshMissions();
+    }
+
+    function renderDetail(data) {
+      const m = data.mission;
+      const nodes = data.nodes.map((n) =>
+        `<div>${esc(n.id)} <span class="muted">${esc(n.state)} attempt ${n.attempt_no}</span></div>`).join('');
+      $('detail').innerHTML = `<h2>${esc(m.title || m.id)} <span class="muted">(${esc(m.observation)})</span></h2>
+        <p>${esc(m.goal)}</p><h2>DAG / Nodes</h2>${nodes}`;
+      $('artifacts').innerHTML = data.artifacts.map((a) =>
+        `<li>${esc(a.path)} <span class="muted">${a.size_bytes} B</span></li>`).join('');
+      $('approvals').innerHTML = data.approvals.filter((a) => a.state === 'pending').map((a) =>
+        `<li>${esc(a.tool_name)} <span class="muted">${esc(a.request_hash_prefix)}</span>
+          <button data-id="${esc(a.id)}" data-act="approve">批准</button>
+          <button data-id="${esc(a.id)}" data-act="reject">拒绝</button></li>`).join('');
+      document.querySelectorAll('#approvals button').forEach((b) =>
+        b.addEventListener('click', () => decide(b.dataset.id, b.dataset.act)));
+      const events = data.events.map((e) => `${e.seq} ${e.kind}`).join('\n');
+      $('events').textContent = events;
+    }
+
+    async function decide(id, decision) {
+      await api(`/approvals/${id}`, { method: 'POST', body: { decision } });
+      if (store.selection) select(store.selection);
+    }
+
+    $('create').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = new FormData(event.target);
+      await api('/missions', { method: 'POST', body: { title: form.get('title') || undefined, goal: form.get('goal') } });
+      event.target.reset();
+      refreshMissions();
+    });
+
+    function connect() {
+      const source = new EventSource(`/api/events?after_seq=${store.localLastSeq}`);
+      $('conn').textContent = 'connecting';
+      source.onopen = () => { $('conn').textContent = 'connected'; };
+      source.addEventListener('hive.lagged', async () => {
+        $('conn').textContent = 'lagged';
+        if (store.selection) await select(store.selection);
+      });
+      source.onmessage = (event) => {
+        const env = JSON.parse(event.data);
+        if (env.seq > store.localLastSeq) store.localLastSeq = env.seq;
+        if (store.selection && env.mission_id === store.selection) {
+          $('events').textContent += `\n${env.seq} ${env.kind}`;
+        }
+      };
+      source.onerror = () => { $('conn').textContent = 'disconnected'; source.close(); };
+    }
+
+    refreshMissions().catch((error) => { $('detail').textContent = error.message; });
+    connect();
+  </script>
+</body>
+</html>
