@@ -8,6 +8,7 @@ members = [
     "crates/hive-events",
     "crates/hive-policy",
     "crates/hive-tools",
+    "crates/hive-llm",
 ]
 
 [workspace.package]
