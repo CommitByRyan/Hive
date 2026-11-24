@@ -60,8 +60,8 @@
 | H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（pro/glm 429 后切 `auto/deepseek-v4.1-flash` high） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | done, merged `ae93876`, verified 314/1 |
 | H11 | 可见对话 `01a20c32-929a-7951-9b5c-ce54e12557ef`（`auto/deepseek-v4.1-flash` high） | H11a `.env`/config migrate/db migrate dry-run/备份/doctor；H11b 打包、安装、干净演练与发布文档；H11c 安装闭环修复 | `.codex/worktrees/7086/Hive`，分支 `codex/h11-release`，基线 `20bd9a5` | done, merged `ac325a2`, verified 334/1 |
 | H11 审计 | 可见对话 `01a20c4d-bef8-7140-b53f-3c77b9c22d3d`（`auto/glm-5.3` max） | 只读复核三提交、dist zip、安装/回滚与演练证据 | main 只读 | done，可合并，P0/P1 清零 |
-| H12 | 待开可见对话（`auto/deepseek-v4.1-flash` high） | 保留水位 sidecar、写入顺序、重启语义、启动/周期归档、配置与健康暴露 | 新建 `codex/h12-retention` worktree，基线 `cc16663` | ready |
-| H13 | 待开可见对话（`auto/deepseek-v4.1-flash` high） | `RecyclePolicy` 默认保留 dirty、显式强删、测试与 H06d 文档 | 新建 `codex/h13-recycle` worktree，基线 `cc16663` | ready |
+| H12 | 可见对话 `01a20c75-6996-7702-b690-990c8c3568c2`（`auto/deepseek-v4.1-flash` high） | 保留水位 sidecar、写入顺序、重启语义、启动/周期归档、配置与健康暴露 | `.codex/worktrees/6bc9/Hive`，分支 `codex/h12-retention`，基线 `1ad0d27` | in_progress |
+| H13 | 可见对话 `01a20c75-8b6b-7980-9b34-2628b2be8a2b`（`auto/deepseek-v4.1-flash` high） | `RecyclePolicy` 默认保留 dirty、显式强删、测试与 H06d 文档 | `.codex/worktrees/6576/Hive`，分支 `codex/h13-recycle`，基线 `1ad0d27` | in_progress |
 | H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | done, merged `6dd9dbc`, verified 304/1 |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
