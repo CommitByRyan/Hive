@@ -9,9 +9,9 @@
 
 **0.1.1 加固版打包**
 
-目标：H12/H13 已完成并合并；H12 还修复了 `AppState` clone Drop 误置 shutdown、导致 tick 循环在请求后停摆的 H09d 缺陷。下一步把版本升到 `0.1.1`，重建发布包并做一次安装/健康/重启演练。当前基线 `9fec1c8`（主仓 351 passed / 1 ignored）。0.1.0 包 SHA256 为 `9b32c8d2…aa8734`，仅作为上一版记录。
+目标：H12/H13 已完成并合并；H12 还修复了 `AppState` clone Drop 误置 shutdown、导致 tick 循环在请求后停摆的 H09d 缺陷。版本已升到 `0.1.1`，发布包已重建并完成干净演练。发布提交 `693acfd`，主仓 `scripts/verify.ps1` → `All checks passed`，351 passed / 1 ignored。发布包 `dist/hive-0.1.1-windows-x86_64.zip`，SHA256 `128f09b4d7876c24dfcce2bb55ec34d3838fbe84a39d5c646e005b21be3707c5`。
 
-状态：`in_progress`
+状态：`done`
 
 ## 阶段状态
 
@@ -78,7 +78,7 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`9fec1c8`（H12 合并后；主仓独立复验 `All checks passed`，351 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4、H09c、H11、H13 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结，H11/H12 未改迁移 SQL。
+合并基线：`693acfd`（0.1.1 发布提交；主仓复验 `All checks passed`，351 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4、H09c、H11、H13 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结，H11/H12/0.1.1 未改迁移 SQL。
 
 平台安全现状：`hive-llm` 的 ureq 已接 `NetworkPolicy` 单次解析 + 显式 `TcpConnector + RustlsConnector`，并禁用环境代理与重定向；通用网络工具仍关闭。`fs.read/write/list` 已走授权父目录句柄相对 IO，原子替换用 `ReplaceFileW`/`MoveFileEx` 并复核父目录身份，但 `atomic_replace_handle_relative=false`，仍有已记录的路径级残余窗口；非 Windows 回退不是句柄级隔离。Shell 非零退出已改为结构化 `status:"error"` + `exit_code`。
 
@@ -222,4 +222,5 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | 2026-11-24 | H13 | `RecyclePolicy` 默认 `keep_dirty=true`；显式 `false` 才强删；3 条回收测试与 H06d/H13 runbook | 分支 `1951fe0`；worktree 337 passed / 1 ignored；主仓合并 `92c2487` |
 | 2026-11-24 | H12 | `retention.json` 保留水位 sidecar（先持久化再删行）、重启 409/health 语义、`HIVE_RETENTION_DAYS`/`HIVE_ARCHIVE_DIR`、启动/小时级归档、`RetentionPolicy` | `25748e9` + `3000572` + `421de8d`；主仓合并 `9fec1c8`，351 passed / 1 ignored；sidecar 第二次归档替换用例真跑 |
 | 2026-11-24 | H12c | 修复 `AppState` clone Drop 误置 shutdown（H09d tick 循环会在请求后停摆）；补 clone/owner Drop 两条回归 | 同 `421de8d`；`hive-server --lib` 2 passed |
+| 2026-11-24 | 0.1.1 发布 | 版本 0.1.1、CHANGELOG/RELEASE/README/包内样例；保留水位与脏 worktree 限制；最终包与 18766–18769 干净演练 | `693acfd`；`scripts/verify.ps1` 351/1；zip SHA256 `128f09b4…07c5`；启动归档 floor=2、重启 409 保持、最终包二进制与候选包一致 |
 
