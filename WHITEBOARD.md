@@ -7,9 +7,9 @@
 
 ## 当前门
 
-**Post-release 加固：H12 保留水位 + H13 worktree 回收安全（并行）**
+**Post-release 加固：H12 保留水位与自动归档**
 
-目标：H12 修复 `retained_since_seq` 重启丢失并把终态 Mission 归档接入启动/周期生命周期；H13 把 dirty worktree 回收默认改为保留、显式才强删。H01–H11 已完成；发布包 `dist/hive-0.1.0-windows-x86_64.zip`，SHA256 `9b32c8d2adaa8b44fad3a9d584ec2f2a3ae2cc4162b2558d142df25e60aa8734`。当前基线 `cc16663`（主仓 334 passed / 1 ignored）。
+目标：H12 修复 `retained_since_seq` 重启丢失并把终态 Mission 归档接入启动/周期生命周期。H13 已合并（默认保留 dirty worktree，显式才强删）。H01–H11 已完成；发布包 `dist/hive-0.1.0-windows-x86_64.zip`，SHA256 `9b32c8d2adaa8b44fad3a9d584ec2f2a3ae2cc4162b2558d142df25e60aa8734`。当前基线 `92c2487`（H13 合并；H13 worktree 337 passed / 1 ignored，主仓待最终复验）。
 
 状态：`in_progress`
 
@@ -43,7 +43,7 @@
 | H10 | 评估、故障注入、性能 | done, verified（release 6 场景 × 6 次，36/36 ok） | H06 |
 | H11 | 发布与迁移 | done, merged, verified（334/1；独立审计 P0/P1 清零） | H10 |
 | H12 | 保留水位持久化与自动归档 | in_progress | H11、H09c |
-| H13 | worktree 回收的脏数据安全 | in_progress | H11、H06d-1 |
+| H13 | worktree 回收的脏数据安全 | done, merged, verified（337/1） | H11、H06d-1 |
 
 ## 活跃工作
 
@@ -61,7 +61,7 @@
 | H11 | 可见对话 `01a20c32-929a-7951-9b5c-ce54e12557ef`（`auto/deepseek-v4.1-flash` high） | H11a `.env`/config migrate/db migrate dry-run/备份/doctor；H11b 打包、安装、干净演练与发布文档；H11c 安装闭环修复 | `.codex/worktrees/7086/Hive`，分支 `codex/h11-release`，基线 `20bd9a5` | done, merged `ac325a2`, verified 334/1 |
 | H11 审计 | 可见对话 `01a20c4d-bef8-7140-b53f-3c77b9c22d3d`（`auto/glm-5.3` max） | 只读复核三提交、dist zip、安装/回滚与演练证据 | main 只读 | done，可合并，P0/P1 清零 |
 | H12 | 可见对话 `01a20c75-6996-7702-b690-990c8c3568c2`（`auto/deepseek-v4.1-flash` high） | 保留水位 sidecar、写入顺序、重启语义、启动/周期归档、配置与健康暴露 | `.codex/worktrees/6bc9/Hive`，分支 `codex/h12-retention`，基线 `1ad0d27` | in_progress |
-| H13 | 可见对话 `01a20c75-8b6b-7980-9b34-2628b2be8a2b`（`auto/deepseek-v4.1-flash` high） | `RecyclePolicy` 默认保留 dirty、显式强删、测试与 H06d 文档 | `.codex/worktrees/6576/Hive`，分支 `codex/h13-recycle`，基线 `1ad0d27` | in_progress |
+| H13 | 可见对话 `01a20c75-8b6b-7980-9b34-2628b2be8a2b`（`auto/deepseek-v4.1-flash` high） | `RecyclePolicy` 默认保留 dirty、显式强删、测试与 H06d 文档 | `.codex/worktrees/6576/Hive`，分支 `codex/h13-recycle`，基线 `1ad0d27` | done, merged `92c2487`, verified 337/1 |
 | H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | done, merged `6dd9dbc`, verified 304/1 |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
@@ -219,4 +219,5 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | 2026-11-24 | H10 基准 | H00 在空闲机器用 release harness 采集 6 场景 ×（1 预热 + 5 样本），写入 p50/p95、events/sec、db_bytes 与机器元数据 | 36/36 `ok:true`；报告 `docs/audits/H10-benchmark-report.md` §9，原始 JSONL `docs/audits/data/` |
 | 2026-11-24 | H11 | `.env` 解析与严格未知键、`config migrate`/`db migrate --dry-run`（VACUUM INTO 副本）、启动前备份、安装包 doctor 语义、打包/安装脚本、RELEASE/CHANGELOG、18765 干净演练 | `3e08bf5` + `0a3d9c8` + `66d1d5c`；主仓合并后 `All checks passed`，334 passed / 1 ignored；zip SHA256 `9b32c8d2…aa8734` |
 | 2026-11-24 | H11 审计 | 独立只读审计三提交、包体 8 项、安装/回滚/迁移证据，复核修复轮 | 结论可合并；P0/P1 清零；P2 迁移失败副本测试已补；P3 无 |
+| 2026-11-24 | H13 | `RecyclePolicy` 默认 `keep_dirty=true`；显式 `false` 才强删；3 条回收测试与 H06d/H13 runbook | 分支 `1951fe0`；worktree 337 passed / 1 ignored；主仓合并 `92c2487` |
 
