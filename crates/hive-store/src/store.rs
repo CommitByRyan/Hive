@@ -5551,12 +5551,32 @@ mod tests {
             .archive_mission(&dir.path().join("archive"), mission.mission_id, 1)
             .expect("archive");
         assert_eq!(report.retained_since_seq, 3);
+
+        // A second archive must replace the existing sidecar rather than fail
+        // on an existing target file.
+        let second = store.create_mission("m2", "g", 0).expect("second mission");
+        store
+            .append_event(&event(
+                second.mission_id,
+                None,
+                EventKind::MissionCancelled,
+                None,
+            ))
+            .expect("second event");
+        store
+            .transition_mission(second.mission_id, MissionState::Cancelled, 0)
+            .expect("second terminal");
+        let report = store
+            .archive_mission(&dir.path().join("archive"), second.mission_id, 1)
+            .expect("second archive");
+        assert_eq!(report.retained_since_seq, 4);
+
         let sidecar = std::fs::read_to_string(dir.path().join("retention.json")).expect("sidecar");
-        assert!(sidecar.contains("\"retained_since_seq\":3"));
+        assert!(sidecar.contains("\"retained_since_seq\":4"));
         drop(store);
 
         let reopened = Store::open(&db).expect("reopen");
-        assert_eq!(reopened.retained_since_seq().expect("floor"), 3);
+        assert_eq!(reopened.retained_since_seq().expect("floor"), 4);
         assert!(reopened
             .read_all_events()
             .expect("events after reopen")

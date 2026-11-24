@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hive_events::{EventBus, MissionFilter};
 use hive_llm::ModelCatalog;
-use hive_runtime::global_metrics;
+use hive_runtime::{global_metrics, RetentionPolicy};
 use hive_store::Store;
 use hive_types::{EventEnvelope, EventInput};
 use tokio::sync::broadcast;
@@ -16,7 +16,9 @@ use crate::SSE_QUEUE_CAPACITY;
 /// Default interval for the background routine/lease tick.
 pub const TICK_PERIOD: Duration = Duration::from_secs(1);
 
-#[derive(Clone)]
+/// Default interval for the low-frequency retention archive pass.
+pub const RETENTION_PERIOD: Duration = Duration::from_secs(3600);
+
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub bus: Arc<EventBus>,
@@ -27,6 +29,7 @@ pub struct AppState {
     pub mode: String,
     pub host: String,
     pub port: u16,
+    owns_shutdown: bool,
 }
 
 impl AppState {
@@ -44,6 +47,7 @@ impl AppState {
             mode,
             host,
             port,
+            owns_shutdown: true,
         };
         state.refresh_latest_seq();
         global_metrics().set_approval_pending(0);
@@ -126,10 +130,53 @@ impl AppState {
             }
         });
     }
+
+    /// Start a stoppable low-frequency retention loop. Each pass locks the
+    /// store, archives expired terminal missions and logs failures without
+    /// exiting the process. The loop exits when the owning state is dropped.
+    pub fn start_retention_loop(&self, period: Duration, policy: RetentionPolicy) {
+        let store = self.store.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now_ms = hive_store::now_ms();
+                if let Ok(mut guard) = store.lock() {
+                    if let Err(error) = hive_runtime::retention_once(&mut guard, now_ms, &policy) {
+                        eprintln!("retention archive failed: {error}");
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl Clone for AppState {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            bus: self.bus.clone(),
+            events_tx: self.events_tx.clone(),
+            latest_seq: self.latest_seq.clone(),
+            shutdown: self.shutdown.clone(),
+            catalog: self.catalog.clone(),
+            mode: self.mode.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            owns_shutdown: false,
+        }
+    }
 }
 
 impl Drop for AppState {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        if self.owns_shutdown {
+            self.shutdown.store(true, Ordering::Relaxed);
+        }
     }
 }

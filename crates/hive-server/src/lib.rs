@@ -13,7 +13,7 @@ use axum::Router;
 use serde_json::{json, Value};
 
 pub use error::ApiError;
-pub use state::{AppState, TICK_PERIOD};
+pub use state::{AppState, RETENTION_PERIOD, TICK_PERIOD};
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_URI_BYTES: usize = 2 * 1024;

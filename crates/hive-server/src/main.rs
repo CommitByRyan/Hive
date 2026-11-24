@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use hive_config::Config;
 use hive_llm::ModelCatalog;
-use hive_server::{build_router, AppState, TICK_PERIOD};
+use hive_runtime::RetentionPolicy;
+use hive_server::{build_router, AppState, RETENTION_PERIOD, TICK_PERIOD};
 use hive_store::Store;
 
 #[tokio::main]
@@ -31,9 +32,29 @@ async fn main() {
         }
     };
 
-    if let Err(error) = hive_runtime::run_startup(&mut store, hive_store::now_ms()) {
-        eprintln!("startup recovery failed: {error}");
-        std::process::exit(1);
+    let retention_policy = (config.retention_days() > 0).then(|| RetentionPolicy {
+        days: config.retention_days(),
+        archive_dir: config.archive_dir().to_path_buf(),
+    });
+    let startup = match hive_runtime::run_startup_with_retention(
+        &mut store,
+        hive_store::now_ms(),
+        retention_policy.as_ref(),
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("startup recovery failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(error) = &startup.retention_error {
+        eprintln!("startup retention archive failed: {error}");
+    }
+    if startup.retention.archived_missions > 0 {
+        eprintln!(
+            "startup retention archived {} mission(s), {} event(s)",
+            startup.retention.archived_missions, startup.retention.events_archived
+        );
     }
 
     let mode = config.mode().to_string();
@@ -41,6 +62,9 @@ async fn main() {
     let port = config.port();
     let state = AppState::new(store, ModelCatalog::new(), mode, host.clone(), port);
     state.start_tick_loop(TICK_PERIOD);
+    if let Some(policy) = retention_policy {
+        state.start_retention_loop(RETENTION_PERIOD, policy);
+    }
     let bind_addr = state.bind_addr();
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,
