@@ -6,14 +6,14 @@ Hive 将任务组织为 `Mission → Run → Node → Agent Session → Turn`，
 
 ## 当前状态
 
-项目处于工程预览阶段，尚未发布稳定版。主线的 DAG 调度、恢复、安全工具、预算账本、Routine、HTTP/SSE 控制台和多 Agent worktree 已完成并合并；H09c 可观测性与保留仍在进行，H11 发布与迁移尚未开始。
+项目处于工程预览阶段，尚未发布稳定版。主线的 DAG 调度、恢复、安全工具、预算账本、Routine、可观测性与保留、HTTP/SSE 控制台和多 Agent worktree 已完成并合并；H10 性能基准则采集中，H11 发布与迁移待基准结论后启动。
 
 当前 `main` 基线已通过：
 
 ```text
 fmt --all --check
 clippy --workspace --all-targets -- -D warnings
-test --workspace                 304 passed / 1 ignored
+test --workspace                 314 passed / 1 ignored
 ```
 
 被忽略的测试需要本机运行 Magpie 网关，其余测试不依赖外部服务。
@@ -26,6 +26,7 @@ test --workspace                 304 passed / 1 ignored
 - **安全边界**：路径、网络、Shell 与审批策略；Windows 句柄级文件访问；出网固定与重定向禁用。
 - **多 Agent 协作**：独立 Git worktree、集成预览与合并、回收策略。
 - **预算与 Routine**：节点预算原子扣减、启动恢复、定时触发与幂等窗口。
+- **可观测性与保留**：JSONL 结构化日志、共享 trace、原子指标、健康分级、终态 Mission 归档与审计段校验。
 - **服务层**：HTTP/SSE API、审批接口、事件补偿与最小 Web 控制台。
 
 ## 快速开始
