@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::{self, Debug, Display, Formatter};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use hive_types::HiveError;
@@ -8,6 +10,55 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8765;
 pub const DEFAULT_MAX_PARALLEL: usize = 2;
+
+pub const KNOWN_KEYS: [&str; 9] = [
+    "HIVE_BASE_URL",
+    "HIVE_API_KEY",
+    "HIVE_MODEL",
+    "HIVE_HOST",
+    "HIVE_PORT",
+    "HIVE_MAX_PARALLEL",
+    "HIVE_ALLOW_SHELL",
+    "HIVE_DATA_DIR",
+    "HIVE_SANDBOX_DIR",
+];
+
+const DEFAULTED_KEYS: [&str; 7] = [
+    "HIVE_BASE_URL",
+    "HIVE_HOST",
+    "HIVE_PORT",
+    "HIVE_MAX_PARALLEL",
+    "HIVE_ALLOW_SHELL",
+    "HIVE_DATA_DIR",
+    "HIVE_SANDBOX_DIR",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnknownEnvKey {
+    pub name: String,
+    pub line: usize,
+}
+
+/// Metadata about an `.env` file without exposing any configured value.
+///
+/// The API key is deliberately reduced to a boolean: neither `Debug` nor
+/// `Display` output can leak secrets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvInspection {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub recognized_keys: Vec<String>,
+    pub missing_defaulted: Vec<&'static str>,
+    pub unknown_keys: Vec<UnknownEnvKey>,
+    pub api_key_configured: bool,
+    pub validation_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedEnv {
+    values: BTreeMap<String, String>,
+    unknown: Vec<UnknownEnvKey>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -47,7 +98,9 @@ impl Config {
     }
 
     pub fn load_from_env_in(project_root: &Path) -> Result<Self, HiveError> {
-        load_with(project_root, |name| env::var(name).ok())
+        load_from_env_sources(project_root, &project_root.join(".env"), |name| {
+            env::var(name).ok()
+        })
     }
 
     pub fn base_url(&self) -> &str {
@@ -219,6 +272,192 @@ where
     })
 }
 
+fn load_from_env_sources<F>(
+    project_root: &Path,
+    env_path: &Path,
+    process: F,
+) -> Result<Config, HiveError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let parsed = parse_env_file(env_path)?;
+    if let Some(unknown) = parsed.unknown.first() {
+        return Err(unknown_key_error(unknown));
+    }
+    load_with(project_root, |name| {
+        process(name).or_else(|| parsed.values.get(name).cloned())
+    })
+}
+
+/// Inspect an `.env` file without applying it and without printing values.
+pub fn inspect_env_file(project_root: &Path, env_path: &Path) -> Result<EnvInspection, HiveError> {
+    inspect_env_file_with(project_root, env_path, |name| env::var(name).ok())
+}
+
+fn inspect_env_file_with<F>(
+    project_root: &Path,
+    env_path: &Path,
+    process: F,
+) -> Result<EnvInspection, HiveError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let parsed = parse_env_file(env_path)?;
+    let exists = env_path.exists();
+    let recognized_keys = KNOWN_KEYS
+        .iter()
+        .filter(|key| parsed.values.contains_key(**key))
+        .map(|key| (*key).to_owned())
+        .collect();
+    let missing_defaulted = DEFAULTED_KEYS
+        .iter()
+        .filter(|key| !parsed.values.contains_key(**key) && process(key).is_none())
+        .copied()
+        .collect();
+    let api_key = process("HIVE_API_KEY")
+        .or_else(|| parsed.values.get("HIVE_API_KEY").cloned())
+        .unwrap_or_default();
+    let api_key_configured = !api_key.trim().is_empty();
+    let validation_error = if parsed.unknown.is_empty() {
+        match load_with(project_root, |name| {
+            process(name).or_else(|| parsed.values.get(name).cloned())
+        }) {
+            Ok(_) => None,
+            Err(error) => Some(error.to_string()),
+        }
+    } else {
+        None
+    };
+
+    Ok(EnvInspection {
+        path: env_path.to_path_buf(),
+        exists,
+        recognized_keys,
+        missing_defaulted,
+        unknown_keys: parsed.unknown,
+        api_key_configured,
+        validation_error,
+    })
+}
+
+fn parse_env_file(path: &Path) -> Result<ParsedEnv, HiveError> {
+    if !path.exists() {
+        return Ok(ParsedEnv::default());
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| env_file_error(format!("failed to read {}: {error}", path.display())))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| env_file_error(format!("{} is not valid UTF-8", path.display())))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut parsed = ParsedEnv::default();
+
+    for (index, raw) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let mut line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export") {
+            if rest.chars().next().is_some_and(char::is_whitespace) {
+                line = rest.trim();
+            }
+        }
+        let Some(equals) = line.find('=') else {
+            let key = line.trim();
+            if key.starts_with("HIVE_") {
+                parsed.unknown.push(UnknownEnvKey {
+                    name: key.to_owned(),
+                    line: line_number,
+                });
+            }
+            continue;
+        };
+        let key = line[..equals].trim();
+        if !key.starts_with("HIVE_") {
+            continue;
+        }
+        if !KNOWN_KEYS.contains(&key) {
+            parsed.unknown.push(UnknownEnvKey {
+                name: key.to_owned(),
+                line: line_number,
+            });
+            continue;
+        }
+        let value = parse_env_value(key, line[equals + 1..].trim(), line_number)?;
+        parsed.values.insert(key.to_owned(), value);
+    }
+
+    Ok(parsed)
+}
+
+fn parse_env_value(key: &str, raw: &str, line: usize) -> Result<String, HiveError> {
+    if let Some(inner) = raw.strip_prefix('"') {
+        let Some(inner) = inner.strip_suffix('"') else {
+            return Err(env_line_error(
+                line,
+                key,
+                "unterminated double-quoted value",
+            ));
+        };
+        return unescape_double_quoted(inner).map_err(|reason| env_line_error(line, key, &reason));
+    }
+    if let Some(inner) = raw.strip_prefix('\'') {
+        let Some(inner) = inner.strip_suffix('\'') else {
+            return Err(env_line_error(
+                line,
+                key,
+                "unterminated single-quoted value",
+            ));
+        };
+        return Ok(inner.to_owned());
+    }
+    Ok(raw.to_owned())
+}
+
+fn unescape_double_quoted(value: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        let Some(escaped) = characters.next() else {
+            return Err("trailing backslash in double-quoted value".to_owned());
+        };
+        match escaped {
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            '"' => output.push('"'),
+            '\\' => output.push('\\'),
+            other => {
+                output.push('\\');
+                output.push(other);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn unknown_key_error(unknown: &UnknownEnvKey) -> HiveError {
+    HiveError::InvalidConfig {
+        field: "HIVE_ENV_UNKNOWN",
+        reason: format!("unknown key {} at line {}", unknown.name, unknown.line),
+    }
+}
+
+fn env_line_error(line: usize, key: &str, reason: &str) -> HiveError {
+    env_file_error(format!("line {line}: {key}: {reason}"))
+}
+
+fn env_file_error(reason: String) -> HiveError {
+    HiveError::InvalidConfig {
+        field: "HIVE_ENV_FILE",
+        reason,
+    }
+}
+
 fn string_value<F>(read: &F, name: &'static str, default: &str) -> Result<String, HiveError>
 where
     F: Fn(&str) -> Option<String>,
@@ -316,8 +555,42 @@ fn invalid_config(field: &'static str, reason: &str) -> HiveError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "hive-config-{name}-{}-{nanos}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn load(values: &[(&str, &str)]) -> Result<Config, HiveError> {
         let values: HashMap<String, String> = values
@@ -419,5 +692,113 @@ mod tests {
         assert!(!format!("{:?}", config).contains(secret));
         assert!(!format!("{:?}", public).contains(secret));
         assert!(!public.to_string().contains(secret));
+    }
+
+    #[test]
+    fn dotenv_supports_bom_comments_export_and_quotes() {
+        let dir = TempDir::new("dotenv-quotes");
+        let path = dir.path().join(".env");
+        fs::write(
+            &path,
+            "\u{feff}# heading\n\nexport HIVE_MODEL=\"model-a\"\nHIVE_HOST='127.0.0.2'\nHIVE_API_KEY=\"sec\\\"ret\"\nHIVE_DATA_DIR=data\nHIVE_SANDBOX_DIR=sandbox\n",
+        )
+        .expect("write env");
+
+        let config = load_from_env_sources(dir.path(), &path, |_| None).expect("load from dotenv");
+        assert_eq!(config.model(), "model-a");
+        assert_eq!(config.host(), "127.0.0.2");
+        assert_eq!(config.api_key(), "sec\"ret");
+        assert_eq!(config.mode(), Mode::Live);
+    }
+
+    #[test]
+    fn process_environment_overrides_dotenv() {
+        let dir = TempDir::new("dotenv-precedence");
+        let path = dir.path().join(".env");
+        fs::write(&path, "HIVE_PORT=1111\nHIVE_HOST=file-host\n").expect("write env");
+        let process: HashMap<String, String> = [("HIVE_PORT".to_owned(), "2222".to_owned())]
+            .into_iter()
+            .collect();
+
+        let config = load_from_env_sources(dir.path(), &path, |name| process.get(name).cloned())
+            .expect("load");
+        assert_eq!(config.port(), 2222);
+        assert_eq!(config.host(), "file-host");
+    }
+
+    #[test]
+    fn unknown_dotenv_keys_include_name_and_line() {
+        let dir = TempDir::new("dotenv-unknown");
+        let path = dir.path().join(".env");
+        fs::write(&path, "# heading\nHIVE_PORT=8765\nHIVE_NOPE=1\n").expect("write env");
+
+        let error = load_from_env_sources(dir.path(), &path, |_| None).expect_err("unknown key");
+        let message = error.to_string();
+        assert!(message.contains("HIVE_NOPE"));
+        assert!(message.contains("line 3"));
+    }
+
+    #[test]
+    fn missing_dotenv_file_keeps_defaults() {
+        let dir = TempDir::new("dotenv-missing");
+        let config = load_from_env_sources(dir.path(), &dir.path().join("missing.env"), |_| None)
+            .expect("missing file is allowed");
+
+        assert_eq!(config.port(), DEFAULT_PORT);
+        assert_eq!(config.host(), DEFAULT_HOST);
+        assert_eq!(config.model(), "");
+    }
+
+    #[test]
+    fn inspection_reports_keys_without_exposing_values() {
+        let dir = TempDir::new("dotenv-inspect");
+        let path = dir.path().join(".env");
+        fs::write(
+            &path,
+            "HIVE_API_KEY=inspection-secret\nHIVE_PORT=abc\nHIVE_UNKNOWN=1\n",
+        )
+        .expect("write env");
+
+        let inspection = inspect_env_file_with(dir.path(), &path, |_| None).expect("inspect");
+        assert!(inspection.exists);
+        assert_eq!(
+            inspection.recognized_keys,
+            vec!["HIVE_API_KEY".to_owned(), "HIVE_PORT".to_owned()]
+        );
+        assert_eq!(inspection.unknown_keys.len(), 1);
+        assert_eq!(inspection.unknown_keys[0].name, "HIVE_UNKNOWN");
+        assert_eq!(inspection.unknown_keys[0].line, 3);
+        assert!(inspection.api_key_configured);
+        assert!(inspection.validation_error.is_none());
+        assert!(inspection.missing_defaulted.contains(&"HIVE_HOST"));
+        assert!(!inspection.missing_defaulted.contains(&"HIVE_API_KEY"));
+        assert!(!format!("{inspection:?}").contains("inspection-secret"));
+    }
+
+    #[test]
+    fn inspection_reports_invalid_known_values() {
+        let dir = TempDir::new("dotenv-invalid");
+        let path = dir.path().join(".env");
+        fs::write(&path, "HIVE_PORT=abc\n").expect("write env");
+
+        let inspection = inspect_env_file_with(dir.path(), &path, |_| None).expect("inspect");
+        let validation_error = inspection.validation_error.expect("invalid port");
+        assert!(validation_error.contains("HIVE_PORT"));
+    }
+
+    #[test]
+    fn dotenv_api_key_is_redacted_from_debug_and_display() {
+        let dir = TempDir::new("dotenv-secret");
+        let path = dir.path().join(".env");
+        let secret = "dotenv-top-secret";
+        fs::write(
+            &path,
+            format!("HIVE_API_KEY={secret}\nHIVE_MODEL=model-a\n"),
+        )
+        .expect("write env");
+
+        let config = load_from_env_sources(dir.path(), &path, |_| None).expect("load from dotenv");
+        assert!(!format!("{config:?}").contains(secret));
+        assert!(!config.public().to_string().contains(secret));
     }
 }

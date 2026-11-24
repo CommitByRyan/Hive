@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 hive-config = { path = "../hive-config" }
+hive-store = { path = "../hive-store" }
 hive-types = { path = "../hive-types" }

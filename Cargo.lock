@@ -319,6 +319,7 @@ name = "hive-cli"
 version = "0.1.0"
 dependencies = [
  "hive-config",
+ "hive-store",
  "hive-types",
 ]
 
@@ -407,6 +408,7 @@ dependencies = [
  "hive-store",
  "hive-types",
  "http-body-util",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

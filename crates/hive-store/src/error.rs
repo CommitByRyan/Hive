@@ -6,6 +6,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("state error: {0}")]
     State(#[from] hive_types::HiveError),
     #[error("duplicate event id `{0}`")]
@@ -54,6 +56,7 @@ impl StoreError {
             Self::Conflict(_) => "conflict",
             Self::Database(_) => "database_error",
             Self::Serialization(_) => "serialization_error",
+            Self::Io(_) => "io_error",
             Self::State(_) => "state_error",
         }
     }
