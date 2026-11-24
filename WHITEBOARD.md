@@ -82,6 +82,8 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
+远端状态（2026-11-24 13:45 外部变更）：仓库被添加 `origin=https://github.com/CommitByRyan/Hive.git`，`origin/main` 为 `1611f8d`（README 提交），本地 `main` 为 `d54aed8`、领先 11 个提交。H00 未执行 push；是否推送需用户明确授权。
+
 契约同步：`PROTOCOL.md` 已加入 ADR 0005 与 ADR 0006；`routine.*` 非触发事件使用系统作用域 `m_00000000-0000-4000-8000-000000000000`，合法但不是 `missions` 行。H09b 已按 ADR 0006 收口并合并：`SYSTEM_SCOPE_MISSION_ID` 为单一常量，`routine.triggered` 使用真实 Mission，`list_missions` 不含系统作用域。
 
 ## 冻结契约
