@@ -32,6 +32,8 @@ pub enum StoreError {
     InvalidTimezone(String),
     #[error("routine limit reached")]
     RoutineLimit,
+    #[error("archive error: {0}")]
+    Archive(String),
 }
 
 impl StoreError {
@@ -45,6 +47,7 @@ impl StoreError {
             Self::InvalidSchedule(_) => "invalid_schedule",
             Self::InvalidTimezone(_) => "invalid_timezone",
             Self::RoutineLimit => "routine_limit",
+            Self::Archive(_) => "archive_error",
             Self::NotFound(_) => "not_found",
             Self::DuplicateEvent(_) => "duplicate_event",
             Self::SequenceExhausted => "sequence_exhausted",

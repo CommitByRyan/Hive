@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use hive_llm::{ChatRequest, ChatResponse, ChatTransport, Gateway, Message, Role, Tool, Usage};
 use hive_policy::RiskLevel;
+use hive_runtime::{emit_info, global_metrics, LogContext};
 use hive_store::{
     now_rfc3339, AgentSessionState, BudgetDimension, LeaseGuard, NewTurnUsage, Store, TurnState,
     UsageSource,
@@ -12,8 +13,8 @@ use hive_tools::{
 };
 use hive_types::{
     AgentSessionId, ApprovalId, AttemptNo, EventId, EventInput, EventKind, Handoff,
-    HandoffProvenance, LeaseToken, MissionId, NodeId, NodeState, RunId, HANDOFF_SCHEMA_VERSION,
-    HANDOFF_SUMMARY_MAX_BYTES,
+    HandoffProvenance, LeaseToken, MissionId, NodeId, NodeState, RunId, TraceId,
+    HANDOFF_SCHEMA_VERSION, HANDOFF_SUMMARY_MAX_BYTES,
 };
 use serde_json::{json, Map, Value};
 
@@ -151,12 +152,18 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
             })?;
         let mission_id = mission.mission_id;
         let run_id = node_record.run_id;
+        let trace_id = TraceId::new();
         let scope = NodeScope {
             node,
             mission_id,
             run_id,
             session,
+            trace_id,
         };
+        let log_context = LogContext::node(trace_id, mission_id, run_id, node, guard.attempt_no)
+            .with_session(session)
+            .with_model(spec.model.as_str());
+        emit_info("hive_agent", "node execution started", &log_context);
 
         if cancel.is_cancelled() {
             return self.cancel_node(scope, &guard, NodeState::Leased, 0);
@@ -171,6 +178,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
             guard.attempt_no,
             EventKind::NodeStarted,
             json!({ "role": spec.role, "model": spec.model }),
+            Some(trace_id),
         );
         self.store
             .transition_node_cas(node, &guard, NodeState::Running, &started, now)?;
@@ -224,6 +232,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                     "model": spec.model,
                     "message_count": messages.len(),
                 }),
+                Some(trace_id),
             );
             self.store.append_event_guarded(node, &guard, &turn_event)?;
             let turn = match self.store.start_turn(
@@ -385,6 +394,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                         .get(&tool_name)
                         .map(|tool| (tool.risk, tool.version))
                         .unwrap_or((RiskLevel::ReadOnly, 1));
+                    global_metrics().inc_tool_calls(&tool_name);
                     if self.approval_policy.requires_approval(risk) {
                         let approval = {
                             let mut gate = StoreApprovalGate::new(
@@ -539,6 +549,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                     "handoff_id": handoff_record.handoff_id,
                     "summary": handoff.summary,
                 }),
+                Some(trace_id),
             );
             self.store.transition_node_cas(
                 node,
@@ -597,6 +608,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
             guard.attempt_no,
             EventKind::NodeToolCall,
             json!({ "tool_name": tool_name, "phase": "intent" }),
+            Some(scope.trace_id),
         );
         self.store
             .append_event_guarded(scope.node, guard, &intent)?;
@@ -613,6 +625,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                 "code": code,
                 "message": message,
             }),
+            Some(scope.trace_id),
         );
         self.store
             .append_event_guarded(scope.node, guard, &result)?;
@@ -634,6 +647,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
             guard.attempt_no,
             EventKind::NodeFailed,
             json!({ "reason": reason, "turns": turns }),
+            Some(scope.trace_id),
         );
         self.store
             .transition_node_cas(scope.node, guard, NodeState::Failed, &event, now_ms())?;
@@ -671,6 +685,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
                 "estimated": false,
                 "turns": turns,
             }),
+            Some(scope.trace_id),
         );
         self.store
             .transition_node_cas(scope.node, guard, NodeState::Failed, &event, now_ms())?;
@@ -697,6 +712,7 @@ impl<'a, T: ChatTransport> AgentRunner<'a, T> {
             guard.attempt_no,
             EventKind::NodeCancelled,
             json!({ "turns": turns }),
+            Some(scope.trace_id),
         );
         self.store.transition_node_cas(
             scope.node,
@@ -723,6 +739,7 @@ struct NodeScope {
     mission_id: MissionId,
     run_id: RunId,
     session: AgentSessionId,
+    trace_id: TraceId,
 }
 
 struct GuardedAuditSink<'a> {
@@ -750,6 +767,7 @@ impl AuditSink for GuardedAuditSink<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn node_event(
     mission_id: MissionId,
     run_id: Option<RunId>,
@@ -758,6 +776,7 @@ fn node_event(
     attempt_no: hive_types::AttemptNo,
     kind: EventKind,
     payload: Value,
+    trace_id: Option<TraceId>,
 ) -> EventInput {
     EventInput {
         event_id: EventId::new(),
@@ -767,7 +786,7 @@ fn node_event(
         node_id: Some(node_id),
         session_id: Some(session_id),
         attempt_no: Some(attempt_no),
-        trace_id: None,
+        trace_id,
         payload,
     }
 }
@@ -1126,6 +1145,54 @@ mod tests {
     }
 
     #[test]
+    fn node_start_log_shares_trace_with_node_started_event() {
+        use serde_json::Value;
+
+        let mut f = fixture("trace");
+        let capture = hive_runtime::start_capture();
+        let transport = MockTransport::new(vec![MockResponse::json(
+            200,
+            &completion(
+                "the answer",
+                Some(json!({"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8})),
+            ),
+        )]);
+        let gateway = Gateway::new(transport);
+        let dispatcher = ToolDispatcher::with_default_root(f.dir.path()).expect("dispatcher");
+        let token = CancellationToken::new();
+        {
+            let mut runner = AgentRunner::new(&mut f.store, &dispatcher, &gateway);
+            runner
+                .run_node(f.session.session_id, f.node.node_id, &spec(), &token)
+                .expect("run");
+        }
+
+        let node_id = f.node.node_id.to_string();
+        let log = capture
+            .records()
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|record| {
+                record["msg"] == "node execution started"
+                    && record["node_id"].as_str() == Some(node_id.as_str())
+            })
+            .expect("node start log line");
+        let started = f
+            .store
+            .read_all_events()
+            .expect("events")
+            .into_iter()
+            .find(|event| {
+                event.kind == EventKind::NodeStarted && event.node_id == Some(f.node.node_id)
+            })
+            .expect("node.started event");
+        let event_trace = started.trace_id.expect("node.started trace").to_string();
+        assert_eq!(log["trace_id"].as_str(), Some(event_trace.as_str()));
+        assert!(log.get("prompt").is_none());
+        assert!(log.get("api_key").is_none());
+    }
+
+    #[test]
     fn tool_call_round_trip_reads_file_and_feeds_result_back() {
         let mut f = fixture("tool");
         std::fs::write(f.dir.path().join("note.txt"), b"hello hive").expect("note");
@@ -1340,6 +1407,7 @@ mod tests {
             AttemptNo::FIRST,
             EventKind::NodeStarted,
             json!({}),
+            Some(TraceId::new()),
         );
         f.store
             .transition_node_cas(f.node.node_id, &guard, NodeState::Running, &started, 1)
@@ -1357,6 +1425,7 @@ mod tests {
             AttemptNo::FIRST,
             EventKind::NodeSucceeded,
             json!({}),
+            Some(TraceId::new()),
         );
         let error = f
             .store
@@ -1552,6 +1621,7 @@ mod tests {
             AttemptNo::FIRST,
             EventKind::NodeStarted,
             json!({}),
+            Some(TraceId::new()),
         );
         f.store
             .transition_node_cas(f.node.node_id, &guard, NodeState::Running, &started, 1)
@@ -1620,6 +1690,7 @@ mod tests {
             AttemptNo::FIRST,
             EventKind::NodeApprovalDecided,
             json!({"approval_id": approval.approval_id, "decision": "approved"}),
+            Some(TraceId::new()),
         );
         f.store
             .transition_node_cas(f.node.node_id, &guard, NodeState::Running, &resumed, 6)

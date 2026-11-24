@@ -22,6 +22,8 @@ pub const SSE_QUEUE_CAPACITY: usize = 256;
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(routes::health))
+        .route("/health/live", get(routes::health_live))
+        .route("/health/ready", get(routes::health_ready))
         .route("/state", get(routes::state))
         .route(
             "/missions",

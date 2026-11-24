@@ -1,22 +1,33 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
-use hive_llm::ModelCatalog;
+use hive_llm::{ModelCatalog, ModelEntry};
 use hive_server::{build_router, AppState};
 use hive_store::Store;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-fn app() -> Router {
+fn catalog() -> ModelCatalog {
+    ModelCatalog::from_entries(vec![ModelEntry {
+        id: "mock-model".to_owned(),
+        ..ModelEntry::default()
+    }])
+}
+
+fn app_with_catalog(catalog: ModelCatalog) -> Router {
     let store = Store::open_in_memory().expect("store");
     let state = AppState::new(
         store,
-        ModelCatalog::new(),
+        catalog,
         "demo".to_owned(),
         "127.0.0.1".to_owned(),
         8765,
     );
     build_router(state)
+}
+
+fn app() -> Router {
+    app_with_catalog(catalog())
 }
 
 async fn json_body(response: axum::response::Response) -> Value {
@@ -63,6 +74,163 @@ async fn health_reports_schema_version_without_secrets() {
     assert_eq!(body["schema_version"], hive_store::SCHEMA_VERSION);
     assert_eq!(body["event_schema_version"], 1);
     assert!(!body.to_string().contains("api"));
+}
+
+#[tokio::test]
+async fn health_endpoints_add_status_checks_and_live_ready() {
+    let app = app();
+    let response = app.clone().oneshot(get("/api/health")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["checks"]["database"], "ok");
+    assert!(body["retained_since_seq"].as_u64().is_some());
+    assert!(body["budget"]["exceeded_total"].is_object());
+
+    let live = app.clone().oneshot(get("/api/health/live")).await.unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+    assert_eq!(json_body(live).await["status"], "live");
+
+    let ready = app.oneshot(get("/api/health/ready")).await.unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(json_body(ready).await["status"], "ready");
+}
+
+#[tokio::test]
+async fn ready_fails_without_model_catalog() {
+    let app = app_with_catalog(ModelCatalog::new());
+    let response = app.oneshot(get("/api/health/ready")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn health_stays_200_but_degraded_with_pending_approval() {
+    use hive_store::ApprovalInput;
+    use hive_types::{AttemptNo, LeaseToken, ToolCallId};
+
+    let store = Store::open_in_memory().expect("store");
+    let state = AppState::new(
+        store,
+        catalog(),
+        "demo".to_owned(),
+        "127.0.0.1".to_owned(),
+        8765,
+    );
+    {
+        let mut store = state.store.lock().unwrap();
+        let mission = store.create_mission("m", "g", 0).expect("mission");
+        let run = store.create_run(mission.mission_id, 0).expect("run");
+        let node = store
+            .add_node(mission.mission_id, run.run_id, 3, 0)
+            .expect("node");
+        store
+            .create_approval(&ApprovalInput {
+                mission_id: mission.mission_id,
+                run_id: Some(run.run_id),
+                node_id: node.node_id,
+                session_id: None,
+                tool_call_id: ToolCallId::new(),
+                tool_name: "fs.write".to_owned(),
+                tool_version: 1,
+                request_hash: "deadbeef".to_owned(),
+                arguments_preview: "{}".to_owned(),
+                policy_version: "v1".to_owned(),
+                attempt_no: AttemptNo::FIRST,
+                lease_token: LeaseToken::generate(),
+                expires_at_ms: hive_store::now_ms() + 60_000,
+            })
+            .expect("approval");
+    }
+    let app = build_router(state);
+    let response = app.oneshot(get("/api/health")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["checks"]["approvals"], "degraded");
+}
+
+#[tokio::test]
+async fn archived_mission_forces_snapshot_for_old_cursors() {
+    use hive_store::Store;
+    use hive_types::{EventId, EventInput, EventKind, MissionState};
+
+    let mut store = Store::open_in_memory().expect("store");
+    let mission = store.create_mission("m", "g", 0).expect("mission");
+    let run = store.create_run(mission.mission_id, 0).expect("run");
+    store
+        .add_node(mission.mission_id, run.run_id, 3, 0)
+        .expect("node");
+    for kind in [EventKind::MissionCreated, EventKind::MissionCancelled] {
+        store
+            .append_event(&EventInput {
+                event_id: EventId::new(),
+                kind,
+                mission_id: mission.mission_id,
+                run_id: None,
+                node_id: None,
+                session_id: None,
+                attempt_no: None,
+                trace_id: None,
+                payload: json!({}),
+            })
+            .expect("event");
+    }
+    store
+        .transition_mission(mission.mission_id, MissionState::Cancelled, 2)
+        .expect("terminal");
+
+    let archive_dir =
+        std::env::temp_dir().join(format!("hive-server-archive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&archive_dir);
+    std::fs::create_dir_all(&archive_dir).expect("archive dir");
+    let report = store
+        .archive_mission(&archive_dir, mission.mission_id, 3)
+        .expect("archive");
+    assert_eq!(report.retained_since_seq, 3);
+
+    let state = AppState::new(
+        store,
+        catalog(),
+        "demo".to_owned(),
+        "127.0.0.1".to_owned(),
+        8765,
+    );
+    let app = build_router(state);
+    for after_seq in [0, 2] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/events?after_seq={after_seq}"))
+                    .header(header::ACCEPT, "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "after_seq {after_seq}"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["snapshot_required"], true);
+        assert_eq!(body["retained_since_seq"], 3);
+        assert_eq!(body["after_seq"], after_seq);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/events?after_seq=3")
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&archive_dir);
 }
 
 #[tokio::test]

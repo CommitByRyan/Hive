@@ -23,5 +23,5 @@ pub use records::{
 };
 pub use routine::{Schedule, DEFAULT_TIMEZONE};
 pub use schema::SCHEMA_VERSION;
-pub use store::{RoutineFireOutcome, Store};
+pub use store::{ArchiveReport, RoutineFireOutcome, Store};
 pub use time::{now_ms, now_rfc3339, rfc3339_from_ms};

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use hive_events::{EventBus, MissionFilter};
 use hive_llm::ModelCatalog;
+use hive_runtime::global_metrics;
 use hive_store::Store;
 use hive_types::{EventEnvelope, EventInput};
 use tokio::sync::broadcast;
@@ -44,6 +45,8 @@ impl AppState {
             host,
             port,
         };
+        state.refresh_latest_seq();
+        global_metrics().set_approval_pending(0);
         state.start_event_bridge();
         state
     }
