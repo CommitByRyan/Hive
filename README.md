@@ -6,14 +6,14 @@ Hive 将任务组织为 `Mission → Run → Node → Agent Session → Turn`，
 
 ## 当前状态
 
-项目处于工程预览阶段，0.1.0 本地发布包已产出，尚未推送远端或对外发布。主线的 DAG 调度、恢复、安全工具、预算账本、Routine、可观测性与保留、HTTP/SSE 控制台、多 Agent worktree、性能基准、配置/数据库迁移与 Windows 打包均已完成并合并。
+项目处于工程预览阶段，0.1.1 本地发布包已产出。主线的 DAG 调度、恢复、安全工具、预算账本、Routine、可观测性与保留、HTTP/SSE 控制台、多 Agent worktree、性能基准、配置/数据库迁移与 Windows 打包均已完成并合并。0.1.1 加固了保留水位持久化、自动归档生命周期与 worktree 脏数据回收。
 
 当前 `main` 基线已通过：
 
 ```text
 fmt --all --check
 clippy --workspace --all-targets -- -D warnings
-test --workspace                 334 passed / 1 ignored
+test --workspace                 351 passed / 1 ignored
 ```
 
 被忽略的测试需要本机运行 Magpie 网关，其余测试不依赖外部服务。

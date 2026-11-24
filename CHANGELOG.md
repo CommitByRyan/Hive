@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.1 — 2026-11-24
+
+0.1.0 之后的加固版本。SQLite schema 仍为 V6，升级不需要迁移；覆盖程序文件即可。
+
+### 修复
+
+- 修复 `AppState` 派生 `Clone` 后任意副本 Drop 都会置 `shutdown` 的缺陷。该缺陷会让生命周期 tick 在服务器处理首个请求后停摆，H12 以 `owns_shutdown` 区分所有者并补两条回归测试。
+
+### 保留与归档
+
+- 保留水位写入 `<data_dir>/retention.json` sidecar，重启后 `retained_since_seq` 不丢失；损坏或不可解析时拒绝启动。
+- 归档顺序固定为：写归档文件并 fsync → 持久化 floor → 同事务删除 `events`/`tool_audit`/`snapshots`；sidecar 写失败不删行。
+- 新增 `HIVE_RETENTION_DAYS`（默认 30，0 关闭）与 `HIVE_ARCHIVE_DIR`（默认 `<data_dir>/archive`），归档同时接入启动与小时级生命周期。
+- `/api/health` 与终态 Mission 保留语义在重启后保持一致，过期详情仍返回 409。
+
+### worktree 回收
+
+- `RecyclePolicy` 默认 `keep_dirty=true`：有未提交改动或未跟踪文件的 worktree 默认保留并报告原因。
+- 只有显式 `keep_dirty=false` 才强制删除；该路径不可恢复。
+
+### 验证
+
+- 主仓 `scripts/verify.ps1` → `All checks passed`；`351 passed / 1 ignored`。
+- 0.1.1 发布包完成解压、无 Rust PATH 的 `doctor`、启动、健康、Mission、SSE、停止与重启保留语义演练。
+
 ## 0.1.0 — 2026-11-24
 
 首个工程预览版本，面向单机、单用户、单进程场景。

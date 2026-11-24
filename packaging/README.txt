@@ -1,8 +1,8 @@
-Hive 0.1.0 - Windows x86_64
+Hive 0.1.1 - Windows x86_64
 
 安装
   1. 解压发布包到目标目录。
-  2. 进入解压出的 hive-0.1.0-windows-x86_64 目录，运行:
+  2. 进入解压出的 hive-0.1.1-windows-x86_64 目录，运行:
        .\bin\hive.exe doctor
   3. 将 hive.env.example 复制为 .env，按需填写 API Key 与模型。
      不要提交或分享真实 .env。
