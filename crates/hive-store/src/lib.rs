@@ -1,4 +1,5 @@
 mod error;
+mod migration;
 mod records;
 mod routine;
 mod schema;
@@ -12,6 +13,9 @@ pub const MAX_SEQ: u64 = 9_007_199_254_740_991;
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 pub use error::{StoreError, StoreResult};
+pub use migration::{
+    backup_database, dry_run_migration, read_schema_version, MigrationDryRunReport,
+};
 pub use records::{
     can_retry, classify_recovery, AgentSessionRecord, AgentSessionState, ApprovalDecision,
     ApprovalInput, ApprovalRecord, ArtifactRecord, BudgetDimension, BudgetLimits, BudgetRecord,
