@@ -34,8 +34,10 @@ const DEFAULT_RETENTION_DAYS: i64 = 30;
 pub struct Store {
     conn: Connection,
     /// Lowest sequence that a client can safely resume from after retention.
-    /// Zero means no archive has happened in this process.
+    /// Zero means no archive has happened yet.
     retained_floor: u64,
+    /// Sidecar that persists [`Store::retained_floor`] across restarts.
+    retention_path: Option<PathBuf>,
 }
 
 /// Result of attempting to fire one routine window.
@@ -72,22 +74,32 @@ pub struct ArchiveReport {
 
 impl Store {
     pub fn open(path: &Path) -> StoreResult<Self> {
+        let retention_path = path.parent().map(|parent| parent.join("retention.json"));
+        let retained_floor = match retention_path.as_deref() {
+            Some(retention_path) => load_retention_floor(retention_path)?,
+            None => 0,
+        };
         let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        Self::from_connection(conn, retention_path, retained_floor)
     }
 
     pub fn open_in_memory() -> StoreResult<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        Self::from_connection(conn, None, 0)
     }
 
-    fn from_connection(conn: Connection) -> StoreResult<Self> {
+    fn from_connection(
+        conn: Connection,
+        retention_path: Option<PathBuf>,
+        retained_floor: u64,
+    ) -> StoreResult<Self> {
         schema::apply_pragmas(&conn)?;
         let mut conn = conn;
         schema::migrate(&mut conn)?;
         Ok(Self {
             conn,
-            retained_floor: 0,
+            retained_floor,
+            retention_path,
         })
     }
 
@@ -103,12 +115,42 @@ impl Store {
         archive_root: &Path,
         now_ms: i64,
     ) -> StoreResult<Vec<ArchiveReport>> {
+        self.archive_expired_missions_with_days(archive_root, now_ms, DEFAULT_RETENTION_DAYS)
+    }
+
+    /// Archive terminal missions whose `updated_at_ms` is older than `days`.
+    ///
+    /// `days == 0` disables automatic archiving and never deletes rows. A
+    /// mission that no longer owns events, audit rows or snapshots is skipped,
+    /// so repeated periodic passes are idempotent.
+    pub fn archive_expired_missions_with_days(
+        &mut self,
+        archive_root: &Path,
+        now_ms: i64,
+        days: i64,
+    ) -> StoreResult<Vec<ArchiveReport>> {
+        if days == 0 {
+            return Ok(Vec::new());
+        }
+        if days < 0 {
+            return Err(StoreError::Archive(
+                "retention days must be non-negative".to_owned(),
+            ));
+        }
+        let retention_ms = days
+            .checked_mul(24 * 60 * 60 * 1000)
+            .ok_or_else(|| StoreError::Archive("retention window overflow".to_owned()))?;
         let threshold_ms = now_ms
-            .checked_sub(DEFAULT_RETENTION_DAYS * 24 * 60 * 60 * 1000)
+            .checked_sub(retention_ms)
             .ok_or_else(|| StoreError::Archive("retention threshold underflow".to_owned()))?;
         let mission_ids: Vec<String> = {
             let mut stmt = self.conn.prepare(
-                "SELECT mission_id FROM missions WHERE state IN ('done','failed','cancelled') AND updated_at_ms < ?1 ORDER BY updated_at_ms ASC",
+                "SELECT mission_id FROM missions WHERE state IN ('done','failed','cancelled') \
+                 AND updated_at_ms < ?1 \
+                 AND (EXISTS (SELECT 1 FROM events WHERE events.mission_id = missions.mission_id) \
+                   OR EXISTS (SELECT 1 FROM tool_audit WHERE tool_audit.mission_id = missions.mission_id) \
+                   OR EXISTS (SELECT 1 FROM snapshots WHERE snapshots.mission_id = missions.mission_id)) \
+                 ORDER BY updated_at_ms ASC",
             )?;
             let rows = stmt.query_map(params![threshold_ms], |row| row.get::<_, String>(0))?;
             let mut out = Vec::new();
@@ -225,6 +267,20 @@ impl Store {
             .map_err(|_| StoreError::Archive("failed to flush archive writer".to_owned()))?;
         file.sync_all().map_err(io_archive_error)?;
 
+        let boundary = envelope_rows
+            .iter()
+            .map(|row| row.0.saturating_add(1) as u64)
+            .max()
+            .unwrap_or(0);
+        let new_floor = self.retained_floor.max(boundary);
+        // Persist before deleting: a failed sidecar write must leave every row
+        // in place. If deletion fails after this point the floor stays ahead,
+        // which only forces clients to fetch a fresh snapshot.
+        if new_floor > self.retained_floor {
+            self.persist_retained_floor(new_floor)?;
+            self.retained_floor = new_floor;
+        }
+
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -241,13 +297,6 @@ impl Store {
             params![mission_id.to_string()],
         )?;
         tx.commit()?;
-
-        let boundary = envelope_rows
-            .iter()
-            .map(|row| row.0.saturating_add(1) as u64)
-            .max()
-            .unwrap_or(0);
-        self.retained_floor = self.retained_floor.max(boundary);
 
         Ok(ArchiveReport {
             mission_id,
@@ -314,6 +363,67 @@ impl Store {
 
     pub fn retained_since_seq(&self) -> StoreResult<u64> {
         Ok(self.retained_floor)
+    }
+
+    fn persist_retained_floor(&self, floor: u64) -> StoreResult<()> {
+        let Some(path) = self.retention_path.as_deref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                StoreError::Retention(format!(
+                    "failed to create retention directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("retention.json");
+        let temp = path.with_file_name(format!(".{file_name}.hive-tmp-{}", std::process::id()));
+        let payload = json!({ "retained_since_seq": floor }).to_string();
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp)
+                .map_err(|error| {
+                    StoreError::Retention(format!(
+                        "failed to open temporary retention file {}: {error}",
+                        temp.display()
+                    ))
+                })?;
+            file.write_all(payload.as_bytes())
+                .and_then(|_| file.write_all(b"\n"))
+                .map_err(|error| {
+                    StoreError::Retention(format!(
+                        "failed to write temporary retention file {}: {error}",
+                        temp.display()
+                    ))
+                })?;
+            file.sync_all().map_err(|error| {
+                StoreError::Retention(format!(
+                    "failed to sync temporary retention file {}: {error}",
+                    temp.display()
+                ))
+            })?;
+            drop(file);
+            std::fs::rename(&temp, path).map_err(|error| {
+                StoreError::Retention(format!(
+                    "failed to replace retention sidecar {}: {error}",
+                    path.display()
+                ))
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
     }
 
     pub fn schema_version(&self) -> StoreResult<i64> {
@@ -3956,6 +4066,38 @@ fn is_unique_violation(err: &rusqlite::Error) -> bool {
     )
 }
 
+fn load_retention_floor(path: &Path) -> StoreResult<u64> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(StoreError::Retention(format!(
+                "failed to read {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        StoreError::Retention(format!("invalid JSON in {}: {error}", path.display()))
+    })?;
+    let floor = value
+        .get("retained_since_seq")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            StoreError::Retention(format!(
+                "{} must contain an unsigned integer `retained_since_seq`",
+                path.display()
+            ))
+        })?;
+    if floor > MAX_SEQ {
+        return Err(StoreError::Retention(format!(
+            "{} retained_since_seq {floor} exceeds maximum {MAX_SEQ}",
+            path.display()
+        )));
+    }
+    Ok(floor)
+}
+
 fn audit_entry_hash(prev_hash: &str, record_json: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prev_hash.as_bytes());
@@ -3971,8 +4113,8 @@ mod tests {
 
     use hive_types::{
         AgentSessionId, ApprovalState, ArtifactId, AttemptNo, EventId, EventInput, EventKind,
-        Handoff, HandoffArtifact, HandoffProvenance, LeaseToken, MissionId, NodeId, NodeState,
-        RunId, ToolCallId, HANDOFF_SCHEMA_VERSION,
+        Handoff, HandoffArtifact, HandoffProvenance, LeaseToken, MissionId, MissionState, NodeId,
+        NodeState, RunId, ToolCallId, HANDOFF_SCHEMA_VERSION,
     };
 
     use super::{RoutineFireOutcome, Store, DEFAULT_RETENTION_DAYS};
@@ -5375,6 +5517,196 @@ mod tests {
         assert!(store
             .verify_archived_mission_audit(&report.archive_path, mission.mission_id)
             .expect("verify archive"));
+    }
+
+    #[test]
+    fn retention_floor_survives_reopen() {
+        let dir = TempDir::new("retention-reopen");
+        let db = dir.path().join("hive.db");
+        let mut store = Store::open(&db).expect("open");
+        assert_eq!(store.retained_since_seq().expect("floor"), 0);
+
+        let mission = store.create_mission("m", "g", 0).expect("mission");
+        store
+            .append_event(&event(
+                mission.mission_id,
+                None,
+                EventKind::MissionCreated,
+                None,
+            ))
+            .expect("created event");
+        store
+            .append_event(&event(
+                mission.mission_id,
+                None,
+                EventKind::MissionCancelled,
+                None,
+            ))
+            .expect("cancelled event");
+        store
+            .transition_mission(mission.mission_id, MissionState::Cancelled, 0)
+            .expect("terminal");
+
+        let report = store
+            .archive_mission(&dir.path().join("archive"), mission.mission_id, 1)
+            .expect("archive");
+        assert_eq!(report.retained_since_seq, 3);
+
+        // A second archive must replace the existing sidecar rather than fail
+        // on an existing target file.
+        let second = store.create_mission("m2", "g", 0).expect("second mission");
+        store
+            .append_event(&event(
+                second.mission_id,
+                None,
+                EventKind::MissionCancelled,
+                None,
+            ))
+            .expect("second event");
+        store
+            .transition_mission(second.mission_id, MissionState::Cancelled, 0)
+            .expect("second terminal");
+        let report = store
+            .archive_mission(&dir.path().join("archive"), second.mission_id, 1)
+            .expect("second archive");
+        assert_eq!(report.retained_since_seq, 4);
+
+        let sidecar = std::fs::read_to_string(dir.path().join("retention.json")).expect("sidecar");
+        assert!(sidecar.contains("\"retained_since_seq\":4"));
+        drop(store);
+
+        let reopened = Store::open(&db).expect("reopen");
+        assert_eq!(reopened.retained_since_seq().expect("floor"), 4);
+        assert!(reopened
+            .read_all_events()
+            .expect("events after reopen")
+            .is_empty());
+    }
+
+    #[test]
+    fn corrupt_retention_sidecar_refuses_to_open() {
+        let dir = TempDir::new("retention-corrupt");
+        let db = dir.path().join("hive.db");
+        let sidecar = dir.path().join("retention.json");
+
+        std::fs::write(&sidecar, "{not json").expect("write corrupt sidecar");
+        let error = Store::open(&db).expect_err("corrupt sidecar must fail");
+        let message = error.to_string();
+        assert!(message.contains("retention.json"));
+        assert!(message.contains("retention error"));
+
+        std::fs::write(
+            &sidecar,
+            format!("{{\"retained_since_seq\":{}}}", MAX_SEQ + 1),
+        )
+        .expect("write out-of-range sidecar");
+        let error = Store::open(&db).expect_err("out-of-range sidecar must fail");
+        assert!(error.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn retention_persist_failure_keeps_rows_and_floor() {
+        let dir = TempDir::new("retention-blocked");
+        let db = dir.path().join("hive.db");
+        let mut store = Store::open(&db).expect("open");
+        let mission = store.create_mission("m", "g", 0).expect("mission");
+        store
+            .append_event(&event(
+                mission.mission_id,
+                None,
+                EventKind::MissionCancelled,
+                None,
+            ))
+            .expect("event");
+        store
+            .transition_mission(mission.mission_id, MissionState::Cancelled, 0)
+            .expect("terminal");
+
+        let sidecar = dir.path().join("retention.json");
+        std::fs::create_dir(&sidecar).expect("block sidecar path");
+        let error = store
+            .archive_mission(&dir.path().join("archive"), mission.mission_id, 1)
+            .expect_err("persist failure");
+        assert!(matches!(error, StoreError::Retention(_)));
+        assert_eq!(store.retained_since_seq().expect("floor"), 0);
+        assert_eq!(
+            store
+                .read_all_events()
+                .expect("events")
+                .iter()
+                .filter(|envelope| envelope.mission_id == mission.mission_id)
+                .count(),
+            1
+        );
+        assert!(store.latest_seq().expect("latest").is_some());
+
+        std::fs::remove_dir(&sidecar).expect("unblock sidecar path");
+        let report = store
+            .archive_mission(&dir.path().join("archive"), mission.mission_id, 1)
+            .expect("retry archive");
+        assert_eq!(report.retained_since_seq, 2);
+        assert!(store
+            .read_all_events()
+            .expect("events")
+            .iter()
+            .all(|envelope| envelope.mission_id != mission.mission_id));
+    }
+
+    #[test]
+    fn archive_expired_missions_is_idempotent_and_spares_active() {
+        let (mut store, expired, _run, _node) = setup();
+        store
+            .append_event(&event(
+                expired.mission_id,
+                None,
+                EventKind::MissionCancelled,
+                None,
+            ))
+            .expect("expired event");
+        store
+            .transition_mission(expired.mission_id, MissionState::Cancelled, 0)
+            .expect("terminal");
+
+        let active = store.create_mission("active", "g", 0).expect("active");
+        store
+            .append_event(&event(
+                active.mission_id,
+                None,
+                EventKind::MissionCreated,
+                None,
+            ))
+            .expect("active event");
+
+        let dir = TempDir::new("archive-idempotent");
+        let now_ms = 31 * 24 * 60 * 60 * 1000;
+        let first = store
+            .archive_expired_missions_with_days(dir.path(), now_ms, 30)
+            .expect("first archive");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].mission_id, expired.mission_id);
+        assert_eq!(
+            store
+                .read_all_events()
+                .expect("active events")
+                .iter()
+                .filter(|envelope| envelope.mission_id == active.mission_id)
+                .count(),
+            1
+        );
+
+        let second = store
+            .archive_expired_missions_with_days(dir.path(), now_ms, 30)
+            .expect("second archive");
+        assert!(second.is_empty());
+        assert_eq!(
+            store
+                .read_all_events()
+                .expect("active events")
+                .iter()
+                .filter(|envelope| envelope.mission_id == active.mission_id)
+                .count(),
+            1
+        );
     }
 
     #[test]

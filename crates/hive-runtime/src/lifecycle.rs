@@ -6,6 +6,8 @@
 //! reclaims expired leases. A single failed tick step is counted, never fatal
 //! to the loop.
 
+use std::path::PathBuf;
+
 use hive_store::Store;
 
 use crate::error::RuntimeError;
@@ -16,9 +18,77 @@ use crate::routine::{tick_routines, RoutineTickReport};
 /// recovery scan first, then budget counter rebuild. Any failure aborts
 /// startup and must cause the caller to refuse to serve.
 pub fn run_startup(store: &mut Store, now_ms: i64) -> Result<RecoveryReport, RuntimeError> {
-    let report = run_startup_recovery(store, now_ms)?;
+    run_startup_with_retention(store, now_ms, None).map(|report| report.recovery)
+}
+
+/// Retention policy for automatic archiving of terminal missions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionPolicy {
+    /// Days after a terminal mission's last update before it is archived.
+    /// Zero disables automatic archiving.
+    pub days: i64,
+    pub archive_dir: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetentionSummary {
+    pub archived_missions: usize,
+    pub events_archived: u64,
+    pub audits_archived: u64,
+    pub retained_since_seq: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StartupReport {
+    pub recovery: RecoveryReport,
+    pub retention: RetentionSummary,
+    /// Retention failures are reported but never abort startup.
+    pub retention_error: Option<String>,
+}
+
+/// Run startup recovery, rebuild budgets, then archive expired terminal
+/// missions once. A retention failure is captured in the report and never
+/// prevents the server from accepting work; the failed mission keeps its rows.
+pub fn run_startup_with_retention(
+    store: &mut Store,
+    now_ms: i64,
+    policy: Option<&RetentionPolicy>,
+) -> Result<StartupReport, RuntimeError> {
+    let recovery = run_startup_recovery(store, now_ms)?;
     store.rebuild_budget_counters(now_ms)?;
+    let mut report = StartupReport {
+        recovery,
+        ..StartupReport::default()
+    };
+    if let Some(policy) = policy {
+        match retention_once(store, now_ms, policy) {
+            Ok(summary) => report.retention = summary,
+            Err(error) => report.retention_error = Some(error.to_string()),
+        }
+    }
     Ok(report)
+}
+
+/// Archive every terminal mission older than the policy window. Failures are
+/// returned so callers can log them; no row is deleted when persistence of the
+/// new floor fails.
+pub fn retention_once(
+    store: &mut Store,
+    now_ms: i64,
+    policy: &RetentionPolicy,
+) -> Result<RetentionSummary, RuntimeError> {
+    let reports =
+        store.archive_expired_missions_with_days(&policy.archive_dir, now_ms, policy.days)?;
+    let retained_since_seq = match reports.last() {
+        Some(report) => report.retained_since_seq,
+        None => store.retained_since_seq()?,
+    };
+    Ok(RetentionSummary {
+        archived_missions: reports.len(),
+        events_archived: reports.iter().map(|report| report.events_archived).sum(),
+        audits_archived: reports.iter().map(|report| report.audits_archived).sum(),
+        retained_since_seq,
+    })
 }
 
 /// Counters for one background tick pass.
@@ -47,10 +117,62 @@ pub fn tick_once(store: &mut Store, now_ms: i64) -> TickReport {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use hive_store::{BudgetDimension, BudgetLimits, NewTurnUsage, Store, UsageSource};
-    use hive_types::{AttemptNo, EventKind, LeaseToken, NodeState};
+    use hive_types::{
+        AttemptNo, EventId, EventInput, EventKind, LeaseToken, MissionId, MissionState, NodeState,
+    };
+    use serde_json::json;
 
     use super::*;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "hive-runtime-{name}-{}-{nanos}-{counter}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn event_input(mission_id: MissionId, kind: EventKind) -> EventInput {
+        EventInput {
+            event_id: EventId::new(),
+            kind,
+            mission_id,
+            run_id: None,
+            node_id: None,
+            session_id: None,
+            attempt_no: None,
+            trace_id: None,
+            payload: json!({}),
+        }
+    }
 
     fn setup() -> (
         Store,
@@ -230,5 +352,118 @@ mod tests {
         let node_record = store.get_node(node).expect("get").expect("node");
         assert_eq!(node_record.state, NodeState::Ready);
         assert!(node_record.lease_token.is_none());
+    }
+
+    fn mission_event_count(store: &Store, mission_id: MissionId) -> usize {
+        store
+            .read_all_events()
+            .expect("events")
+            .iter()
+            .filter(|envelope| envelope.mission_id == mission_id)
+            .count()
+    }
+
+    #[test]
+    fn startup_retention_archives_expired_terminal_and_spares_active() {
+        let (mut store, expired, _run, _node) = setup();
+        store
+            .append_event(&event_input(expired, EventKind::MissionCancelled))
+            .expect("expired event");
+        store
+            .transition_mission(expired, MissionState::Cancelled, 0)
+            .expect("terminal");
+        let active = store.create_mission("active", "g", 0).expect("active");
+        store
+            .append_event(&event_input(active.mission_id, EventKind::MissionCreated))
+            .expect("active event");
+
+        let dir = TempDir::new("startup-retention");
+        let policy = RetentionPolicy {
+            days: 30,
+            archive_dir: dir.path().join("archive"),
+        };
+        let report =
+            run_startup_with_retention(&mut store, 31 * 24 * 60 * 60 * 1000, Some(&policy))
+                .expect("startup");
+        assert!(report.retention_error.is_none());
+        assert_eq!(report.retention.archived_missions, 1);
+        assert_eq!(report.retention.events_archived, 1);
+        assert_eq!(report.retention.retained_since_seq, 2);
+        assert_eq!(mission_event_count(&store, expired), 0);
+        assert_eq!(mission_event_count(&store, active.mission_id), 1);
+        assert!(store.get_mission(expired).expect("mission").is_some());
+    }
+
+    #[test]
+    fn retention_days_zero_disables_archiving() {
+        let (mut store, mission, _run, _node) = setup();
+        store
+            .append_event(&event_input(mission, EventKind::MissionCancelled))
+            .expect("event");
+        store
+            .transition_mission(mission, MissionState::Cancelled, 0)
+            .expect("terminal");
+
+        let dir = TempDir::new("retention-disabled");
+        let policy = RetentionPolicy {
+            days: 0,
+            archive_dir: dir.path().join("archive"),
+        };
+        let report =
+            run_startup_with_retention(&mut store, 31 * 24 * 60 * 60 * 1000, Some(&policy))
+                .expect("startup");
+        assert!(report.retention_error.is_none());
+        assert_eq!(report.retention.archived_missions, 0);
+        assert_eq!(mission_event_count(&store, mission), 1);
+        assert_eq!(store.retained_since_seq().expect("floor"), 0);
+    }
+
+    #[test]
+    fn retention_once_is_idempotent() {
+        let (mut store, mission, _run, _node) = setup();
+        store
+            .append_event(&event_input(mission, EventKind::MissionCancelled))
+            .expect("event");
+        store
+            .transition_mission(mission, MissionState::Cancelled, 0)
+            .expect("terminal");
+
+        let dir = TempDir::new("retention-idempotent");
+        let policy = RetentionPolicy {
+            days: 30,
+            archive_dir: dir.path().join("archive"),
+        };
+        let now_ms = 31 * 24 * 60 * 60 * 1000;
+        let first = retention_once(&mut store, now_ms, &policy).expect("first");
+        assert_eq!(first.archived_missions, 1);
+        let second = retention_once(&mut store, now_ms, &policy).expect("second");
+        assert_eq!(second.archived_missions, 0);
+        assert_eq!(second.retained_since_seq, first.retained_since_seq);
+    }
+
+    #[test]
+    fn retention_failure_keeps_rows_and_does_not_block_startup() {
+        let (mut store, mission, _run, _node) = setup();
+        store
+            .append_event(&event_input(mission, EventKind::MissionCancelled))
+            .expect("event");
+        store
+            .transition_mission(mission, MissionState::Cancelled, 0)
+            .expect("terminal");
+
+        let dir = TempDir::new("retention-blocked");
+        let blocked = dir.path().join("archive-blocked");
+        std::fs::write(&blocked, b"not a directory").expect("block archive path");
+        let policy = RetentionPolicy {
+            days: 30,
+            archive_dir: blocked,
+        };
+        let report =
+            run_startup_with_retention(&mut store, 31 * 24 * 60 * 60 * 1000, Some(&policy))
+                .expect("startup survives retention failure");
+        assert!(report.retention_error.is_some());
+        assert_eq!(report.retention.archived_missions, 0);
+        assert_eq!(mission_event_count(&store, mission), 1);
+        assert_eq!(store.retained_since_seq().expect("floor"), 0);
     }
 }

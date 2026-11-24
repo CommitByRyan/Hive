@@ -47,9 +47,9 @@ pwsh -NoProfile -File scripts/install.ps1 `
 4. `.env` 中的未知 `HIVE_*` 键会返回字段名与行号；非 `HIVE_*` 键忽略。
 5. `hive config migrate --dry-run [--file <path>]` 只报告键数量、缺失默认项、未知键和 API Key `set/unset`，不写文件，也不打印密钥值。
 
-已知键：`HIVE_BASE_URL`、`HIVE_API_KEY`、`HIVE_MODEL`、`HIVE_HOST`、`HIVE_PORT`、`HIVE_MAX_PARALLEL`、`HIVE_ALLOW_SHELL`、`HIVE_DATA_DIR`、`HIVE_SANDBOX_DIR`。
+已知键：`HIVE_BASE_URL`、`HIVE_API_KEY`、`HIVE_MODEL`、`HIVE_HOST`、`HIVE_PORT`、`HIVE_MAX_PARALLEL`、`HIVE_ALLOW_SHELL`、`HIVE_DATA_DIR`、`HIVE_SANDBOX_DIR`、`HIVE_RETENTION_DAYS`、`HIVE_ARCHIVE_DIR`。`HIVE_RETENTION_DAYS` 默认 `30`，`0` 关闭自动归档；`HIVE_ARCHIVE_DIR` 默认 `<data_dir>/archive`。
 
-默认监听 `127.0.0.1:8765`，数据目录 `data/`，沙箱目录 `sandbox/`。相对路径按安装目录解析。
+默认监听 `127.0.0.1:8765`，数据目录 `data/`，沙箱目录 `sandbox/`，归档目录 `<data_dir>/archive`。相对路径按安装目录解析。
 
 ## 4. 启动
 

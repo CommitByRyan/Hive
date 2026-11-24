@@ -22,7 +22,10 @@ mod threaded;
 pub use clock::{Clock, SystemClock, TestClock};
 pub use error::RuntimeError;
 pub use executor::{ExecOutcome, NodeExecutor};
-pub use lifecycle::{run_startup, tick_once, TickReport};
+pub use lifecycle::{
+    retention_once, run_startup, run_startup_with_retention, tick_once, RetentionPolicy,
+    RetentionSummary, StartupReport, TickReport,
+};
 pub use logging::{
     emit, emit_error, emit_info, new_span_id, start_capture, LogCapture, LogContext, LogLevel,
 };

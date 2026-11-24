@@ -10,8 +10,9 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8765;
 pub const DEFAULT_MAX_PARALLEL: usize = 2;
+pub const DEFAULT_RETENTION_DAYS: i64 = 30;
 
-pub const KNOWN_KEYS: [&str; 9] = [
+pub const KNOWN_KEYS: [&str; 11] = [
     "HIVE_BASE_URL",
     "HIVE_API_KEY",
     "HIVE_MODEL",
@@ -21,9 +22,11 @@ pub const KNOWN_KEYS: [&str; 9] = [
     "HIVE_ALLOW_SHELL",
     "HIVE_DATA_DIR",
     "HIVE_SANDBOX_DIR",
+    "HIVE_RETENTION_DAYS",
+    "HIVE_ARCHIVE_DIR",
 ];
 
-const DEFAULTED_KEYS: [&str; 7] = [
+const DEFAULTED_KEYS: [&str; 9] = [
     "HIVE_BASE_URL",
     "HIVE_HOST",
     "HIVE_PORT",
@@ -31,6 +34,8 @@ const DEFAULTED_KEYS: [&str; 7] = [
     "HIVE_ALLOW_SHELL",
     "HIVE_DATA_DIR",
     "HIVE_SANDBOX_DIR",
+    "HIVE_RETENTION_DAYS",
+    "HIVE_ARCHIVE_DIR",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +91,8 @@ pub struct Config {
     max_parallel: usize,
     data_dir: PathBuf,
     sandbox_dir: PathBuf,
+    retention_days: i64,
+    archive_dir: PathBuf,
 }
 
 impl Config {
@@ -139,6 +146,14 @@ impl Config {
         &self.sandbox_dir
     }
 
+    pub fn retention_days(&self) -> i64 {
+        self.retention_days
+    }
+
+    pub fn archive_dir(&self) -> &Path {
+        &self.archive_dir
+    }
+
     pub fn mode(&self) -> Mode {
         if self.api_key.is_empty() || self.model.is_empty() {
             Mode::Demo
@@ -177,6 +192,8 @@ impl Debug for Config {
             .field("max_parallel", &self.max_parallel)
             .field("data_dir", &self.data_dir)
             .field("sandbox_dir", &self.sandbox_dir)
+            .field("retention_days", &self.retention_days)
+            .field("archive_dir", &self.archive_dir)
             .finish()
     }
 }
@@ -248,10 +265,24 @@ where
     let allow_shell = read("HIVE_ALLOW_SHELL").is_some_and(|value| value.trim() == "1");
     let data_dir_value = string_value(&read, "HIVE_DATA_DIR", "data")?;
     let sandbox_dir_value = string_value(&read, "HIVE_SANDBOX_DIR", "sandbox")?;
+    let retention_days_value = string_value(&read, "HIVE_RETENTION_DAYS", "30")?;
 
     let root = absolute_path(project_root, "project_root")?;
     let data_dir = validated_path(&root, &data_dir_value, "HIVE_DATA_DIR")?;
     let sandbox_dir = validated_path(&root, &sandbox_dir_value, "HIVE_SANDBOX_DIR")?;
+    let archive_dir = match read("HIVE_ARCHIVE_DIR") {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(invalid_config(
+                    "HIVE_ARCHIVE_DIR",
+                    "value must not be empty",
+                ));
+            }
+            validated_path(&root, value, "HIVE_ARCHIVE_DIR")?
+        }
+        None => data_dir.join("archive"),
+    };
     if paths_equivalent(&data_dir, &sandbox_dir) {
         return Err(invalid_config(
             "HIVE_DATA_DIR",
@@ -269,6 +300,8 @@ where
         max_parallel: parse_max_parallel(&max_parallel_value)?,
         data_dir,
         sandbox_dir,
+        retention_days: parse_retention_days(&retention_days_value)?,
+        archive_dir,
     })
 }
 
@@ -488,6 +521,19 @@ fn parse_max_parallel(value: &str) -> Result<usize, HiveError> {
         .ok_or_else(|| invalid_config("HIVE_MAX_PARALLEL", "value must be a positive integer"))
 }
 
+fn parse_retention_days(value: &str) -> Result<i64, HiveError> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|days| *days >= 0)
+        .ok_or_else(|| {
+            invalid_config(
+                "HIVE_RETENTION_DAYS",
+                "value must be a non-negative integer",
+            )
+        })
+}
+
 fn validated_path(root: &Path, value: &str, field: &'static str) -> Result<PathBuf, HiveError> {
     let joined = if Path::new(value).is_absolute() {
         PathBuf::from(value)
@@ -616,6 +662,8 @@ mod tests {
         assert!(config
             .sandbox_dir()
             .ends_with(Path::new("project").join("sandbox")));
+        assert_eq!(config.retention_days(), DEFAULT_RETENTION_DAYS);
+        assert_eq!(config.archive_dir(), config.data_dir().join("archive"));
     }
 
     #[test]
@@ -673,6 +721,68 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn retention_days_must_be_non_negative() {
+        assert_eq!(
+            load(&[("HIVE_RETENTION_DAYS", "0")])
+                .unwrap()
+                .retention_days(),
+            0
+        );
+        assert_eq!(
+            load(&[("HIVE_RETENTION_DAYS", "7")])
+                .unwrap()
+                .retention_days(),
+            7
+        );
+        for value in ["", "-1", "abc", "1.5"] {
+            let error = load(&[("HIVE_RETENTION_DAYS", value)]).unwrap_err();
+            assert!(matches!(
+                error,
+                HiveError::InvalidConfig {
+                    field: "HIVE_RETENTION_DAYS",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_dir_is_resolved_against_project_root() {
+        let config = load(&[("HIVE_ARCHIVE_DIR", "custom/archive")]).unwrap();
+        assert!(config
+            .archive_dir()
+            .ends_with(Path::new("project").join("custom").join("archive")));
+
+        let empty = load(&[("HIVE_ARCHIVE_DIR", " ")]).unwrap_err();
+        assert!(matches!(
+            empty,
+            HiveError::InvalidConfig {
+                field: "HIVE_ARCHIVE_DIR",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn archive_dir_defaults_under_custom_data_dir() {
+        let custom = load(&[("HIVE_DATA_DIR", "custom-data")]).unwrap();
+        assert_eq!(custom.archive_dir(), custom.data_dir().join("archive"));
+        assert!(custom
+            .archive_dir()
+            .ends_with(Path::new("project").join("custom-data").join("archive")));
+
+        let explicit = load(&[
+            ("HIVE_DATA_DIR", "custom-data"),
+            ("HIVE_ARCHIVE_DIR", "explicit-archive"),
+        ])
+        .unwrap();
+        assert_ne!(explicit.archive_dir(), explicit.data_dir().join("archive"));
+        assert!(explicit
+            .archive_dir()
+            .ends_with(Path::new("project").join("explicit-archive")));
     }
 
     #[test]

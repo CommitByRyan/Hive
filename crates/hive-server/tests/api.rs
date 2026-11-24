@@ -1,3 +1,7 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
@@ -6,6 +10,37 @@ use hive_server::{build_router, AppState};
 use hive_store::Store;
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "hive-server-api-{name}-{}-{nanos}-{counter}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn catalog() -> ModelCatalog {
     ModelCatalog::from_entries(vec![ModelEntry {
@@ -231,6 +266,72 @@ async fn archived_mission_forces_snapshot_for_old_cursors() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let _ = std::fs::remove_dir_all(&archive_dir);
+}
+
+#[tokio::test]
+async fn retained_floor_survives_server_restart() {
+    use hive_store::Store;
+    use hive_types::{EventId, EventInput, EventKind, MissionState};
+
+    let dir = TempDir::new("retention-restart");
+    let db = dir.path().join("hive.db");
+    {
+        let mut store = Store::open(&db).expect("open store");
+        let mission = store.create_mission("m", "g", 0).expect("mission");
+        for kind in [EventKind::MissionCreated, EventKind::MissionCancelled] {
+            store
+                .append_event(&EventInput {
+                    event_id: EventId::new(),
+                    kind,
+                    mission_id: mission.mission_id,
+                    run_id: None,
+                    node_id: None,
+                    session_id: None,
+                    attempt_no: None,
+                    trace_id: None,
+                    payload: json!({}),
+                })
+                .expect("event");
+        }
+        store
+            .transition_mission(mission.mission_id, MissionState::Cancelled, 2)
+            .expect("terminal");
+        let report = store
+            .archive_mission(&dir.path().join("archive"), mission.mission_id, 3)
+            .expect("archive");
+        assert_eq!(report.retained_since_seq, 3);
+    }
+
+    let store = Store::open(&db).expect("reopen store");
+    assert_eq!(store.retained_since_seq().expect("floor"), 3);
+    let state = AppState::new(
+        store,
+        catalog(),
+        "demo".to_owned(),
+        "127.0.0.1".to_owned(),
+        8765,
+    );
+    let app = build_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events?after_seq=0")
+                .header(header::ACCEPT, "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = json_body(response).await;
+    assert_eq!(body["snapshot_required"], true);
+    assert_eq!(body["retained_since_seq"], 3);
+
+    let health = app.oneshot(get("/api/health")).await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(json_body(health).await["retained_since_seq"], 3);
 }
 
 #[tokio::test]
