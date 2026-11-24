@@ -12,13 +12,21 @@
 | 发布包 | `dist/hive-0.1.0-windows-x86_64.zip` |
 | 迁移目标 | SQLite schema V6 |
 | 二进制 | `bin/hive.exe`、`bin/hive-server.exe` |
-| 包内文档 | `README.txt`、`RELEASE.md`、`CHANGELOG.md`、`hive.env.example`、`SHA256SUMS.txt` |
+| 包内文件 | 共 8 项：上述两个二进制、`hive.env.example`、`README.txt`、`RELEASE.md`、`CHANGELOG.md`、`start-hive.ps1`、`SHA256SUMS.txt` |
 
 `scripts/package.ps1` 会构建 release 二进制、校验 `hive --version` 与目录/zip 名称一致、生成逐文件 SHA256 和 zip SHA256。包内 `RELEASE.md` 末尾追加实际构建 commit、构建时间与平台。
 
 ## 2. 安装
 
-推荐使用发布包和解压后的安装脚本：
+发布包用户不需要 Rust，也不需要运行安装脚本。将 zip 解压到任意目录，例如 `C:\Hive`，然后进入解压出的 `hive-0.1.0-windows-x86_64` 目录：
+
+```powershell
+.\bin\hive.exe doctor
+```
+
+发布包内没有 `scripts/install.ps1`；它只是仓库内/开发者使用的 zip 安装 helper，不进入 zip，也不是用户安装步骤。
+
+仓库内可选 helper：
 
 ```powershell
 pwsh -NoProfile -File scripts/install.ps1 `
@@ -27,15 +35,9 @@ pwsh -NoProfile -File scripts/install.ps1 `
 ```
 
 - 目标目录非空时必须显式加 `-Force`；脚本只覆盖发布包文件，不删除用户已有 `data/`、`sandbox/` 或 `.env`。
-- 安装脚本不解压到目标目录之外的路径，不修改 PATH、不写注册表、不需要管理员权限。
-- 有 `SHA256SUMS.txt` 时逐文件校验；缺失或不匹配会失败。
-- 安装后打印 `hive doctor` 与启动命令。
-
-手动安装等价于解压 zip，然后进入解压目录运行：
-
-```powershell
-.\hive.exe doctor
-```
+- 脚本不修改 PATH、不写注册表、不需要管理员权限。
+- 缺少 `SHA256SUMS.txt`、清单外文件或哈希不匹配时拒绝安装。
+- 安装后打印 `.\bin\hive.exe doctor` 与启动命令。
 
 ## 3. 配置
 
@@ -83,7 +85,7 @@ curl.exe --noproxy '*' http://127.0.0.1:8765/api/state
 
 1. 停服，确认 `18765` 等测试端口或生产端口不再监听。
 2. 记录当前版本与 `data\hive.db` 的 SHA256。
-3. 用新发布包执行 `install.ps1 -Force`。
+3. 解压新发布包并覆盖程序文件（至少 `bin\`），保留 `data\`、`sandbox\`、`.env` 与用户文件。仓库内开发者可用 `scripts/install.ps1 -TargetDir <dir> -From <zip> -Force`；该脚本不在发布包内。
 4. 启动服务；旧 schema 会先自动备份，再向前迁移。
 5. 用 `/api/health` 检查 `schema_version` 与 `status`，再执行一次业务冒烟。
 
@@ -110,7 +112,7 @@ Get-FileHash -Algorithm SHA256 .\dist\hive-0.1.0-windows-x86_64.zip
 
 - 包内 `SHA256SUMS.txt` 使用 `<hash>  <relative/path>` 格式。
 - zip 旁的 `.sha256` 使用 `<zip hash>  <zip name>` 格式。
-- `scripts/install.ps1` 在复制前逐文件校验 `SHA256SUMS.txt`。
+- 仓库内 `scripts/install.ps1` 在复制前逐文件校验 `SHA256SUMS.txt`；清单缺失、清单外文件或哈希不匹配都会拒绝安装。
 
 ## 9. 发布清单
 
@@ -129,28 +131,31 @@ Get-FileHash -Algorithm SHA256 .\dist\hive-0.1.0-windows-x86_64.zip
 
 ### 安装与 doctor
 
+按发布包用户路径手动解压，不调用 `scripts/install.ps1`：
+
 ```powershell
-pwsh -NoProfile -File scripts/install.ps1 `
-  -TargetDir work\h11-clean\hive `
-  -From dist\hive-0.1.0-windows-x86_64.zip
+Expand-Archive -LiteralPath dist\hive-0.1.0-windows-x86_64.zip `
+  -DestinationPath work\h11-clean-r2 -Force
+cd work\h11-clean-r2\hive-0.1.0-windows-x86_64
+.\bin\hive.exe doctor
 ```
 
-输出摘要：`Verified 7 files from SHA256SUMS.txt`；安装退出码 0。无 Rust PATH 下执行 `bin\hive.exe doctor`，退出码 0，`rustc`/`cargo` 均为 `missing from PATH [optional]`，数据与沙箱目录均为 `writable`。
+输出摘要：解压得到 8 项包内文件；无 Rust PATH 下 `bin\hive.exe doctor` 退出码 0，`rustc`/`cargo` 均为 `missing from PATH [optional]`，数据与沙箱目录均为 `writable`。
 
 ### 启动与 API
 
 ```powershell
 $env:HIVE_HOST='127.0.0.1'
 $env:HIVE_PORT='18765'
-$env:HIVE_DATA_DIR='<repo>\work\h11-clean\data'
-$env:HIVE_SANDBOX_DIR='<repo>\work\h11-clean\sandbox'
-.\bin\hive-server.exe
+$env:HIVE_DATA_DIR='<repo>\work\h11-clean-r2\data'
+$env:HIVE_SANDBOX_DIR='<repo>\work\h11-clean-r2\sandbox'
+.\start-hive.ps1
 ```
 
 使用 `curl.exe --noproxy '*'` 验证，避免系统代理拦截 localhost：
 
 - `GET /api/health` → HTTP 200，`schema_version=6`，`status=ready`，`mode=demo`；`model_catalog=unavailable` 是因为未配置模型凭据。
-- `POST /api/missions` → HTTP 201，创建 `m_c8a5d5ff-8991-415a-8132-d3baae6375a3`，`last_seq=1`。
+- `POST /api/missions` → HTTP 201，返回 `mission.id=m_...`，`last_seq=1`。
 - `GET /api/state` → HTTP 200，`last_seq=1`，`stats.missions=1`，`stats.events=1`。
 - `GET /api/events?after_seq=0`（`Accept: text/event-stream`）→ 收到 `id: 1`、`event: mission.created`；`curl --max-time 2` 以退出码 28 结束，属于保持连接后的预期超时。
 
@@ -159,12 +164,14 @@ $env:HIVE_SANDBOX_DIR='<repo>\work\h11-clean\sandbox'
 ### 配置与数据库 dry-run
 
 - `hive config migrate --dry-run --file hive.env.example` → `Recognized keys: 9`，`API Key: unset`，`Validation: ok`，退出码 0。
-- 在含测试 API Key 的 `drill.env` 上运行 → `Recognized keys: 3`，`API Key: set`，输出未包含密钥值，退出码 0。
+- 在含测试 API Key 的 `drill.env` 上运行 → `Recognized keys: 3`，`API Key: set`，输出未包含密钥值（程序化检查 `contains_secret=False`），退出码 0。
 - `hive db migrate --dry-run --db data\hive.db`（服务已停止的真实库）→ `Current version: 6`，`Pending migrations: none`，`Final version: 6`，临时副本已删除，退出码 0。
-- 原库 SHA256 前后均为 `89a2318c76452be80e1d743f163f3dd96623b2b05604aa06985c6b5501238362`，一致。
+- 原库 SHA256 前后一致（`sha256_before == sha256_after`）。
 - 对照观察：只复制 `hive.db` 单文件、丢掉 `hive.db-wal` 时，副本会被读成版本 0；这证明 WAL 模式下必须使用一致副本，不能按文件直接复制。
 
 ### 安装安全
 
 - 目标目录非空且不带 `-Force` → 脚本抛错并退出 1，未写入文件。
 - 带 `-Force` 重装 → 退出 0；用户已有 `.env`（`HIVE_PORT=18765`）与 `data\user-marker.txt`（`keep-me`）均保留。
+- 从包副本删除 `SHA256SUMS.txt` 后运行 `scripts/install.ps1` → 退出 1，错误包含 `SHA256SUMS.txt missing; refusing to install`。
+- 在包副本加入未列入清单的 `extra.txt` 后运行 `scripts/install.ps1` → 退出 1，错误包含 `file is not listed in SHA256SUMS.txt: extra.txt`。

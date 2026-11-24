@@ -49,11 +49,11 @@ function Test-PackageHashes {
 
     $sumsPath = Join-Path $PackageRoot 'SHA256SUMS.txt'
     if (-not (Test-Path -LiteralPath $sumsPath)) {
-        Write-Warning "SHA256SUMS.txt not found; skipping hash verification."
-        return
+        throw "SHA256SUMS.txt missing; refusing to install"
     }
 
     $verified = 0
+    $listed = @{}
     foreach ($line in Get-Content -LiteralPath $sumsPath) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
@@ -64,6 +64,7 @@ function Test-PackageHashes {
         }
         $expected = $match.Groups[1].Value.ToLowerInvariant()
         $relative = $match.Groups[2].Value.Replace('/', '\')
+        $normalized = $relative.Replace('\', '/')
         $file = Assert-UnderDirectory -Path (Join-Path $PackageRoot $relative) -Root $PackageRoot
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
             throw "file listed in SHA256SUMS.txt is missing: $relative"
@@ -72,7 +73,18 @@ function Test-PackageHashes {
         if ($actual -ne $expected) {
             throw "SHA256 mismatch for $relative`nexpected: $expected`nactual:   $actual"
         }
+        $listed[$normalized] = $true
         $verified += 1
+    }
+
+    foreach ($file in Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Force) {
+        if ($file.Name -eq 'SHA256SUMS.txt') {
+            continue
+        }
+        $relative = [IO.Path]::GetRelativePath($PackageRoot, $file.FullName).Replace('\', '/')
+        if (-not $listed.ContainsKey($relative)) {
+            throw "file is not listed in SHA256SUMS.txt: $relative"
+        }
     }
     Write-Host "Verified $verified files from SHA256SUMS.txt"
 }
@@ -154,5 +166,5 @@ Write-Host ''
 Write-Host "Installed Hive to $target"
 Write-Host 'Next steps:'
 Write-Host "  cd `"$target`""
-Write-Host '  .\hive.exe doctor'
+Write-Host '  .\bin\hive.exe doctor'
 Write-Host '  .\start-hive.ps1'

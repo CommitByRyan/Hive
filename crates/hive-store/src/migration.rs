@@ -342,4 +342,28 @@ mod tests {
         );
         assert_eq!(sha256(&path), before);
     }
+
+    #[test]
+    fn dry_run_retains_copy_when_migration_fails() {
+        let dir = TempDir::new("failed");
+        let path = dir.path().join("hive.db");
+        create_v5_database(&path);
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.execute_batch("CREATE TABLE routines (x TEXT);")
+                .expect("incompatible routines table");
+        }
+        let before = sha256(&path);
+
+        let report = dry_run_migration(&path).expect("dry run");
+        assert_eq!(report.current_version, 5);
+        assert_eq!(report.pending_versions, vec![6]);
+        assert_eq!(report.final_version, 5);
+        assert!(report.failure.is_some());
+        assert!(report.copy_retained);
+        let copy = report.copy_path.expect("copy path");
+        assert!(copy.exists());
+        assert_eq!(read_schema_version(&path).expect("source version"), 5);
+        assert_eq!(sha256(&path), before);
+    }
 }
