@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use hive_runtime::{global_metrics, METRIC_BUDGET_EXCEEDED_TOTAL};
 use hive_store::{
     ApprovalDecision, ApprovalRecord, ArtifactRecord, MissionListRecord, MissionRecord, NodeRecord,
     RoutineRecord, RunRecord,
@@ -90,9 +91,29 @@ struct UpdateRoutineBody {
 }
 
 pub async fn health(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let schema_version = {
+    let (schema_version, store_status, snapshot, retained_since_seq) = {
         let store = state.store.lock().map_err(|_| ApiError::store_lock())?;
-        store.schema_version().map_err(ApiError::store)?
+        let schema_version = store.schema_version().map_err(ApiError::store)?;
+        let retained_since_seq = store.retained_since_seq().map_err(ApiError::store)?;
+        let store_status = if schema_version == hive_store::SCHEMA_VERSION {
+            "ok"
+        } else {
+            "unmigrated"
+        };
+        let snapshot = store.state_snapshot().map_err(ApiError::store)?;
+        (schema_version, store_status, snapshot, retained_since_seq)
+    };
+    let metrics = global_metrics().snapshot();
+    let model_catalog_ready = !state.catalog.is_empty();
+    let budget_exceeded = budget_exceeded_by_dimension(&metrics);
+    let budget_degraded = budget_exceeded
+        .as_object()
+        .map(|entries| !entries.is_empty())
+        .unwrap_or(false);
+    let status = if snapshot.pending_approval_count > 0 || budget_degraded {
+        "degraded"
+    } else {
+        "ready"
     };
     Ok(json_response(
         StatusCode::OK,
@@ -101,11 +122,79 @@ pub async fn health(State(state): State<AppState>) -> Result<Response, ApiError>
             "schema_version": schema_version,
             "event_schema_version": hive_types::EVENT_SCHEMA_VERSION,
             "mode": state.mode,
-            "model_catalog_ready": !state.catalog.is_empty(),
+            "model_catalog_ready": model_catalog_ready,
             "authentication_required": state.authentication_required(),
             "approver_identity": "unauthenticated_local_console",
+            "status": status,
+            "checks": {
+                "database": store_status,
+                "model_catalog": if model_catalog_ready { "ready" } else { "unavailable" },
+                "approvals": if snapshot.pending_approval_count > 0 { "degraded" } else { "ready" },
+                "budget": if budget_degraded { "degraded" } else { "ready" },
+            },
+            "budget": {
+                "exceeded_total": budget_exceeded,
+            },
+            "metrics": metrics,
+            "retained_since_seq": retained_since_seq,
         }),
     ))
+}
+
+pub async fn health_live(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let database_ok = {
+        let store = state.store.lock().map_err(|_| ApiError::store_lock())?;
+        store.journal_mode().map_err(ApiError::store).is_ok()
+    };
+    if !database_ok {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "database liveness check failed",
+        ));
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        json!({ "status": "live", "ok": true }),
+    ))
+}
+
+pub async fn health_ready(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let schema_version = {
+        let store = state.store.lock().map_err(|_| ApiError::store_lock())?;
+        store.schema_version().map_err(ApiError::store)?
+    };
+    if schema_version != hive_store::SCHEMA_VERSION || state.catalog.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "service is not ready",
+        ));
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        json!({ "status": "ready", "ok": true, "model_catalog": "ready" }),
+    ))
+}
+
+fn budget_exceeded_by_dimension(metrics: &Value) -> Value {
+    let mut totals = serde_json::Map::new();
+    if let Some(entries) = metrics.as_object() {
+        for (name, entry) in entries {
+            if name != METRIC_BUDGET_EXCEEDED_TOTAL
+                && !name.starts_with(&format!("{}|", METRIC_BUDGET_EXCEEDED_TOTAL))
+            {
+                continue;
+            }
+            let dimension = entry["labels"]["label"].as_str().unwrap_or("other");
+            let count = entry["value"].as_u64().unwrap_or(0);
+            let slot = totals
+                .entry(dimension.to_owned())
+                .or_insert_with(|| Value::from(0));
+            *slot = Value::from(slot.as_u64().unwrap_or(0) + count);
+        }
+    }
+    Value::Object(totals)
 }
 
 pub async fn state(
@@ -387,7 +476,7 @@ pub async fn events(
         None => None,
     };
 
-    let (backlog, latest) = {
+    let (backlog, latest, retained_since_seq) = {
         let store = state.store.lock().map_err(|_| ApiError::store_lock())?;
         if let Some(mission_id) = mission_id {
             if store
@@ -401,12 +490,14 @@ pub async fn events(
                 ));
             }
         }
-        store
+        let retained_since_seq = store.retained_since_seq().map_err(ApiError::store)?;
+        let (backlog, latest) = store
             .read_events_for_sse(mission_id, after_seq)
-            .map_err(ApiError::store)?
+            .map_err(ApiError::store)?;
+        (backlog, latest, retained_since_seq)
     };
     let latest_seq = latest.unwrap_or(0);
-    if after_seq > latest_seq {
+    if after_seq > latest_seq && after_seq > retained_since_seq {
         return Err(ApiError::conflict(
             "sequence_ahead",
             "local cursor is ahead of server sequence",
@@ -417,6 +508,14 @@ pub async fn events(
         .store(latest_seq, std::sync::atomic::Ordering::Relaxed);
 
     let rx = state.events_tx.subscribe();
+    if after_seq < retained_since_seq {
+        let snapshot_hint = json!({
+            "snapshot_required": true,
+            "retained_since_seq": retained_since_seq,
+            "after_seq": after_seq,
+        });
+        return Ok(json_response(StatusCode::CONFLICT, snapshot_hint));
+    }
     let body_stream = crate::sse::sse_stream(backlog, rx, state.latest_seq.clone());
     let response = Response::builder()
         .status(StatusCode::OK)

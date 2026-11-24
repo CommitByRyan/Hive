@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use hive_types::{
     AgentSessionId, ApprovalId, ApprovalState, AttemptNo, EventEnvelope, EventId, EventInput,
@@ -26,9 +28,14 @@ use crate::{MAX_SEQ, SNAPSHOT_SCHEMA_VERSION};
 
 const MAX_ROUTINES: u64 = 50;
 
+const DEFAULT_RETENTION_DAYS: i64 = 30;
+
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
+    /// Lowest sequence that a client can safely resume from after retention.
+    /// Zero means no archive has happened in this process.
+    retained_floor: u64,
 }
 
 /// Result of attempting to fire one routine window.
@@ -54,6 +61,15 @@ pub enum RoutineFireOutcome {
     Failed { fire_at_ms: i64 },
 }
 
+#[derive(Clone, Debug)]
+pub struct ArchiveReport {
+    pub mission_id: MissionId,
+    pub events_archived: u64,
+    pub audits_archived: u64,
+    pub retained_since_seq: u64,
+    pub archive_path: PathBuf,
+}
+
 impl Store {
     pub fn open(path: &Path) -> StoreResult<Self> {
         let conn = Connection::open(path)?;
@@ -69,7 +85,10 @@ impl Store {
         schema::apply_pragmas(&conn)?;
         let mut conn = conn;
         schema::migrate(&mut conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            retained_floor: 0,
+        })
     }
 
     pub fn journal_mode(&self) -> StoreResult<String> {
@@ -77,6 +96,224 @@ impl Store {
             .conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         Ok(mode)
+    }
+
+    pub fn archive_expired_missions(
+        &mut self,
+        archive_root: &Path,
+        now_ms: i64,
+    ) -> StoreResult<Vec<ArchiveReport>> {
+        let threshold_ms = now_ms
+            .checked_sub(DEFAULT_RETENTION_DAYS * 24 * 60 * 60 * 1000)
+            .ok_or_else(|| StoreError::Archive("retention threshold underflow".to_owned()))?;
+        let mission_ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT mission_id FROM missions WHERE state IN ('done','failed','cancelled') AND updated_at_ms < ?1 ORDER BY updated_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![threshold_ms], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+
+        let mut reports = Vec::new();
+        for mission_id in mission_ids {
+            let mission_id = MissionId::parse(&mission_id)?;
+            reports.push(self.archive_mission(archive_root, mission_id, now_ms)?);
+        }
+        Ok(reports)
+    }
+
+    pub fn archive_mission(
+        &mut self,
+        archive_root: &Path,
+        mission_id: MissionId,
+        now_ms: i64,
+    ) -> StoreResult<ArchiveReport> {
+        let mission = self
+            .get_mission(mission_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("mission {mission_id}")))?;
+        if !mission.state.is_terminal() {
+            return Err(StoreError::Archive(format!(
+                "mission {mission_id} is active"
+            )));
+        }
+
+        let mission_dir = archive_root.join(mission_id.to_string());
+        std::fs::create_dir_all(&mission_dir)
+            .map_err(|error| StoreError::Archive(error.to_string()))?;
+        let events_path = mission_dir.join("events.jsonl");
+
+        let envelope_rows: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT seq, envelope_json FROM events WHERE mission_id = ?1 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map(params![mission_id.to_string()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+
+        let audit_rows: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT audit_id, tool_call_id, record_json, prev_hash, entry_hash FROM tool_audit WHERE mission_id = ?1 ORDER BY audit_id ASC",
+            )?;
+            let rows = stmt.query_map(params![mission_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+
+        let mut writer = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&events_path)
+                .map_err(|error| StoreError::Archive(error.to_string()))?,
+        );
+        let segment_genesis_hash = audit_rows
+            .first()
+            .map(|row| row.3.clone())
+            .unwrap_or_else(|| "GENESIS".to_owned());
+        let archive_header = serde_json::json!({
+            "mission_id": mission_id.to_string(),
+            "archived_at_ms": now_ms,
+            "event_count": envelope_rows.len(),
+            "audit_count": audit_rows.len(),
+            "segment_genesis_hash": segment_genesis_hash,
+        });
+        writer
+            .write_all(archive_header.to_string().as_bytes())
+            .and_then(|_| writer.write_all(b"\n"))
+            .map_err(io_archive_error)?;
+        for (_, envelope_json) in envelope_rows.iter() {
+            writer
+                .write_all(envelope_json.as_bytes())
+                .and_then(|_| writer.write_all(b"\n"))
+                .map_err(io_archive_error)?;
+        }
+        for (_, _, record_json, prev_hash, entry_hash) in audit_rows.iter() {
+            let archived_audit = serde_json::json!({
+                "record_json": record_json,
+                "prev_hash": prev_hash,
+                "entry_hash": entry_hash,
+            });
+            writer
+                .write_all(archived_audit.to_string().as_bytes())
+                .and_then(|_| writer.write_all(b"\n"))
+                .map_err(io_archive_error)?;
+        }
+        writer.flush().map_err(io_archive_error)?;
+        let file = writer
+            .into_inner()
+            .map_err(|_| StoreError::Archive("failed to flush archive writer".to_owned()))?;
+        file.sync_all().map_err(io_archive_error)?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM events WHERE mission_id = ?1",
+            params![mission_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM tool_audit WHERE mission_id = ?1",
+            params![mission_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM snapshots WHERE mission_id = ?1",
+            params![mission_id.to_string()],
+        )?;
+        tx.commit()?;
+
+        let boundary = envelope_rows
+            .iter()
+            .map(|row| row.0.saturating_add(1) as u64)
+            .max()
+            .unwrap_or(0);
+        self.retained_floor = self.retained_floor.max(boundary);
+
+        Ok(ArchiveReport {
+            mission_id,
+            events_archived: envelope_rows.len() as u64,
+            audits_archived: audit_rows.len() as u64,
+            retained_since_seq: self.retained_floor,
+            archive_path: events_path,
+        })
+    }
+
+    pub fn verify_archived_mission_audit(
+        &self,
+        archive_path: &Path,
+        mission_id: MissionId,
+    ) -> StoreResult<bool> {
+        let lines: Vec<String> = std::fs::read_to_string(archive_path)
+            .map_err(|error| StoreError::Archive(error.to_string()))?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let Some((header_json, rest)) = lines.split_first() else {
+            return Ok(false);
+        };
+        let header: serde_json::Value = serde_json::from_str(header_json)?;
+        if header["mission_id"] != mission_id.to_string() {
+            return Ok(false);
+        }
+        let event_count = header["event_count"]
+            .as_u64()
+            .ok_or_else(|| StoreError::Archive("invalid archive event_count".to_owned()))?
+            as usize;
+        if rest.len() < event_count {
+            return Ok(false);
+        }
+        let audit_records: Vec<&str> = rest[event_count..].iter().map(String::as_str).collect();
+        let expected_audit_count = header["audit_count"].as_u64().unwrap_or_default() as usize;
+        if audit_records.len() != expected_audit_count {
+            return Ok(false);
+        }
+        let mut expected_prev = header["segment_genesis_hash"]
+            .as_str()
+            .unwrap_or("GENESIS")
+            .to_owned();
+        for audit_json in audit_records {
+            let audit: serde_json::Value = serde_json::from_str(audit_json)?;
+            let record_json = audit["record_json"]
+                .as_str()
+                .ok_or_else(|| StoreError::Archive("missing record_json".to_owned()))?;
+            let prev_hash = audit["prev_hash"]
+                .as_str()
+                .ok_or_else(|| StoreError::Archive("missing prev_hash".to_owned()))?;
+            let entry_hash = audit["entry_hash"]
+                .as_str()
+                .ok_or_else(|| StoreError::Archive("missing entry_hash".to_owned()))?;
+            if prev_hash != expected_prev
+                || audit_entry_hash(&expected_prev, record_json) != entry_hash
+            {
+                return Ok(false);
+            }
+            expected_prev = entry_hash.to_owned();
+        }
+        Ok(true)
+    }
+
+    pub fn retained_since_seq(&self) -> StoreResult<u64> {
+        Ok(self.retained_floor)
     }
 
     pub fn schema_version(&self) -> StoreResult<i64> {
@@ -176,6 +413,26 @@ impl Store {
 
     pub fn get_mission(&self, mission_id: MissionId) -> StoreResult<Option<MissionRecord>> {
         query_mission(&self.conn, mission_id)
+    }
+
+    /// Advance a mission through its lifecycle. Transitions are validated
+    /// against [`MissionState`] so a terminal mission cannot move again.
+    pub fn transition_mission(
+        &mut self,
+        mission_id: MissionId,
+        next: MissionState,
+        now_ms: i64,
+    ) -> StoreResult<MissionRecord> {
+        let mission = self
+            .get_mission(mission_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("mission {mission_id}")))?;
+        mission.state.transition(next)?;
+        self.conn.execute(
+            "UPDATE missions SET state = ?1, updated_at_ms = ?2 WHERE mission_id = ?3",
+            params![next.as_str(), now_ms, mission_id.to_string()],
+        )?;
+        self.get_mission(mission_id)?
+            .ok_or_else(|| StoreError::NotFound(format!("mission {mission_id}")))
     }
 
     pub fn get_run(&self, run_id: RunId) -> StoreResult<Option<RunRecord>> {
@@ -482,10 +739,7 @@ impl Store {
     }
 
     pub fn latest_seq(&self) -> StoreResult<Option<u64>> {
-        let value: Option<i64> = self
-            .conn
-            .query_row("SELECT MAX(seq) FROM events", [], |row| row.get(0))?;
-        Ok(value.map(|seq| seq as u64))
+        latest_seq_on(&self.conn)
     }
 
     pub fn save_snapshot(&mut self, input: &SnapshotInput<'_>) -> StoreResult<SnapshotRecord> {
@@ -2573,8 +2827,18 @@ fn list_missions_on(
 }
 
 fn latest_seq_on(conn: &Connection) -> StoreResult<Option<u64>> {
-    let value: Option<i64> = conn.query_row("SELECT MAX(seq) FROM events", [], |row| row.get(0))?;
-    Ok(value.map(|seq| seq as u64))
+    // `seq` is AUTOINCREMENT, so sqlite_sequence keeps the high-water mark
+    // even after archived rows are deleted. Retention must not move
+    // `latest_seq` backwards for clients that still hold a cursor.
+    let value: i64 = conn.query_row(
+        "SELECT MAX(\
+            COALESCE((SELECT MAX(seq) FROM events), 0),\
+            COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)\
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((value > 0).then_some(value as u64))
 }
 
 fn mission_latest_seq_on(conn: &Connection, mission_id: MissionId) -> StoreResult<Option<u64>> {
@@ -3617,6 +3881,10 @@ fn validate_cursor(seq: u64) -> StoreResult<i64> {
     i64::try_from(seq).map_err(|_| StoreError::SequenceExhausted)
 }
 
+fn io_archive_error(error: std::io::Error) -> StoreError {
+    StoreError::Archive(error.to_string())
+}
+
 fn create_approval_on(
     conn: &Connection,
     input: &ApprovalInput,
@@ -3707,7 +3975,7 @@ mod tests {
         RunId, ToolCallId, HANDOFF_SCHEMA_VERSION,
     };
 
-    use super::{RoutineFireOutcome, Store};
+    use super::{RoutineFireOutcome, Store, DEFAULT_RETENTION_DAYS};
     use crate::error::StoreError;
     use crate::records::{
         can_retry, AgentSessionState, ApprovalDecision, ApprovalInput, BudgetDimension,
@@ -4997,6 +5265,116 @@ mod tests {
             )
             .expect("tamper");
         assert!(!store.verify_tool_audit_chain().expect("verify tampered"));
+    }
+
+    #[test]
+    fn archive_expired_mission_preserves_latest_seq_and_active_events() {
+        let (mut store, mission, _run, node) = setup();
+        let active_mission = store.create_mission("active", "g", 0).expect("active");
+        let active_run = store
+            .create_run(active_mission.mission_id, 0)
+            .expect("active run");
+        let active_node = store
+            .add_node(active_mission.mission_id, active_run.run_id, 3, 0)
+            .expect("active node");
+        let active_event = event(
+            active_mission.mission_id,
+            None,
+            EventKind::MissionCreated,
+            None,
+        );
+        store.append_event(&active_event).expect("active event");
+        let mission_event = event(mission.mission_id, None, EventKind::MissionDone, None);
+        let archived_event = store.append_event(&mission_event).expect("mission event");
+        assert_eq!(archived_event.seq, 2);
+        let pre_archive_latest = store.latest_seq().expect("latest");
+
+        store
+            .conn
+            .execute(
+                "UPDATE missions SET state = 'done', updated_at_ms = 0 WHERE mission_id = ?1",
+                rusqlite::params![mission.mission_id.to_string()],
+            )
+            .expect("terminal");
+        let dir = TempDir::new("archive");
+        let reports = store
+            .archive_expired_missions(dir.path(), 31 * 24 * 60 * 60 * 1000)
+            .expect("archive");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].mission_id, mission.mission_id);
+        assert_eq!(reports[0].events_archived, 1);
+        let post_archive_latest = store.latest_seq().expect("latest after");
+        assert_eq!(post_archive_latest, Some(2));
+        assert_eq!(pre_archive_latest, Some(2));
+        assert_eq!(reports[0].retained_since_seq, 3);
+        let active_events = store
+            .read_mission_events(active_mission.mission_id, 1)
+            .expect("active events");
+        assert_eq!(active_events.len(), 0);
+        assert!(store
+            .read_mission_events(mission.mission_id, 1)
+            .expect("archived events")
+            .is_empty());
+        assert!(store.get_node(node.node_id).expect("node").is_some());
+        assert!(store
+            .get_node(active_node.node_id)
+            .expect("active node")
+            .is_some());
+    }
+
+    #[test]
+    fn archive_retention_boundary_excludes_exactly_expired() {
+        let (mut store, mission, _run, _node) = setup();
+        let exactly_old = 31 * 24 * 60 * 60 * 1000;
+        let threshold = exactly_old - DEFAULT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+        store
+            .conn
+            .execute(
+                "UPDATE missions SET state = 'done', updated_at_ms = ?1 WHERE mission_id = ?2",
+                rusqlite::params![threshold, mission.mission_id.to_string()],
+            )
+            .expect("terminal");
+        let dir = TempDir::new("archive-boundary");
+        let reports = store
+            .archive_expired_missions(dir.path(), exactly_old)
+            .expect("archive");
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn archived_mission_audit_chain_verifies_by_segment() {
+        let mut store = Store::open_in_memory().expect("store");
+        let mission = store.create_mission("m", "g", 0).expect("mission");
+        let run = store.create_run(mission.mission_id, 0).expect("run");
+        let _node = store
+            .add_node(mission.mission_id, run.run_id, 0, 0)
+            .expect("node");
+        let audit = ToolCallId::new();
+        store
+            .append_tool_audit(
+                mission.mission_id,
+                audit,
+                "node.tool_call",
+                serde_json::json!({ "tool": "fs.read" }),
+                0,
+            )
+            .expect("audit");
+
+        store
+            .conn
+            .execute(
+                "UPDATE missions SET state = 'done', updated_at_ms = 0 WHERE mission_id = ?1",
+                rusqlite::params![mission.mission_id.to_string()],
+            )
+            .expect("terminal");
+        let dir = TempDir::new("archive-audit");
+        let report = store
+            .archive_mission(dir.path(), mission.mission_id, 31 * 24 * 60 * 60 * 1000)
+            .expect("archive");
+        assert!(store
+            .verify_archived_mission_audit(&report.archive_path, mission.mission_id)
+            .expect("verify archive"));
     }
 
     #[test]
