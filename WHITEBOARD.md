@@ -7,11 +7,11 @@
 
 ## 当前门
 
-**全部阶段完成（0.1.0 本地发布包）**
+**Post-release 加固：H12 保留水位 + H13 worktree 回收安全（并行）**
 
-目标：H01–H11 全部完成并合并。H11 交付 `.env` 配置、`config`/`db` 迁移 dry-run、启动前备份、发布包/安装 helper、干净演练与回滚文档；独立审计 P0/P1 清零。发布包 `dist/hive-0.1.0-windows-x86_64.zip`，SHA256 `9b32c8d2adaa8b44fad3a9d584ec2f2a3ae2cc4162b2558d142df25e60aa8734`；未 push、未建远端、未签名。当前基线 `ac325a2`（主仓 334 passed / 1 ignored）。
+目标：H12 修复 `retained_since_seq` 重启丢失并把终态 Mission 归档接入启动/周期生命周期；H13 把 dirty worktree 回收默认改为保留、显式才强删。H01–H11 已完成；发布包 `dist/hive-0.1.0-windows-x86_64.zip`，SHA256 `9b32c8d2adaa8b44fad3a9d584ec2f2a3ae2cc4162b2558d142df25e60aa8734`。当前基线 `cc16663`（主仓 334 passed / 1 ignored）。
 
-状态：`done`
+状态：`in_progress`
 
 ## 阶段状态
 
@@ -42,6 +42,8 @@
 | R08 | 安全与并发独立审计 | done, merged（no P0 / 4 P1） | H09a、H03b-2 |
 | H10 | 评估、故障注入、性能 | done, verified（release 6 场景 × 6 次，36/36 ok） | H06 |
 | H11 | 发布与迁移 | done, merged, verified（334/1；独立审计 P0/P1 清零） | H10 |
+| H12 | 保留水位持久化与自动归档 | in_progress | H11、H09c |
+| H13 | worktree 回收的脏数据安全 | in_progress | H11、H06d-1 |
 
 ## 活跃工作
 
@@ -58,6 +60,8 @@
 | H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（pro/glm 429 后切 `auto/deepseek-v4.1-flash` high） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | done, merged `ae93876`, verified 314/1 |
 | H11 | 可见对话 `01a20c32-929a-7951-9b5c-ce54e12557ef`（`auto/deepseek-v4.1-flash` high） | H11a `.env`/config migrate/db migrate dry-run/备份/doctor；H11b 打包、安装、干净演练与发布文档；H11c 安装闭环修复 | `.codex/worktrees/7086/Hive`，分支 `codex/h11-release`，基线 `20bd9a5` | done, merged `ac325a2`, verified 334/1 |
 | H11 审计 | 可见对话 `01a20c4d-bef8-7140-b53f-3c77b9c22d3d`（`auto/glm-5.3` max） | 只读复核三提交、dist zip、安装/回滚与演练证据 | main 只读 | done，可合并，P0/P1 清零 |
+| H12 | 待开可见对话（`auto/deepseek-v4.1-flash` high） | 保留水位 sidecar、写入顺序、重启语义、启动/周期归档、配置与健康暴露 | 新建 `codex/h12-retention` worktree，基线 `cc16663` | ready |
+| H13 | 待开可见对话（`auto/deepseek-v4.1-flash` high） | `RecyclePolicy` 默认保留 dirty、显式强删、测试与 H06d 文档 | 新建 `codex/h13-recycle` worktree，基线 `cc16663` | ready |
 | H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | done, merged `6dd9dbc`, verified 304/1 |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
@@ -74,7 +78,7 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`ac325a2`（H11 合并后；主仓独立复验 `All checks passed`，334 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4、H09c 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结，H11 未改迁移 SQL。
+合并基线：`cc16663`（H11 收口后；主仓独立复验 `All checks passed`，334 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4、H09c、H11 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结，H11 未改迁移 SQL。
 
 平台安全现状：`hive-llm` 的 ureq 已接 `NetworkPolicy` 单次解析 + 显式 `TcpConnector + RustlsConnector`，并禁用环境代理与重定向；通用网络工具仍关闭。`fs.read/write/list` 已走授权父目录句柄相对 IO，原子替换用 `ReplaceFileW`/`MoveFileEx` 并复核父目录身份，但 `atomic_replace_handle_relative=false`，仍有已记录的路径级残余窗口；非 Windows 回退不是句柄级隔离。Shell 非零退出已改为结构化 `status:"error"` + `exit_code`。
 
@@ -82,7 +86,7 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
-远端状态（2026-11-24 13:45 外部变更）：仓库被添加 `origin=https://github.com/CommitByRyan/Hive.git`，`origin/main` 为 `1611f8d`（README 提交），本地 `main` 为 `d54aed8`、领先 11 个提交。H00 未执行 push；是否推送需用户明确授权。
+远端状态（2026-11-24 13:45 外部变更）：仓库被添加 `origin=https://github.com/CommitByRyan/Hive.git`，`origin/main` 为 `1611f8d`（README 提交）；远端由用户主对话维护，H00 不执行 push。
 
 契约同步：`PROTOCOL.md` 已加入 ADR 0005 与 ADR 0006；`routine.*` 非触发事件使用系统作用域 `m_00000000-0000-4000-8000-000000000000`，合法但不是 `missions` 行。H09b 已按 ADR 0006 收口并合并：`SYSTEM_SCOPE_MISSION_ID` 为单一常量，`routine.triggered` 使用真实 Mission，`list_missions` 不含系统作用域。
 
