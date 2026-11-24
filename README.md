@@ -6,14 +6,14 @@ Hive 将任务组织为 `Mission → Run → Node → Agent Session → Turn`，
 
 ## 当前状态
 
-项目处于工程预览阶段，尚未发布稳定版。主线的 DAG 调度、恢复、安全工具、预算账本、Routine、可观测性与保留、HTTP/SSE 控制台和多 Agent worktree 已完成并合并；H10 性能基准则采集中，H11 发布与迁移待基准结论后启动。
+项目处于工程预览阶段，0.1.0 本地发布包已产出，尚未推送远端或对外发布。主线的 DAG 调度、恢复、安全工具、预算账本、Routine、可观测性与保留、HTTP/SSE 控制台、多 Agent worktree、性能基准、配置/数据库迁移与 Windows 打包均已完成并合并。
 
 当前 `main` 基线已通过：
 
 ```text
 fmt --all --check
 clippy --workspace --all-targets -- -D warnings
-test --workspace                 314 passed / 1 ignored
+test --workspace                 334 passed / 1 ignored
 ```
 
 被忽略的测试需要本机运行 Magpie 网关，其余测试不依赖外部服务。
@@ -28,6 +28,7 @@ test --workspace                 314 passed / 1 ignored
 - **预算与 Routine**：节点预算原子扣减、启动恢复、定时触发与幂等窗口。
 - **可观测性与保留**：JSONL 结构化日志、共享 trace、原子指标、健康分级、终态 Mission 归档与审计段校验。
 - **服务层**：HTTP/SSE API、审批接口、事件补偿与最小 Web 控制台。
+- **发布与迁移**：`.env` 配置、`config`/`db` 迁移 dry-run、启动前备份、Windows 发布包与安装 helper。
 
 ## 快速开始
 
@@ -74,6 +75,7 @@ cargo test --workspace
 - [执行协议](docs/PROTOCOL.md)
 - [重构路线](docs/ROADMAP.md)
 - [评估说明](docs/EVAL.md)
+- [发布与回滚](docs/RELEASE.md)
 - [ADR 索引](docs/ADR/0001-foundation.md)
 - [阶段白板](WHITEBOARD.md)
 

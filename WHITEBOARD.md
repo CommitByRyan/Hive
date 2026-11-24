@@ -7,11 +7,11 @@
 
 ## 当前门
 
-**H11 发布与迁移（独立审计中）**
+**全部阶段完成（0.1.0 本地发布包）**
 
-目标：H10 正式基准已完成（36 次运行全 `ok:true`，原始 JSONL 在 `docs/audits/data/`）。H11 落 `packaging/`、`scripts/package.ps1`/`install.ps1`、`hive config migrate --dry-run`、`hive db migrate --dry-run`、干净环境演练、`docs/RELEASE.md`、`CHANGELOG.md` 与 SHA256；不 push、不建远端、不签名。当前基线 `6eb85f4`（主仓 314 passed / 1 ignored）。
+目标：H01–H11 全部完成并合并。H11 交付 `.env` 配置、`config`/`db` 迁移 dry-run、启动前备份、发布包/安装 helper、干净演练与回滚文档；独立审计 P0/P1 清零。发布包 `dist/hive-0.1.0-windows-x86_64.zip`，SHA256 `9b32c8d2adaa8b44fad3a9d584ec2f2a3ae2cc4162b2558d142df25e60aa8734`；未 push、未建远端、未签名。当前基线 `ac325a2`（主仓 334 passed / 1 ignored）。
 
-状态：`in_progress`
+状态：`done`
 
 ## 阶段状态
 
@@ -41,7 +41,7 @@
 | H06d-2 | Handoff 真实基线 | done, merged, verified（264/1） | H09a、H06d-1 |
 | R08 | 安全与并发独立审计 | done, merged（no P0 / 4 P1） | H09a、H03b-2 |
 | H10 | 评估、故障注入、性能 | done, verified（release 6 场景 × 6 次，36/36 ok） | H06 |
-| H11 | 发布与迁移 | in_progress（H11a 配置/迁移 → H11b 打包/演练） | H10 |
+| H11 | 发布与迁移 | done, merged, verified（334/1；独立审计 P0/P1 清零） | H10 |
 
 ## 活跃工作
 
@@ -56,8 +56,8 @@
 | H09b | 可见对话 `01a2089f-87cc-7281-8cfb-1a9c348b865b`（flash high） | V6 routines、表达式、幂等触发、tick、`/api/routines` | `.codex/worktrees/2b99/Hive`，基线 `5f3769c` | done, merged `5bcee31`, verified 286/1 |
 | H09d | 可见对话 `01a208fb-add5-7ce1-8792-dc2079d9bc55`（`auto/deepseek-v4-pro` high） | 启动恢复接线、reclaim 同事务事件、可停止生命周期 tick | `.codex/worktrees/dec6/Hive`，基线 `5bcee31` | done, merged `da60c17`, verified 291/1 |
 | H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（pro/glm 429 后切 `auto/deepseek-v4.1-flash` high） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | done, merged `ae93876`, verified 314/1 |
-| H11 | 可见对话 `01a20c32-929a-7951-9b5c-ce54e12557ef`（`auto/deepseek-v4.1-flash` high） | H11a `.env`/config migrate/db migrate dry-run/备份/doctor；H11b 打包、安装、干净演练与发布文档 | `.codex/worktrees/7086/Hive`，分支 `codex/h11-release`，基线 `20bd9a5` | in_progress |
-| H11 审计 | 可见对话 `01a20c4d-bef8-7140-b53f-3c77b9c22d3d`（`auto/glm-5.3` max） | 只读复核 `3e08bf5`/`0a3d9c8`、dist zip、安装/回滚与演练证据 | main 只读 | in_progress |
+| H11 | 可见对话 `01a20c32-929a-7951-9b5c-ce54e12557ef`（`auto/deepseek-v4.1-flash` high） | H11a `.env`/config migrate/db migrate dry-run/备份/doctor；H11b 打包、安装、干净演练与发布文档；H11c 安装闭环修复 | `.codex/worktrees/7086/Hive`，分支 `codex/h11-release`，基线 `20bd9a5` | done, merged `ac325a2`, verified 334/1 |
+| H11 审计 | 可见对话 `01a20c4d-bef8-7140-b53f-3c77b9c22d3d`（`auto/glm-5.3` max） | 只读复核三提交、dist zip、安装/回滚与演练证据 | main 只读 | done，可合并，P0/P1 清零 |
 | H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | done, merged `6dd9dbc`, verified 304/1 |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
@@ -74,7 +74,7 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`ae93876`（H09c 合并后；主仓独立复验 `All checks passed`，314 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结。
+合并基线：`ac325a2`（H11 合并后；主仓独立复验 `All checks passed`，334 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4、H09c 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结，H11 未改迁移 SQL。
 
 平台安全现状：`hive-llm` 的 ureq 已接 `NetworkPolicy` 单次解析 + 显式 `TcpConnector + RustlsConnector`，并禁用环境代理与重定向；通用网络工具仍关闭。`fs.read/write/list` 已走授权父目录句柄相对 IO，原子替换用 `ReplaceFileW`/`MoveFileEx` 并复核父目录身份，但 `atomic_replace_handle_relative=false`，仍有已记录的路径级残余窗口；非 Windows 回退不是句柄级隔离。Shell 非零退出已改为结构化 `status:"error"` + `exit_code`。
 
@@ -211,4 +211,6 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | 2026-11-24 | H03b-4 | `hive-platform::PathHandle` 句柄持有/相对读写/目录枚举/原子替换，`fs.read/list/write` 接线，junction 父目录拒绝，能力声明 | 分支 304 passed / 1 ignored（NTFS junction 用例真跑）；主仓合并后 `All checks passed`；残余替换窗口已记录 |
 | 2026-11-24 | H09c | JSONL 日志与 trace、Atomic 指标注册表、health 分级、终态 Mission 整段归档、Mission 段审计链校验、`retained_since_seq` 快照提示 | 分支 301 passed / 1 ignored；主仓合并后 `All checks passed`，314 passed / 1 ignored；归档 fsync 后同事务删除，`latest_seq` 不降 |
 | 2026-11-24 | H10 基准 | H00 在空闲机器用 release harness 采集 6 场景 ×（1 预热 + 5 样本），写入 p50/p95、events/sec、db_bytes 与机器元数据 | 36/36 `ok:true`；报告 `docs/audits/H10-benchmark-report.md` §9，原始 JSONL `docs/audits/data/` |
+| 2026-11-24 | H11 | `.env` 解析与严格未知键、`config migrate`/`db migrate --dry-run`（VACUUM INTO 副本）、启动前备份、安装包 doctor 语义、打包/安装脚本、RELEASE/CHANGELOG、18765 干净演练 | `3e08bf5` + `0a3d9c8` + `66d1d5c`；主仓合并后 `All checks passed`，334 passed / 1 ignored；zip SHA256 `9b32c8d2…aa8734` |
+| 2026-11-24 | H11 审计 | 独立只读审计三提交、包体 8 项、安装/回滚/迁移证据，复核修复轮 | 结论可合并；P0/P1 清零；P2 迁移失败副本测试已补；P3 无 |
 
