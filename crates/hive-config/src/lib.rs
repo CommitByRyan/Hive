@@ -11,7 +11,6 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8765;
 pub const DEFAULT_MAX_PARALLEL: usize = 2;
 pub const DEFAULT_RETENTION_DAYS: i64 = 30;
-pub const DEFAULT_ARCHIVE_DIR: &str = "data/archive";
 
 pub const KNOWN_KEYS: [&str; 11] = [
     "HIVE_BASE_URL",
@@ -267,12 +266,23 @@ where
     let data_dir_value = string_value(&read, "HIVE_DATA_DIR", "data")?;
     let sandbox_dir_value = string_value(&read, "HIVE_SANDBOX_DIR", "sandbox")?;
     let retention_days_value = string_value(&read, "HIVE_RETENTION_DAYS", "30")?;
-    let archive_dir_value = string_value(&read, "HIVE_ARCHIVE_DIR", DEFAULT_ARCHIVE_DIR)?;
 
     let root = absolute_path(project_root, "project_root")?;
     let data_dir = validated_path(&root, &data_dir_value, "HIVE_DATA_DIR")?;
     let sandbox_dir = validated_path(&root, &sandbox_dir_value, "HIVE_SANDBOX_DIR")?;
-    let archive_dir = validated_path(&root, &archive_dir_value, "HIVE_ARCHIVE_DIR")?;
+    let archive_dir = match read("HIVE_ARCHIVE_DIR") {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(invalid_config(
+                    "HIVE_ARCHIVE_DIR",
+                    "value must not be empty",
+                ));
+            }
+            validated_path(&root, value, "HIVE_ARCHIVE_DIR")?
+        }
+        None => data_dir.join("archive"),
+    };
     if paths_equivalent(&data_dir, &sandbox_dir) {
         return Err(invalid_config(
             "HIVE_DATA_DIR",
@@ -653,9 +663,7 @@ mod tests {
             .sandbox_dir()
             .ends_with(Path::new("project").join("sandbox")));
         assert_eq!(config.retention_days(), DEFAULT_RETENTION_DAYS);
-        assert!(config
-            .archive_dir()
-            .ends_with(Path::new("project").join("data").join("archive")));
+        assert_eq!(config.archive_dir(), config.data_dir().join("archive"));
     }
 
     #[test]
@@ -756,6 +764,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn archive_dir_defaults_under_custom_data_dir() {
+        let custom = load(&[("HIVE_DATA_DIR", "custom-data")]).unwrap();
+        assert_eq!(custom.archive_dir(), custom.data_dir().join("archive"));
+        assert!(custom
+            .archive_dir()
+            .ends_with(Path::new("project").join("custom-data").join("archive")));
+
+        let explicit = load(&[
+            ("HIVE_DATA_DIR", "custom-data"),
+            ("HIVE_ARCHIVE_DIR", "explicit-archive"),
+        ])
+        .unwrap();
+        assert_ne!(explicit.archive_dir(), explicit.data_dir().join("archive"));
+        assert!(explicit
+            .archive_dir()
+            .ends_with(Path::new("project").join("explicit-archive")));
     }
 
     #[test]

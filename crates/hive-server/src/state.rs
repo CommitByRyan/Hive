@@ -180,3 +180,34 @@ impl Drop for AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> AppState {
+        AppState::new(
+            Store::open_in_memory().expect("store"),
+            ModelCatalog::new(),
+            "demo".to_owned(),
+            "127.0.0.1".to_owned(),
+            8765,
+        )
+    }
+
+    #[tokio::test]
+    async fn cloned_state_drop_does_not_signal_shutdown() {
+        let state = state();
+        let clone = state.clone();
+        drop(clone);
+        assert!(!state.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn owner_drop_signals_shutdown() {
+        let state = state();
+        let shutdown = state.shutdown.clone();
+        drop(state);
+        assert!(shutdown.load(Ordering::Relaxed));
+    }
+}
