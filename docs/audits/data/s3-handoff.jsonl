@@ -1,0 +1,6 @@
+{"scenario":"s3-handoff","commit":"6eb85f4","run":1,"workers":1,"nodes":3,"wall_ms":179,"events":16,"db_bytes":258048,"ok":true}
+{"scenario":"s3-handoff","commit":"6eb85f4","run":2,"workers":1,"nodes":3,"wall_ms":260,"events":16,"db_bytes":258048,"ok":true}
+{"scenario":"s3-handoff","commit":"6eb85f4","run":3,"workers":1,"nodes":3,"wall_ms":173,"events":16,"db_bytes":258048,"ok":true}
+{"scenario":"s3-handoff","commit":"6eb85f4","run":4,"workers":1,"nodes":3,"wall_ms":163,"events":16,"db_bytes":258048,"ok":true}
+{"scenario":"s3-handoff","commit":"6eb85f4","run":5,"workers":1,"nodes":3,"wall_ms":342,"events":16,"db_bytes":258048,"ok":true}
+{"scenario":"s3-handoff","commit":"6eb85f4","run":6,"workers":1,"nodes":3,"wall_ms":178,"events":16,"db_bytes":258048,"ok":true}

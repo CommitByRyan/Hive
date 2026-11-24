@@ -1,0 +1,6 @@
+{"scenario":"s2-dag","commit":"6eb85f4","run":1,"workers":4,"nodes":10,"wall_ms":229,"events":31,"db_bytes":262144,"ok":true}
+{"scenario":"s2-dag","commit":"6eb85f4","run":2,"workers":4,"nodes":10,"wall_ms":220,"events":31,"db_bytes":262144,"ok":true}
+{"scenario":"s2-dag","commit":"6eb85f4","run":3,"workers":4,"nodes":10,"wall_ms":208,"events":31,"db_bytes":262144,"ok":true}
+{"scenario":"s2-dag","commit":"6eb85f4","run":4,"workers":4,"nodes":10,"wall_ms":243,"events":31,"db_bytes":262144,"ok":true}
+{"scenario":"s2-dag","commit":"6eb85f4","run":5,"workers":4,"nodes":10,"wall_ms":343,"events":31,"db_bytes":262144,"ok":true}
+{"scenario":"s2-dag","commit":"6eb85f4","run":6,"workers":4,"nodes":10,"wall_ms":223,"events":31,"db_bytes":262144,"ok":true}

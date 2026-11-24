@@ -1,0 +1,6 @@
+{"scenario":"s6-cancel","commit":"6eb85f4","run":1,"workers":1,"nodes":3,"wall_ms":55,"events":8,"db_bytes":4096,"ok":true}
+{"scenario":"s6-cancel","commit":"6eb85f4","run":2,"workers":1,"nodes":3,"wall_ms":53,"events":8,"db_bytes":4096,"ok":true}
+{"scenario":"s6-cancel","commit":"6eb85f4","run":3,"workers":1,"nodes":3,"wall_ms":67,"events":8,"db_bytes":4096,"ok":true}
+{"scenario":"s6-cancel","commit":"6eb85f4","run":4,"workers":1,"nodes":3,"wall_ms":64,"events":8,"db_bytes":4096,"ok":true}
+{"scenario":"s6-cancel","commit":"6eb85f4","run":5,"workers":1,"nodes":3,"wall_ms":48,"events":8,"db_bytes":4096,"ok":true}
+{"scenario":"s6-cancel","commit":"6eb85f4","run":6,"workers":1,"nodes":3,"wall_ms":53,"events":8,"db_bytes":4096,"ok":true}

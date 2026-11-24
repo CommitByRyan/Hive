@@ -7,9 +7,9 @@
 
 ## 当前门
 
-**H10 正式基准采集**
+**H11 发布与迁移**
 
-目标：在机器空闲状态下采集 `s1-single` … `s6-cancel` 的 1 次预热 + 5 次样本，写入 `docs/audits/H10-benchmark-report.md`；H11 在基准结论通过后启动。H09c、H09d、H03b-3、H03b-4 已合并。当前基线 `ae93876`（主仓 314 passed / 1 ignored）。
+目标：H10 正式基准已完成（36 次运行全 `ok:true`，原始 JSONL 在 `docs/audits/data/`）。H11 落 `packaging/`、`scripts/package.ps1`/`install.ps1`、`hive config migrate --dry-run`、`hive db migrate --dry-run`、干净环境演练、`docs/RELEASE.md`、`CHANGELOG.md` 与 SHA256；不 push、不建远端、不签名。当前基线 `6eb85f4`（主仓 314 passed / 1 ignored）。
 
 状态：`in_progress`
 
@@ -40,8 +40,8 @@
 | H06d-1 | worktree 集成器与回收 | done, merged, verified（232/3） | H06 |
 | H06d-2 | Handoff 真实基线 | done, merged, verified（264/1） | H09a、H06d-1 |
 | R08 | 安全与并发独立审计 | done, merged（no P0 / 4 P1） | H09a、H03b-2 |
-| H10 | 评估、故障注入、性能 | harness done；正式基准采集中（H00） | H06 |
-| H11 | 发布与迁移 | blocked | H10 |
+| H10 | 评估、故障注入、性能 | done, verified（release 6 场景 × 6 次，36/36 ok） | H06 |
+| H11 | 发布与迁移 | ready | H10 |
 
 ## 活跃工作
 
@@ -208,4 +208,5 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | 2026-11-23 | H03b-3 | ureq 自定义 `PinnedResolver` + 显式 connector、精确 endpoint、禁代理/重定向、Shell 非零退出结构化 | 分支 270/1；主仓合并后 `All checks passed`，297 passed / 1 ignored |
 | 2026-11-24 | H03b-4 | `hive-platform::PathHandle` 句柄持有/相对读写/目录枚举/原子替换，`fs.read/list/write` 接线，junction 父目录拒绝，能力声明 | 分支 304 passed / 1 ignored（NTFS junction 用例真跑）；主仓合并后 `All checks passed`；残余替换窗口已记录 |
 | 2026-11-24 | H09c | JSONL 日志与 trace、Atomic 指标注册表、health 分级、终态 Mission 整段归档、Mission 段审计链校验、`retained_since_seq` 快照提示 | 分支 301 passed / 1 ignored；主仓合并后 `All checks passed`，314 passed / 1 ignored；归档 fsync 后同事务删除，`latest_seq` 不降 |
+| 2026-11-24 | H10 基准 | H00 在空闲机器用 release harness 采集 6 场景 ×（1 预热 + 5 样本），写入 p50/p95、events/sec、db_bytes 与机器元数据 | 36/36 `ok:true`；报告 `docs/audits/H10-benchmark-report.md` §9，原始 JSONL `docs/audits/data/` |
 

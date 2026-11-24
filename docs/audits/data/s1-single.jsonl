@@ -1,0 +1,6 @@
+{"scenario":"s1-single","commit":"6eb85f4","run":1,"workers":1,"nodes":1,"wall_ms":139,"events":6,"db_bytes":245760,"ok":true}
+{"scenario":"s1-single","commit":"6eb85f4","run":2,"workers":1,"nodes":1,"wall_ms":158,"events":6,"db_bytes":245760,"ok":true}
+{"scenario":"s1-single","commit":"6eb85f4","run":3,"workers":1,"nodes":1,"wall_ms":110,"events":6,"db_bytes":245760,"ok":true}
+{"scenario":"s1-single","commit":"6eb85f4","run":4,"workers":1,"nodes":1,"wall_ms":84,"events":6,"db_bytes":245760,"ok":true}
+{"scenario":"s1-single","commit":"6eb85f4","run":5,"workers":1,"nodes":1,"wall_ms":111,"events":6,"db_bytes":245760,"ok":true}
+{"scenario":"s1-single","commit":"6eb85f4","run":6,"workers":1,"nodes":1,"wall_ms":95,"events":6,"db_bytes":245760,"ok":true}
