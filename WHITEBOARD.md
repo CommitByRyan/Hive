@@ -41,7 +41,7 @@
 | H06d-2 | Handoff 真实基线 | done, merged, verified（264/1） | H09a、H06d-1 |
 | R08 | 安全与并发独立审计 | done, merged（no P0 / 4 P1） | H09a、H03b-2 |
 | H10 | 评估、故障注入、性能 | done, verified（release 6 场景 × 6 次，36/36 ok） | H06 |
-| H11 | 发布与迁移 | ready | H10 |
+| H11 | 发布与迁移 | in_progress（H11a 配置/迁移 → H11b 打包/演练） | H10 |
 
 ## 活跃工作
 
@@ -56,6 +56,7 @@
 | H09b | 可见对话 `01a2089f-87cc-7281-8cfb-1a9c348b865b`（flash high） | V6 routines、表达式、幂等触发、tick、`/api/routines` | `.codex/worktrees/2b99/Hive`，基线 `5f3769c` | done, merged `5bcee31`, verified 286/1 |
 | H09d | 可见对话 `01a208fb-add5-7ce1-8792-dc2079d9bc55`（`auto/deepseek-v4-pro` high） | 启动恢复接线、reclaim 同事务事件、可停止生命周期 tick | `.codex/worktrees/dec6/Hive`，基线 `5bcee31` | done, merged `da60c17`, verified 291/1 |
 | H09c | 可见对话 `01a2090a-116c-7091-bde6-9ffc5d43bce8`（pro/glm 429 后切 `auto/deepseek-v4.1-flash` high） | JSONL 日志、trace、指标、健康分级、终态 Mission 归档与分段审计 | `.codex/worktrees/21ad/Hive`，基线 `da60c17` | done, merged `ae93876`, verified 314/1 |
+| H11 | 可见对话 `01a20c32-929a-7951-9b5c-ce54e12557ef`（`auto/deepseek-v4.1-flash` high） | H11a `.env`/config migrate/db migrate dry-run/备份/doctor；H11b 打包、安装、干净演练与发布文档 | `.codex/worktrees/7086/Hive`，分支 `codex/h11-release`，基线 `20bd9a5` | in_progress |
 | H03b-4 | 可见对话 `01a2090b-b745-7ab3-9d02-1a58c4bce038`（pro high → 429，切 `auto/kimi-k3.1-pro` high） | `PathHandle` IO/枚举/替换、fs.* 接线、能力声明 | `.codex/worktrees/93a9/Hive`，基线 `0303089` | done, merged `6dd9dbc`, verified 304/1 |
 | H03b-2 | 可见对话 `01a2088d-81b1-7200-b025-66eea2c704b3`（mimo high） | `crates/hive-platform`、Win32 句柄路径、连接级 IP 策略 | `.codex/worktrees/2d29/Hive`，基线 `096edb1` | done, merged `8f3e5f6`, verified 236/1 |
 | H03b-3 | 可见对话 `01a208f5-bfc6-7771-91e9-0fd085ecdff4`（`workbuddy/deepseek-v4-pro` high） | `hive-llm` pinned egress、`hive-policy` 精确 endpoint、Shell 非零退出 | `.codex/worktrees/6e0f/Hive`，基线 `822cd9c` | done, merged `0303089`, verified 297/1 |
