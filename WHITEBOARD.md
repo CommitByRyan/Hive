@@ -223,4 +223,5 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | 2026-11-24 | H12 | `retention.json` 保留水位 sidecar（先持久化再删行）、重启 409/health 语义、`HIVE_RETENTION_DAYS`/`HIVE_ARCHIVE_DIR`、启动/小时级归档、`RetentionPolicy` | `25748e9` + `3000572` + `421de8d`；主仓合并 `9fec1c8`，351 passed / 1 ignored；sidecar 第二次归档替换用例真跑 |
 | 2026-11-24 | H12c | 修复 `AppState` clone Drop 误置 shutdown（H09d tick 循环会在请求后停摆）；补 clone/owner Drop 两条回归 | 同 `421de8d`；`hive-server --lib` 2 passed |
 | 2026-11-24 | 0.1.1 发布 | 版本 0.1.1、CHANGELOG/RELEASE/README/包内样例；保留水位与脏 worktree 限制；最终包与 18766–18769 干净演练 | `693acfd`；`scripts/verify.ps1` 351/1；zip SHA256 `128f09b4…07c5`；启动归档 floor=2、重启 409 保持、最终包二进制与候选包一致 |
+| 2026-11-24 | 0.1.1 审计 | 独立只读复核发布提交、包体 8 项与逐文件 SHA、版本一致性、sidecar 归档顺序、重启 409、`HIVE_ARCHIVE_DIR` 空值语义与脏 worktree 默认 | 对话 `01a20c8b-7865-7b41-a812-655f2173c4c4`（glm-5.3 max）；P0/P1/P2 = 0，结论可发布；仓库跟踪文件未改 |
 
