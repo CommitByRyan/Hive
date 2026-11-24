@@ -65,9 +65,20 @@ pub enum MergeOutcome {
 }
 
 /// Policy controlling what `recycle` does with a dirty worktree.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// The default is `keep_dirty: true`: recycling never destroys uncommitted
+/// work unless the caller opts in. `keep_dirty: false` force-removes a dirty
+/// worktree (`git worktree remove --force`) and permanently discards its
+/// uncommitted changes, so it is a deliberate destructive choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecyclePolicy {
     pub keep_dirty: bool,
+}
+
+impl Default for RecyclePolicy {
+    fn default() -> Self {
+        Self { keep_dirty: true }
+    }
 }
 
 /// Outcome of recycling a worktree.
@@ -267,8 +278,10 @@ impl WorktreeManager {
         Ok(MergeOutcome::Merged { commit })
     }
 
-    /// Recycle a worktree. A dirty worktree is kept when the policy requests
-    /// it; otherwise it is removed (forcing removal of dirty content).
+    /// Recycle a worktree. A dirty worktree is kept by default
+    /// (`RecyclePolicy::default().keep_dirty == true`) and only removed when
+    /// the caller explicitly sets `keep_dirty: false`, which force-removes it
+    /// and discards uncommitted changes. A clean worktree is always removed.
     pub fn recycle(
         &self,
         handle: &WorktreeHandle,
@@ -656,6 +669,70 @@ mod tests {
             .expect_err("dirty");
         assert!(matches!(error, WorkspaceError::DirtyProjectRoot(_)));
         assert!(!dir.path().join("x.txt").exists());
+    }
+
+    #[test]
+    fn recycle_policy_default_keeps_dirty_worktree() {
+        assert!(RecyclePolicy::default().keep_dirty);
+
+        let dir = TempDir::new("recycle-default-dirty");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+        let handle = manager.create(NodeId::new(), "HEAD").expect("create");
+        std::fs::write(handle.path.join("dirty.txt"), b"uncommitted").expect("dirty");
+        std::fs::write(handle.path.join("README.md"), b"modified\n").expect("modified");
+
+        let outcome = manager
+            .recycle(&handle, RecyclePolicy::default())
+            .expect("recycle default");
+        assert_eq!(outcome, RecycleOutcome::KeptDirty);
+        assert!(handle.path.exists(), "dirty worktree must be kept");
+        assert_eq!(
+            std::fs::read(handle.path.join("dirty.txt")).expect("untracked file"),
+            b"uncommitted"
+        );
+        assert_eq!(
+            std::fs::read(handle.path.join("README.md")).expect("modified file"),
+            b"modified\n"
+        );
+        assert!(manager.status(&handle).expect("status").dirty);
+        assert!(
+            manager
+                .list()
+                .expect("list")
+                .iter()
+                .any(|listed| listed.path == handle.path),
+            "kept worktree must stay registered"
+        );
+    }
+
+    #[test]
+    fn recycle_default_policy_removes_clean_worktree() {
+        let dir = TempDir::new("recycle-default-clean");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+        let handle = manager.create(NodeId::new(), "HEAD").expect("create");
+
+        let outcome = manager
+            .recycle(&handle, RecyclePolicy::default())
+            .expect("recycle clean");
+        assert_eq!(outcome, RecycleOutcome::Removed);
+        assert!(!handle.path.exists());
+    }
+
+    #[test]
+    fn recycle_explicit_force_removes_dirty_worktree() {
+        let dir = TempDir::new("recycle-force-dirty");
+        init_repo(dir.path());
+        let manager = WorktreeManager::new(dir.path());
+        let handle = manager.create(NodeId::new(), "HEAD").expect("create");
+        std::fs::write(handle.path.join("dirty.txt"), b"uncommitted").expect("dirty");
+
+        let outcome = manager
+            .recycle(&handle, RecyclePolicy { keep_dirty: false })
+            .expect("recycle force");
+        assert_eq!(outcome, RecycleOutcome::Removed);
+        assert!(!handle.path.exists());
     }
 
     #[test]
