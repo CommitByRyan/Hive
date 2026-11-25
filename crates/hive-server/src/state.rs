@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,11 +25,11 @@ pub struct AppState {
     pub events_tx: broadcast::Sender<EventEnvelope>,
     pub latest_seq: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    live: Arc<AtomicUsize>,
     pub catalog: ModelCatalog,
     pub mode: String,
     pub host: String,
     pub port: u16,
-    owns_shutdown: bool,
 }
 
 impl AppState {
@@ -43,11 +43,11 @@ impl AppState {
             events_tx,
             latest_seq,
             shutdown: shutdown.clone(),
+            live: Arc::new(AtomicUsize::new(1)),
             catalog,
             mode,
             host,
             port,
-            owns_shutdown: true,
         };
         state.refresh_latest_seq();
         global_metrics().set_approval_pending(0);
@@ -158,24 +158,25 @@ impl AppState {
 
 impl Clone for AppState {
     fn clone(&self) -> Self {
+        self.live.fetch_add(1, Ordering::Relaxed);
         Self {
             store: self.store.clone(),
             bus: self.bus.clone(),
             events_tx: self.events_tx.clone(),
             latest_seq: self.latest_seq.clone(),
             shutdown: self.shutdown.clone(),
+            live: self.live.clone(),
             catalog: self.catalog.clone(),
             mode: self.mode.clone(),
             host: self.host.clone(),
             port: self.port,
-            owns_shutdown: false,
         }
     }
 }
 
 impl Drop for AppState {
     fn drop(&mut self) {
-        if self.owns_shutdown {
+        if self.live.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.shutdown.store(true, Ordering::Relaxed);
         }
     }

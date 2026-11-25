@@ -65,6 +65,26 @@
 
     function observationClass(obs) { return obs === 'waiting_approval' ? 'active' : ''; }
 
+    const NAMED_EVENT_KINDS = [
+      'mission.created', 'mission.started', 'plan.created', 'plan.revised',
+      'plan.degraded', 'node.ready', 'node.started', 'node.turn', 'node.thought',
+      'node.tool_call', 'node.tool_started', 'node.tool_result',
+      'node.approval_requested', 'node.approval_decided', 'node.needs_recovery',
+      'node.succeeded', 'node.failed', 'node.budget_exceeded', 'node.cancelled',
+      'node.skipped', 'mission.summary', 'mission.done', 'mission.failed',
+      'mission.cancelled', 'message.user', 'routine.created', 'routine.updated',
+      'routine.deleted', 'routine.triggered', 'routine.error', 'artifact.saved',
+      'handoff.created', 'model.retry', 'model.fallback',
+    ];
+
+    function handleEnvelope(event) {
+      const env = JSON.parse(event.data);
+      if (env.seq > store.localLastSeq) store.localLastSeq = env.seq;
+      if (store.selection && env.mission_id === store.selection) {
+        $('events').textContent += `\n${env.seq} ${env.kind}`;
+      }
+    }
+
     async function refreshMissions() {
       const data = await api('/missions');
       store.localLastSeq = Math.max(store.localLastSeq, data.last_seq || 0);
@@ -116,7 +136,11 @@
       refreshMissions();
     });
 
-    function connect() {
+    async function connect() {
+      const health = await api('/health').catch(() => null);
+      if (health) {
+        store.localLastSeq = Math.max(store.localLastSeq, health.retained_since_seq || 0);
+      }
       const source = new EventSource(`/api/events?after_seq=${store.localLastSeq}`);
       $('conn').textContent = 'connecting';
       source.onopen = () => { $('conn').textContent = 'connected'; };
@@ -124,13 +148,10 @@
         $('conn').textContent = 'lagged';
         if (store.selection) await select(store.selection);
       });
-      source.onmessage = (event) => {
-        const env = JSON.parse(event.data);
-        if (env.seq > store.localLastSeq) store.localLastSeq = env.seq;
-        if (store.selection && env.mission_id === store.selection) {
-          $('events').textContent += `\n${env.seq} ${env.kind}`;
-        }
-      };
+      for (const kind of NAMED_EVENT_KINDS) {
+        source.addEventListener(kind, handleEnvelope);
+      }
+      source.onmessage = handleEnvelope;
       source.onerror = () => { $('conn').textContent = 'disconnected'; source.close(); };
     }
 
