@@ -127,7 +127,7 @@ Get-FileHash -Algorithm SHA256 .\dist\hive-0.1.2-windows-x86_64.zip
 | 构建 commit | 包内 `RELEASE.md` 的“本包构建信息”；源码提交见 `git log` |
 | 迁移版本 | V6（`hive-store::SCHEMA_VERSION`） |
 | 已知限制 | 单机单用户；仅 Windows x86_64 验证；无自动更新/签名/云发布；迁移不可回滚；`fs.write` 残余替换窗口；显式 `keep_dirty=false` 的 worktree 删除不可恢复；未配置凭据时为 demo 模式 |
-| 验证人 | H11 实施对话；发布门由 H00 复核 |
+| 验证人 | 0.1.2 发布收尾对话；发布门由 H00 复核 |
 
 ## 10. 干净演练记录（0.1.0，历史）
 
@@ -251,3 +251,49 @@ UPDATE missions SET state='done', updated_at_ms=<now-2d> WHERE mission_id='m_c0c
 
 - 安装 helper 的非空目录、缺清单、清单外文件拒绝路径未在 0.1.1 复跑；0.1.1 未改 `scripts/install.ps1`，沿用第 10 节 0.1.0 证据。
 - 未使用真实模型凭据做 live 冒烟；发布包默认 demo 模式。
+
+## 12. 干净演练记录（0.1.2）
+
+日期：2026-11-25。使用候选包 `dist/hive-0.1.2-windows-x86_64.zip`，SHA256 `353aefe43eadd9066dd10d6499819a039738a7c26dedafa7bf525006a0bff173`。候选包构建 commit 为 `e351bd7`，构建信息见包内 `RELEASE.md`。本节写入后按同一源码重建最终包；候选包与最终包的 `bin\` 二进制应保持一致，最终 zip SHA256 以同目录 `.sha256` 为准。
+
+### 解压与 doctor
+
+按发布包用户路径解压，不调用 `scripts/install.ps1`：
+
+```powershell
+Expand-Archive -LiteralPath dist\hive-0.1.2-windows-x86_64.zip `
+  -DestinationPath work\drill-012
+cd work\drill-012\hive-0.1.2-windows-x86_64
+```
+
+- 包内 8 个文件齐全，`SHA256SUMS.txt` 共 7 条逐文件记录，复算 `BAD=0`。
+- `hive --version` → `Hive 0.1.2`，退出码 0。
+- PATH 只保留 `System32` 与 Windows 目录时，`doctor` 退出码 0；`rustc`/`cargo` 均为 `missing from PATH [optional]`，数据与沙箱目录均为 `writable`。
+
+### 启动、Mission 与实时 SSE
+
+```powershell
+$env:HIVE_HOST='127.0.0.1'
+$env:HIVE_PORT='18770'
+$env:HIVE_DATA_DIR='<repo>\work\drill-012\data'
+$env:HIVE_SANDBOX_DIR='<repo>\work\drill-012\sandbox'
+.\bin\hive-server.exe
+```
+
+- `GET /api/health` → `ok=true`、`status=ready`、`mode=demo`、`schema_version=6`、`retained_since_seq=0`、`checks.database=ok`。
+- `POST /api/missions` → `mission.id=m_4a0d8bb1-d6db-490b-8c08-2530307e13d3`、`last_seq=1`。
+- `GET /api/state` → `last_seq=1`、`stats.missions=1`、`stats.events=1`。
+- `GET /api/events?mission_id=m_4a0d8bb1-...&after_seq=1`（`Accept: text/event-stream`）→ 先收到 `retry: 2500`；追加消息后实时收到 `id: 2`、`event: message.user`、payload 含 `packaged live SSE`。`curl --max-time 20` 以退出码 28 结束，属于保持连接后的预期超时。
+- 同一包内控制台 `GET /` → 页面显示 `connected`；选中 `0.1.2 drill` 后追加消息，事件流无需刷新从 `2` 增长到 `3`，验证命名事件监听与包内静态资源均已更新。
+- 停止后 `Get-NetTCPConnection -LocalPort 18770 -State Listen` 返回 0 条，未留下监听。
+
+### 候选包二进制
+
+- `bin\hive.exe` SHA256：`c41160bf82f5ae1b4dc47e1d060fef482c468c38d5c3cd15673e04e4413e16cc`
+- `bin\hive-server.exe` SHA256：`6817b593417a0187cb0deb14784ef61a2707fb55063cb883846f360514fffaa1`
+
+### 未复跑项
+
+- 安装 helper 的非空目录、缺清单、清单外文件拒绝路径未在 0.1.2 复跑；0.1.2 未改 `scripts/install.ps1`。
+- 未使用真实模型凭据做 live 冒烟；发布包默认 demo 模式。
+- 保留水位归档与重启语义未在 0.1.2 复跑；0.1.2 未改 retention/归档代码。

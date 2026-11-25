@@ -18,7 +18,7 @@ test --workspace                 354 passed / 1 ignored
 
 被忽略的测试需要本机运行 Magpie 网关，其余测试不依赖外部服务。
 
-本地发布包：`dist/hive-0.1.2-windows-x86_64.zip`，SHA256 见同目录 `.sha256`（打包后回填）。安装、升级、回滚与干净演练记录见 `docs/RELEASE.md`。
+本地发布包：`dist/hive-0.1.2-windows-x86_64.zip`，SHA256 `6c3ccc0f25a9f4e122d1c7e9b0fbe8ddaafa17f472ed08b4c0a362d81dddedad`。安装、升级、回滚与干净演练记录见 `docs/RELEASE.md`。
 
 ## 已实现
 
