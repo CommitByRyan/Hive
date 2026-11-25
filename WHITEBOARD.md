@@ -3,13 +3,13 @@
 > 唯一操作看板。所有对话先读本文件及自己的 runbook。
 > 只有 H00 总控可以修改本文件；其他阶段通过 handoff 汇报，不直接改白板。
 > 约定：完成的对话**不归档**，保留在侧栏供回看；归档记录当前为空。
-> 最近更新：2026-11-24
+> 最近更新：2026-11-25
 
 ## 当前门
 
-**0.1.1 加固版打包**
+**0.1.2 实时事件修复发布**
 
-目标：H12/H13 已完成并合并；H12 还修复了 `AppState` clone Drop 误置 shutdown、导致 tick 循环在请求后停摆的 H09d 缺陷。版本已升到 `0.1.1`，发布包已重建并完成干净演练。发布提交 `693acfd`，主仓 `scripts/verify.ps1` → `All checks passed`，351 passed / 1 ignored。发布包 `dist/hive-0.1.1-windows-x86_64.zip`，SHA256 `128f09b4d7876c24dfcce2bb55ec34d3838fbe84a39d5c646e005b21be3707c5`。
+目标：修复 0.1.1 控制台 SSE 不实时显示。`AppState` 改为引用计数生命周期，最后一个副本释放才停止事件桥/tick/retention；Web 控制台注册全部 34 个命名 SSE 事件，并用 `/api/health` 的 `retained_since_seq` 初始化游标。版本升至 `0.1.2`，SQLite schema 仍为 V6，0.1.1 → 0.1.2 无需迁移。提交 `cf9103b`、`933dc0d`、`e351bd7`、`7539078`；主仓 `scripts/verify.ps1` → `All checks passed`，354 passed / 1 ignored。发布包 `dist/hive-0.1.2-windows-x86_64.zip`，SHA256 `6c3ccc0f25a9f4e122d1c7e9b0fbe8ddaafa17f472ed08b4c0a362d81dddedad`。本版尚未 push。
 
 状态：`done`
 
@@ -44,6 +44,7 @@
 | H11 | 发布与迁移 | done, merged, verified（334/1；独立审计 P0/P1 清零） | H10 |
 | H12 | 保留水位持久化与自动归档 | done, merged, verified（351/1） | H11、H09c |
 | H13 | worktree 回收的脏数据安全 | done, merged, verified（337/1） | H11、H06d-1 |
+| 0.1.2 | 实时事件与控制台回归修复 | done, verified（354/1） | 0.1.1 |
 
 ## 活跃工作
 
@@ -78,7 +79,7 @@
 | H08 | 可见对话 `01a2084e-56e9-75e2-88e3-07327a218ac6`（glm-5.3 max → pro high） | `crates/hive-server`、11 路由、SSE、最小控制台 | `.codex/worktrees/aa44/Hive` | done, merged `e720968` |
 | H09 设计 | 可见对话 `01a20812-2ebb-7e32-b375-a703c9313edc`（pro high） | 只写 `docs/design/H09-recovery-observability.md` | main `f5ef9b4` | done, ADR 0005 accepted |
 
-合并基线：`693acfd`（0.1.1 发布提交；主仓复验 `All checks passed`，351 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4、H09c、H11、H13 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结，H11/H12/0.1.1 未改迁移 SQL。
+合并基线：`7539078`（0.1.2 发布证据提交；主仓复验 `All checks passed`，354 passed / 1 ignored）。H08、H06b、H06c、H10、H03b-1、H09a、H03b-2、H06d-2、H09b、H09d、H03b-3、H03b-4、H09c、H11、H13 的测试均作为不退化门槛；V6 已由 H09b 落地并冻结，H11/H12/0.1.1/0.1.2 未改迁移 SQL。
 
 平台安全现状：`hive-llm` 的 ureq 已接 `NetworkPolicy` 单次解析 + 显式 `TcpConnector + RustlsConnector`，并禁用环境代理与重定向；通用网络工具仍关闭。`fs.read/write/list` 已走授权父目录句柄相对 IO，原子替换用 `ReplaceFileW`/`MoveFileEx` 并复核父目录身份，但 `atomic_replace_handle_relative=false`，仍有已记录的路径级残余窗口；非 Windows 回退不是句柄级隔离。Shell 非零退出已改为结构化 `status:"error"` + `exit_code`。
 
@@ -86,7 +87,7 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 
 仓库卫生：`1453238` 因 `core.autocrlf=true` 把全仓重写成 CRLF；`f5ef9b4` 已加 `.gitattributes`（`* text=auto eol=lf`）并规范化，当前相对 `18f8d80` 只剩 3 个文件 7 行差异。
 
-远端状态（2026-11-24 13:45 外部变更）：仓库被添加 `origin=https://github.com/CommitByRyan/Hive.git`，`origin/main` 为 `1611f8d`（README 提交）；远端由用户主对话维护，H00 不执行 push。
+远端状态（2026-11-25）：`origin=https://github.com/CommitByRyan/Hive.git`；0.1.1 已由用户主对话推送，`origin/main` 为 `05182db`。0.1.2 的 `cf9103b..7539078` 目前只在本地，H00 未 push，等待用户明确授权。
 
 契约同步：`PROTOCOL.md` 已加入 ADR 0005 与 ADR 0006；`routine.*` 非触发事件使用系统作用域 `m_00000000-0000-4000-8000-000000000000`，合法但不是 `missions` 行。H09b 已按 ADR 0006 收口并合并：`SYSTEM_SCOPE_MISSION_ID` 为单一常量，`routine.triggered` 使用真实 Mission，`list_missions` 不含系统作用域。
 
@@ -224,4 +225,7 @@ R08 审计结论：无 P0。P1-1/P1-2 已由 H09d 修复（启动恢复接线、
 | 2026-11-24 | H12c | 修复 `AppState` clone Drop 误置 shutdown（H09d tick 循环会在请求后停摆）；补 clone/owner Drop 两条回归 | 同 `421de8d`；`hive-server --lib` 2 passed |
 | 2026-11-24 | 0.1.1 发布 | 版本 0.1.1、CHANGELOG/RELEASE/README/包内样例；保留水位与脏 worktree 限制；最终包与 18766–18769 干净演练 | `693acfd`；`scripts/verify.ps1` 351/1；zip SHA256 `128f09b4…07c5`；启动归档 floor=2、重启 409 保持、最终包二进制与候选包一致 |
 | 2026-11-24 | 0.1.1 审计 | 独立只读复核发布提交、包体 8 项与逐文件 SHA、版本一致性、sidecar 归档顺序、重启 409、`HIVE_ARCHIVE_DIR` 空值语义与脏 worktree 默认 | 对话 `01a20c8b-7865-7b41-a812-655f2173c4c4`（glm-5.3 max）；P0/P1/P2 = 0，结论可发布；仓库跟踪文件未改 |
+| 2026-11-25 | 0.1.2 修复 | `AppState` 引用计数生命周期；Console 注册 34 个命名 SSE 事件并用 health 保留水位初始化游标 | `cf9103b`；指导对话 `01a20df1-48db-7263-a781-9b20522713ec` |
+| 2026-11-25 | 0.1.2 测试 | Router → EventBus → 后台桥 → `/api/events` 的 `message.user` 实时链路；控制台静态回归覆盖全部事件名 | `933dc0d`；`scripts/verify.ps1` 354 passed / 1 ignored |
+| 2026-11-25 | 0.1.2 发布 | 版本 0.1.2、CHANGELOG/RELEASE/README/packaging；候选包与最终包、二进制一致性、18770/18771 干净演练 | `e351bd7` + `7539078`；zip SHA256 `6c3ccc0f…ddedad`；未 push |
 
