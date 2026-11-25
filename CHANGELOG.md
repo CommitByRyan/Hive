@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.2 — 2026-11-25
+
+实时事件与控制台回归修复。SQLite schema 仍为 V6，事件 schema 仍为 V1；0.1.1 → 0.1.2 不需要迁移，覆盖程序文件即可。
+
+### 修复
+
+- `AppState` 生命周期改为引用计数：只有最后一个 state 副本释放后才设置 `shutdown`。此前的 `owns_shutdown` 方案仍会被 Axum `with_state` 的克隆/释放顺序击穿，导致后台事件桥在服务启动后提前退出，SSE 只能回放历史事件。
+- Web 控制台为全部 34 个 `EventKind` 注册命名 SSE 监听（如 `message.user`），不再只依赖 `source.onmessage`，因此 `event:` 命名帧可以实时进入事件流。
+- 控制台在建立 SSE 前读取 `/api/health` 的 `retained_since_seq` 并以此初始化游标，避免存在保留水位时从 `0` 连接立即收到 409 而显示 `disconnected`。
+
+### 测试与验证
+
+- 新增真实链路测试：Router → EventBus → 后台事件桥 → `/api/events` 广播，确认追加消息后实时收到 `event: message.user`。
+- 新增控制台静态回归：检查全部 34 个命名事件、`addEventListener` 与 `retained_since_seq` 初始化。
+- 主仓 `scripts/verify.ps1` → `All checks passed`；`354 passed / 1 ignored`。
+- 0.1.2 候选包完成解压、无 Rust PATH 的 `doctor`、启动、健康、Mission、SSE 实时事件、停止与端口释放演练。
+
+### 兼容性
+
+- SQLite schema 保持 V6，不新增迁移；0.1.1 的 `data/hive.db` 与 `retention.json` 可直接使用。
+- 事件封套与 `EventKind` 取值不变，事件 schema 保持 V1。
+- 配置键与默认值不变。
+
 ## 0.1.1 — 2026-11-24
 
 0.1.0 之后的加固版本。SQLite schema 仍为 V6，升级不需要迁移；覆盖程序文件即可。

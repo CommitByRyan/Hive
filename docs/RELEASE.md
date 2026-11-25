@@ -1,4 +1,4 @@
-# Hive 0.1.1 发布与迁移手册
+# Hive 0.1.2 发布与迁移手册
 
 本文档面向 Windows x86_64 单机安装。发布包是工程预览版，不包含模型凭据、用户数据或自动更新。
 
@@ -6,21 +6,21 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | `0.1.1`（唯一来源：根 `Cargo.toml` 的 `[workspace.package] version`） |
+| 版本 | `0.1.2`（唯一来源：根 `Cargo.toml` 的 `[workspace.package] version`） |
 | 平台 | Windows x86_64 |
-| 暂存目录 | `dist/hive-0.1.1-windows-x86_64/` |
-| 发布包 | `dist/hive-0.1.1-windows-x86_64.zip` |
+| 暂存目录 | `dist/hive-0.1.2-windows-x86_64/` |
+| 发布包 | `dist/hive-0.1.2-windows-x86_64.zip` |
 | 迁移目标 | SQLite schema V6 |
 | 二进制 | `bin/hive.exe`、`bin/hive-server.exe` |
 | 包内文件 | 共 8 项：上述两个二进制、`hive.env.example`、`README.txt`、`RELEASE.md`、`CHANGELOG.md`、`start-hive.ps1`、`SHA256SUMS.txt` |
 
 `scripts/package.ps1` 会构建 release 二进制、校验 `hive --version` 与目录/zip 名称一致、生成逐文件 SHA256 和 zip SHA256。包内 `RELEASE.md` 末尾追加实际构建 commit、构建时间与平台。
 
-0.1.1 相对 0.1.0 不改 schema：`retention.json` 是数据目录下的独立 sidecar，旧库直接启动即可。升级只覆盖程序文件，保留 `data/`、`sandbox/` 与 `.env`。
+0.1.2 相对 0.1.1 不改 schema：SQLite 仍为 V6，事件 schema 仍为 V1，`retention.json` 与旧数据库可直接使用。升级只覆盖程序文件，保留 `data/`、`sandbox/` 与 `.env`。
 
 ## 2. 安装
 
-发布包用户不需要 Rust，也不需要运行安装脚本。将 zip 解压到任意目录，例如 `C:\Hive`，然后进入解压出的 `hive-0.1.1-windows-x86_64` 目录：
+发布包用户不需要 Rust，也不需要运行安装脚本。将 zip 解压到任意目录，例如 `C:\Hive`，然后进入解压出的 `hive-0.1.2-windows-x86_64` 目录：
 
 ```powershell
 .\bin\hive.exe doctor
@@ -33,7 +33,7 @@
 ```powershell
 pwsh -NoProfile -File scripts/install.ps1 `
   -TargetDir C:\Hive `
-  -From dist\hive-0.1.1-windows-x86_64.zip
+  -From dist\hive-0.1.2-windows-x86_64.zip
 ```
 
 - 目标目录非空时必须显式加 `-Force`；脚本只覆盖发布包文件，不删除用户已有 `data/`、`sandbox/` 或 `.env`。
@@ -85,7 +85,7 @@ curl.exe --noproxy '*' http://127.0.0.1:8765/api/state
 
 ## 6. 升级
 
-0.1.0 → 0.1.1 不需要数据库迁移，但保留 `data/` 是必须的；`retention.json` 会在首次启动后出现在数据目录。
+0.1.1 → 0.1.2 不需要数据库迁移，保留 `data/`、`sandbox/` 与 `.env` 即可。0.1.2 修复了控制台实时事件不显示的问题，升级后不需要修改配置。
 
 1. 停服，确认 `18765` 等测试端口或生产端口不再监听。
 2. 记录当前版本与 `data\hive.db` 的 SHA256。
@@ -111,7 +111,7 @@ Copy-Item -LiteralPath data\backups\hive.db.bak-v5-<timestamp> -Destination data
 ```powershell
 Get-FileHash -Algorithm SHA256 .\bin\hive.exe
 Get-FileHash -Algorithm SHA256 .\bin\hive-server.exe
-Get-FileHash -Algorithm SHA256 .\dist\hive-0.1.1-windows-x86_64.zip
+Get-FileHash -Algorithm SHA256 .\dist\hive-0.1.2-windows-x86_64.zip
 ```
 
 - 包内 `SHA256SUMS.txt` 使用 `<hash>  <relative/path>` 格式。
@@ -122,8 +122,8 @@ Get-FileHash -Algorithm SHA256 .\dist\hive-0.1.1-windows-x86_64.zip
 
 | 项 | 内容 |
 |---|---|
-| 产物 | `hive-0.1.1-windows-x86_64.zip` 与同名 `.sha256` |
-| 版本 | `0.1.1`；`hive --version` 必须输出 `Hive 0.1.1` |
+| 产物 | `hive-0.1.2-windows-x86_64.zip` 与同名 `.sha256` |
+| 版本 | `0.1.2`；`hive --version` 必须输出 `Hive 0.1.2` |
 | 构建 commit | 包内 `RELEASE.md` 的“本包构建信息”；源码提交见 `git log` |
 | 迁移版本 | V6（`hive-store::SCHEMA_VERSION`） |
 | 已知限制 | 单机单用户；仅 Windows x86_64 验证；无自动更新/签名/云发布；迁移不可回滚；`fs.write` 残余替换窗口；显式 `keep_dirty=false` 的 worktree 删除不可恢复；未配置凭据时为 demo 模式 |

@@ -301,7 +301,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hive-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-llm",
  "hive-policy",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-config",
  "hive-store",
@@ -325,14 +325,14 @@ dependencies = [
 
 [[package]]
 name = "hive-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-types",
 ]
 
 [[package]]
 name = "hive-eval"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-agent",
  "hive-llm",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "hive-events"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-store",
  "hive-types",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "hive-llm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-policy",
  "serde",
@@ -366,14 +366,14 @@ dependencies = [
 
 [[package]]
 name = "hive-platform"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "hive-policy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "hive-platform",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "hive-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-store",
  "hive-types",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "hive-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "futures-core",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "hive-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "hive-types",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "hive-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-platform",
  "hive-policy",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "hive-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "hive-workspace"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hive-types",
  "thiserror",
